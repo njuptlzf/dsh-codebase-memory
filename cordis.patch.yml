@@ -1,0 +1,33 @@
+# dsh-codebase-memory bundle patch: 两级挂载。
+#
+# 行序是刻意的，不是排版：
+#   1) `codebase-memory` 先启动。它负责依赖自举（把 mcp-adapter 装进
+#      $DSH_HOME/vendor/mcp-adapter）并写好 adapter 的服务器清单 cbm.json。
+#   2) `codebase-memory-mcp-client` 后启动，用官方 MCP 桥去拉起 adapter。
+#      Cordis 会 await 前一行的 async apply，所以桥启动时文件必然已就绪。
+#
+# 路径不写死在本机：`!!js` 表达式在 Loader 上下文求值（可见 process 与 ctx，
+# 没有 require），与部署自带 web-app patch 用 process.env 的写法一致。
+#
+# 两处都必须用 `command: node` + 绝对 .mjs 路径，不能走 PATH 上的
+# mcp-server.cmd：MCP SDK 的 stdio transport 用不带 shell 的 spawn，
+# Node 在 Windows 上默认拒绝无 shell 启动 .cmd。
+- insert:
+    - id: codebase-memory
+      name: 'dsh-codebase-memory'
+
+    - id: codebase-memory-mcp-client
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: cbm
+        command: node
+        args:
+          - !!js (process.env.DSH_HOME || (process.env.USERPROFILE + '\\.dsh')) + '\\vendor\\mcp-adapter\\node_modules\\@njuptlzf\\mcp-adapter\\mcp-server.mjs'
+          - '--config'
+          - !!js (process.env.DSH_HOME || (process.env.USERPROFILE + '\\.dsh')) + '\\vendor\\mcp-adapter\\cbm.json'
+        cwd: !!js process.env.DSH_HOME || (process.env.USERPROFILE + '\\.dsh')
+        toolCallTimeoutMs: 120000
+        # adapter 在 0 server 配置下也能正常起来（实测），所以启动失败不该拦
+        # 住整个 profile；真正的前提检查放在 code_index 的首次调用里。
+        failOnStartupError: false

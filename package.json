@@ -1,0 +1,52 @@
+{
+  "name": "dsh-codebase-memory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH host bundle: index the session workspace with codebase-memory-mcp and expose it through @njuptlzf/mcp-adapter (one ~250-token MCP proxy tool instead of 17 tool schemas).",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "author": "njuptlzf",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/njuptlzf/dsh-codebase-memory.git"
+  },
+  "homepage": "https://github.com/njuptlzf/dsh-codebase-memory#readme",
+  "bugs": {
+    "url": "https://github.com/njuptlzf/dsh-codebase-memory/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "sync": "node scripts/sync.mjs",
+    "check:patch": "node checks/check-patch.mjs",
+    "check:plugin": "node checks/check-plugin.mjs",
+    "check:chain": "node checks/check-chain.mjs",
+    "check:tokens": "node checks/check-tokens.mjs",
+    "check": "npm run check:patch && npm run check:plugin && npm run check:chain && npm run check:tokens"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "codebase-memory",
+    "code-index",
+    "mcp"
+  ]
+}
