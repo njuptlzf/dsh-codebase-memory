@@ -1,0 +1,18 @@
+# 依赖与构建产物
+node_modules/
+dist/
+build/
+*.log
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 索引产物：本插件不生成（--persistence 默认 false，索引只落 ~/.cache），
+# 列在这里只是防止手滑把重产物提交进来。
+.codebase-memory/
+
+# 验收脚本的临时文件
+*.dsh-check-bak
