@@ -1,229 +1,232 @@
 # dsh-codebase-memory
 
-把 [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) 接进 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 的 host bundle：**为当前会话的工作区建代码知识图谱，让模型按图检索代码，而不是逐文件 grep/read**。
+English | [简体中文](README.zh.md)
 
-> **TL;DR (EN)** — A DSH host plugin that bootstraps a pinned MCP token-compression layer, mounts the codebase-memory-mcp code-graph engine through the official MCP bridge, and pins `repo_path` to the *session* workspace (which the engine cannot do by itself in a multi-session host). The model sees exactly one ~250-token proxy tool instead of 17 tool schemas (measured 4.0x saving), plus `code_index` / `code_setup`.
+A [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) host bundle that wires [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) into your agent sessions: **it builds a code knowledge graph of the current session workspace and lets the model retrieve code through the graph — instead of grepping file by file**.
 
-## 目录
+## Table of contents
 
-- [链路与分工](#链路与分工)
-- [为什么需要它](#为什么需要它这个插件存在的全部理由)
-- [安装](#安装)
-- [怎么用](#怎么用)（含[话术清单](#3-话术清单实测有效)与 [AGENTS.md 模板](#4-怎么写-agentsmd一劳永逸)）
-- [配置](#配置可选)
-- [验收](#验收)
-- [排错](#排错)
-- [工程备注](#工程备注给要改它的人)
-- [已知限制与不做](#已知限制与不做)
+- [How the chain is composed](#how-the-chain-is-composed)
+- [Why this plugin exists](#why-this-plugin-exists)
+- [Install](#install)
+- [Usage](#usage) — including [prompting recipes](#3-prompting-recipes-what-actually-triggers-it) and an [AGENTS.md template](#4-encoding-it-in-agentsmd-make-it-permanent)
+- [Configuration](#configuration-optional)
+- [Verification](#verification)
+- [Troubleshooting](#troubleshooting)
+- [Engineering notes](#engineering-notes-for-whoever-modifies-it)
+- [Known limitations & non-goals](#known-limitations--non-goals)
 
-## 链路与分工
+## How the chain is composed
 
 ```
-DSH host 组合（本 bundle 的 cordis.patch.yml 插两行）
-├─ ④ dsh-codebase-memory          本插件：依赖自举 + 把会话工作区钉死 + 给模型写使用说明
-└─ ③ @deepseek-ai/dsh-mcp-client  官方 MCP 桥 → 模型只看到一个 mcp__cbm__mcp
-      └─ ② @njuptlzf/mcp-adapter  token 压缩层：17 份 schema 压成 1 个代理工具（插件自举，钉死版本）
-            └─ ① codebase-memory-mcp  索引引擎：162 语言 tree-sitter + Hybrid LSP + 知识图谱（手动安装）
+DSH host composition (two rows inserted by this bundle's cordis.patch.yml)
+├─ ④ dsh-codebase-memory          this plugin: bootstraps dependencies, pins the indexed
+│                                 workspace to the session, and tells the model how to use it
+└─ ③ @deepseek-ai/dsh-mcp-client  the official MCP bridge → the model sees exactly one proxy tool
+      └─ ② @njuptlzf/mcp-adapter  token-compression layer: 17 tool schemas → 1 proxy tool
+            │                     (auto-bootstrapped by the plugin, version-pinned)
+            └─ ① codebase-memory-mcp  the engine: 162-language tree-sitter + Hybrid LSP + knowledge graph
+                                      (installed manually)
 ```
 
-四个都是既有件，**没有任何一个被 fork 或修改**。本插件只做三件事：自举②、给③配好清单、把①的入口按会话工作区钉死。
+All four are existing components — **none of them is forked or modified**. The plugin only bootstraps ②, writes ③'s server manifest, and pins ①'s entry point to the session workspace.
 
-## 为什么需要它（这个插件存在的全部理由）
+## Why this plugin exists
 
-**DSH 是多会话宿主，而一个 MCP server 进程只有一个 cwd。**
+**DSH is a multi-session host, but an MCP server process has exactly one cwd.**
 
-codebase-memory-mcp 自带 `auto_index` / `auto_watch`，但它只能看见**自己那个进程的 cwd**。DSH 里所有会话共享同一个 MCP 进程——哪个会话的工作区该被索引？引擎自己无法回答。
+codebase-memory-mcp ships `auto_index` / `auto_watch`, yet they can only ever see *their own process cwd*. In DSH every session shares one MCP process — which session's workspace should be indexed? The engine cannot answer that by itself.
 
-所以 `repo_path` 只能由一个**活在 DSH 进程里、能读到会话头**的角色注入。这就是本插件：
+So `repo_path` must be injected by something that lives inside the DSH process and can read the session header. That is the entire reason this plugin exists:
 
 ```js
-// index.js — 全插件唯一决定"索引什么"的地方
+// index.js — the single place that decides "what gets indexed"
 const cwd = exec.agent?.session?.header?.cwd
 ```
 
-模型永远**拿不到也传不了** `repo_path`（`code_index` 没有这个参数，`index_repository` 从工具面剔除）——索引路径不可能被幻觉带偏，这是整个设计里最重要的一条约束。
+The model **never gets to pass `repo_path`**: `code_index` has no such parameter, and `index_repository` is removed from the tool surface (`excludeTools`). A hallucinated path cannot poison the index — this is the most important constraint in the whole design.
 
-## 安装
+## Install
 
-### ① 索引引擎（手动，一次性）
+### 1. The indexing engine (manual, one-time)
 
-二进制不自动下载：可执行文件的安全水位高于包。官方脚本自带 checksums 校验：
+Binaries are never auto-downloaded — the security bar for executables is higher than for packages. The official script verifies checksums itself:
 
 ```powershell
 irm https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.ps1 -OutFile install.ps1
 Unblock-File .\install.ps1; .\install.ps1 --skip-config
 ```
 
-装完后插件会按 官方安装位 → `$DSH_HOME/vendor/codebase-memory-mcp/bin` → PATH 的顺序探测；也可以用 `cbmPath` 配置指死。
+Afterwards the plugin probes, in order: the official install location → `$DSH_HOME/vendor/codebase-memory-mcp/bin` → `PATH`. Or pin it explicitly via the `cbmPath` config.
 
-### ② 把 bundle 挂进 profile（②③④全自动）
+### 2. Mount the bundle into a profile (②③④ are fully automatic)
 
 ```powershell
 git clone https://github.com/njuptlzf/dsh-codebase-memory
-dsh plugin --profile <你的profile> add file:<clone 出来的绝对路径>
+dsh plugin --profile <your-profile> add file:<absolute-path-to-the-clone>
 ```
 
-> **先确认目标 profile。** 桌面端和 web 是两个 profile，装错的 symptoms 非常干净：重启后工具完全不出现。不确定就先 `dsh --profile <name> --dump-config` 搜 `codebase-memory`。
+> **Confirm the target profile first.** Desktop and web are separate profiles; installing into the wrong one fails in a very quiet way — after restart the tools simply never appear. When unsure: `dsh --profile <name> --dump-config` and search for `codebase-memory`.
 >
-> `dsh plugin add` 在依赖多的 profile 里可能长时间不返回（实测超过 10 分钟）。它实际是两步：pnpm 装包 + 把名字写进 `dsh.profile.bundles`。卡住就手动补 bundles 条目——插件生效只需要"文件在 node_modules 里 + 名字在 bundles 里"：
+> `dsh plugin add` may hang for a long time in dependency-heavy profiles (observed: >10 min). It is really two steps: pnpm installs the package, then the CLI adds the name to `dsh.profile.bundles`. If it stalls, do the second step by hand — the plugin goes live given "files in node_modules + name in bundles":
 >
 > ```jsonc
 > "dsh": { "profile": { "bundles": [ /* ... */, "dsh-codebase-memory" ] } }
 > ```
 
-### ③ 重启，然后验证
+### 3. Restart, then verify
 
-重启 profile 后对模型说一句：
+Restart the profile and tell the model:
 
 ```
-跑一下 code_setup，把结果原样贴给我
+run code_setup and paste the output verbatim
 ```
 
-看到 `status: OK`、`清单(⑤): ...cbm.json`（不是"(未写)"）即链路全通。压缩层②会在首次 boot 时自动 `npm install` 进 `$DSH_HOME/vendor/mcp-adapter`，无需干预。
+`status: OK` — and the manifest line pointing at a real `cbm.json` (not `(not written)`) — means the whole chain is alive. Layer ② installs itself into `$DSH_HOME/vendor/mcp-adapter` on first boot; no manual steps.
 
-## 怎么用
+## Usage
 
-### 1. 先理解索引单位：一个会话工作区 = 一个 project
+### 1. The unit of indexing: one session workspace = one project
 
-这是用好它的全部前提，**三句话**：
+This is the prerequisite for everything else — in three sentences:
 
-1. `code_index` 索引的**永远是当前会话的工作区**——工作区选到仓库根，该仓库就是一个独立 project；工作区选到多个仓库的上层目录，它们就**塌进同一个 project**。
-2. project 名由路径推导（非字母数字换成 `-`，如 `D:/code/repo-a` → `D-code-repo-a`），但**以 `code_index` 返回的为准**。
-3. 之后所有检索，`project` 是**唯一的**路由键——每个工具调用都必须带上它。插件不做、也做不了"猜你这次问的是哪个仓库"。
+1. `code_index` **always indexes the current session's workspace**. Choose the repo root as the workspace and the repo is its own project; choose a parent directory and all repos under it **collapse into one project**.
+2. The project name is derived from the path (non-alphanumerics → `-`, e.g. `D:/code/repo-a` → `D-code-repo-a`), but **the `code_index` return value is the source of truth**.
+3. For every search afterwards, `project` is the **only routing key** — pass it explicitly on every call. The plugin does not, and structurally cannot, guess "which repo is this question about".
 
 ```powershell
-# 每个 project 一个库文件，索引全在这里（不进代码仓库，重产物归缓存）：
+# one sqlite per project, all under the cache (nothing lands in your repo):
 Get-ChildItem ~/.cache/codebase-memory-mcp -Filter *.db
 ```
 
-实测参考量级（本机，普通笔记本）：中型 TS 仓库（~700 文件）首建 10-13s、图 1700 节点上下；刷新一次约 8s（引擎是全量重解析，不是增量）；单次检索 <100ms。
+Measured order of magnitude (mid-size TS repo, ~700 files): first build 10–13 s, ~1,700 nodes; a refresh costs ~8 s (the engine re-parses fully — it is not incremental); a single query < 100 ms.
 
-### 2. 标准动线
+### 2. The standard flow
 
 ```
-code_index（建索引 / 改完代码后刷新）→ 拿到 project
-→ cbm_search_graph 定位符号 → cbm_get_code_snippet 读那一段
-→ 需要关系时 cbm_trace_path / cbm_detect_changes
+code_index (build / refresh after edits) → you have the project name
+→ cbm_search_graph to locate symbols → cbm_get_code_snippet to read exactly that range
+→ for relationships: cbm_trace_path / cbm_detect_changes
 ```
 
-检索一律走代理工具 `mcp__cbm__mcp`，`args` **直接传对象**（不需要 JSON 字符串）：
+All retrieval goes through the proxy tool `mcp__cbm__mcp`; pass `args` **as a plain object** (no JSON-string double encoding):
 
 ```jsonc
-{"tool": "cbm_search_graph", "args": {"project": "<project>", "query": "符号名", "limit": 10}}
-{"tool": "cbm_get_code_snippet", "args": {"project": "<project>", "qualified_name": "<search_graph 给的 qn>"}}
-{"tool": "cbm_trace_path", "args": {"project": "<project>", "function_name": "X", "direction": "callers"}}
+{"tool": "cbm_search_graph",     "args": {"project": "<project>", "query": "symbolName", "limit": 10}}
+{"tool": "cbm_get_code_snippet", "args": {"project": "<project>", "qualified_name": "<qn from search_graph>"}}
+{"tool": "cbm_trace_path",       "args": {"project": "<project>", "function_name": "X", "direction": "callers"}}
 ```
 
-多步查询用 `mcp__cbm__mcpScript` 一次跑完（实测两次 `search_graph` 合计 73ms），别拆成多次往返。
+For multi-step lookups, run them in one `mcp__cbm__mcpScript` call instead of round-tripping (measured: two `search_graph` calls in 73 ms total).
 
-### 3. 话术清单（实测有效）
+### 3. Prompting recipes (what actually triggers it)
 
-**能不能触发，取决于你问的问题是不是"图形的强项"。** 下面这些句式实测能把模型推向索引：
+Whether the model uses the graph depends on whether your question is a **graph-shaped question**. These phrasings were observed to work:
 
-| 这样问 | 为什么灵 |
+| Ask like this | Why it works |
 |---|---|
-| 「**谁调用了** `X`？改它会影响哪些调用方？」 | `CALLS` 边直接答；grep 只能找到字符串出现处，不是调用 |
-| 「`X` 的定义在哪、哪个行区间？」 | 精确区间，省掉整个文件的 Read |
-| 「这个模块的**入口点 / 路由 / 包结构**有哪些？」 | `get_architecture` 一次给全景 |
-| 「用索引查：先 `search_graph` 定位，再 `get_code_snippet` 读那段，**别 grep**」 | 点名步骤 + 关掉替代方案，触发率最高 |
-| 「用 `project=<名>` 查」 | 直接给路由键，省掉摸索 |
-| 「只在 `**/<仓库>/**` 里找」 | `file_pattern` 收窄，多仓库工作区必备 |
-| 「把这几个符号的实现**一次**查回来」 | 逼它用 `mcpScript` 批量 |
+| "**Who calls** `X`? What breaks if I change it?" | `CALLS` edges answer this directly; grep only finds string occurrences, not call sites |
+| "Where is `X` defined, and in which line range?" | Exact ranges — saves the whole-file Read |
+| "What are this module's entry points / routes / package structure?" | `get_architecture` returns the panorama in one call |
+| "Use the index: `search_graph` first, then `get_code_snippet` for that range — **don't grep**" | Names the steps and turns off the fallback; highest trigger rate |
+| "Search with `project=<name>`" | Hands over the routing key; no fumbling |
+| "Only inside `**/<repo>/**`" | `file_pattern` scoping — essential in multi-repo workspaces |
+| "Fetch these five implementations **in one call**" | Forces `mcpScript` batching |
 
-反例——这样问**不会**也不该触发索引：「帮我看看这个文件」（Read 的甜区）、「这个报错什么意思」「这个配置值是多少」（字面量，`search_code`/grep 更对）。
+Counter-examples — these should **not** trigger the index: "look at this file" (Read's sweet spot), "what does this error mean", "what is this config value" (literals → `search_code`/grep).
 
-怎么判断它**真的**走了索引：工具卡出现 `mcp__cbm__mcp`，回答里带 `qualified_name` + 精确行区间（`index.js 238-261`）；如果它直接贴了半屏文件原文，那就是 grep/Read。
+How to tell it *really* used the index: the tool card shows `mcp__cbm__mcp`, and the answer cites `qualified_name` + exact line ranges (`index.js 238-261`). If it pastes half a screen of raw file text, it just Read the file.
 
-### 4. 怎么写 AGENTS.md（一劳永逸）
+### 4. Encoding it in AGENTS.md (make it permanent)
 
-提示词段只是路标，**跟仓库走的 AGENTS.md 才是常驻规则**。DSH 的 `dsh-agent-instructions` 会把工作区（及祖先链）里的 `AGENTS.md` / `CLAUDE.md` 在**首个请求前**注入为 baseline context——新开会话即生效，改完不用重启。放在仓库根、或所有会话共同的上层目录：
+The prompt section is only a signpost; **an AGENTS.md that travels with the repo is the standing rule**. DSH's `dsh-agent-instructions` injects `AGENTS.md` / `CLAUDE.md` from the workspace (and its ancestor chain) as baseline context **before the first request** — a new session picks it up automatically; no restart needed. Put it at the repo root, or in a directory shared by all your sessions:
 
 ```markdown
-## 代码分析走索引，不逐文件读
+## Analyze code through the index, not file by file
 
-本工作区已建代码索引（dsh-codebase-memory）。分析代码前先按此路径走：
+This workspace is code-indexed (dsh-codebase-memory). Before reading code:
 
-- 路由键是 `project`：值 = 本工作区对应的项目名（拿不准先跑 `code_index`，返回值即 project 名）。
-- 定位符号：`mcp__cbm__mcp` → `cbm_search_graph`（args 直接传对象）。
-- 读实现：`cbm_get_code_snippet` 只取那一段，别整文件 Read。
-- 追关系：`cbm_trace_path`（谁调用/被调用）、`cbm_detect_changes`（改动影响面）。
-- 多仓库工作区必须收窄：`file_pattern="**/<仓库>/**"`；同名符号用返回的 `qualified_name` 消歧。
-- 多步查询用 `mcp__cbm__mcpScript` 一次跑完，别多次往返。
-- 只有查字面量（字符串/配置值/日志文案）或索引明确没覆盖时，才用 grep/Read。
-- 改完代码用 `code_index` 刷新（全量重解析，约 8 秒，值得等）。
+- The routing key is `project`; run `code_index` once when unsure — its return value *is* the project name.
+- Locate symbols: `mcp__cbm__mcp` → `cbm_search_graph` (pass `args` as a plain object).
+- Read implementations: `cbm_get_code_snippet` for that exact range — no whole-file Reads.
+- Trace relationships: `cbm_trace_path` (callers/callees), `cbm_detect_changes` (impact of a diff).
+- Multi-repo workspaces must scope: `file_pattern="**/<repo>/**"`; resolve duplicate names via `qualified_name`.
+- Batch multi-step lookups with `mcp__cbm__mcpScript` instead of many round trips.
+- Use grep/Read only for literals (strings / config values / log text) or where the index clearly misses the path.
+- After edits, refresh with `code_index` (~8 s full re-parse; worth it).
 ```
 
-写 AGENTS.md 的三条经验：
+Three rules of thumb for writing this kind of instruction:
 
-1. **写规则，不写说明书**——「分析代码前先按此路径走」比「可以用索引」有效得多；模型默认走 grep 不是因为不知道，是因为没人禁止。
-2. **给出口**——"只有 X 才用 grep"比"永远别 grep"更对，字面量检索确实是 grep 的活。
-3. **把最大的坑写死**——project 名怎么拿、多仓库怎么收窄，这两条不写，模型试错一次就退回 grep。
+1. **Write rules, not manuals** — "before reading code, follow this path" beats "you may use the index". The model defaults to grep not because it doesn't know better, but because nobody said otherwise.
+2. **Leave an exit** — "grep only for literals" is more correct than "never grep". Literal-string search genuinely belongs to grep.
+3. **Hard-code the two biggest traps** — how to obtain the project name, and how to scope a multi-repo workspace. Omit these and the model falls back to grep after one failed attempt.
 
-## 配置（可选）
+## Configuration (optional)
 
-在 composition 里给 `codebase-memory` 行加 `config:`：
+Add `config:` to the `codebase-memory` row in the composition:
 
-| 字段 | 默认 | 说明 |
+| Field | Default | Meaning |
 |---|---|---|
-| `bootstrap` | `background` | `blocking` / `background` / `manual`（manual = 只探测不下载） |
-| `adapterVersion` | `2.29.0-0.0.4` | 钉死；**唯一升级入口** |
-| `adapterDir` | `$DSH_HOME/vendor/mcp-adapter` | 压缩层与 `cbm.json` 的落点 |
-| `cbmPath` | 自动探测 | 留空则按 官方安装位 → vendor → PATH 探测 |
+| `bootstrap` | `background` | `blocking` / `background` / `manual` (manual = probe only, never download) |
+| `adapterVersion` | `2.29.0-0.0.4` | pinned; **the single upgrade entry point** |
+| `adapterDir` | `$DSH_HOME/vendor/mcp-adapter` | where layer ② and `cbm.json` live |
+| `cbmPath` | auto-probe | leave empty to probe official → vendor → PATH |
 
-## 验收
+## Verification
 
 ```powershell
 npm run check   # = check:patch + check:plugin + check:chain + check:tokens
 ```
 
-| 检查 | 证明什么 |
+| Check | What it proves |
 |---|---|
-| `check-patch.mjs` | `cordis.patch.yml` 里 3 个 `!!js` 表达式按 Loader 原语义能求值，且指向真实文件；`DSH_HOME` 缺失时的回退同值 |
-| `check-plugin.mjs` | 假 ctx 真实调用 `apply`/`code_index`/`code_setup`：链路就绪、工作区来自会话 cwd、不同工作区→不同 project、cbm 缺失时 throw 并给出安装命令 |
-| `check-chain.mjs` | 真拉起 adapter → cbm 做 MCP 握手：代理工具就位、懒连接被唤醒、`search_graph` 返回真实行 |
-| `check-tokens.mjs` | **消融臂**：直连 cbm vs 经代理的 `tools/list` 实际体积；代理不比直连小就 throw |
+| `check-patch.mjs` | the three `!!js` expressions in `cordis.patch.yml` evaluate under the Loader's exact semantics and point at real files; the `DSH_HOME`-missing fallback yields identical values |
+| `check-plugin.mjs` | a fake ctx — mirroring the real service's preconditions — actually runs `apply`/`code_index`/`code_setup`: chain ready, workspace bound to session cwd, different workspaces → different projects, missing engine throws with a copy-pasteable install command |
+| `check-chain.mjs` | really spawns adapter → engine over MCP stdio: proxy tool present, lazy connection woken up, `search_graph` returns real rows |
+| `check-tokens.mjs` | **ablation arm**: direct engine vs proxied `tools/list` byte size; throws if the proxy is not smaller — the main claim must have a falsifiable premise |
 
-本机实测：
+Measured on the author's machine:
 
 ```
 PATCH OK
-20/20 臂通过（tauri + web 两个 profile）   PLUGIN OK
-CHAIN OK（代理工具 mcp，cbm 15 工具被发现）
-臂A 直连 cbm            : 17 工具, 17308 B ≈ 4327 tokens
-臂B 代理·冷缓存         :  2 工具,  4278 B ≈ 1070 tokens  （省 4.0x）
-臂C 代理·缓存含resources:  3 工具,  4871 B ≈ 1218 tokens  （省 3.6x）
+20/20 arms passed (two profiles)   PLUGIN OK
+CHAIN OK (proxy tool `mcp`, 15 engine tools discovered)
+arm A direct engine            : 17 tools, 17308 B ≈ 4327 tokens
+arm B proxied, cold cache      :  2 tools,  4278 B ≈ 1070 tokens  (4.0x)
+arm C proxied, cache w/ resour.:  3 tools,  4871 B ≈ 1218 tokens  (3.6x)
 ```
 
-> `check-plugin.mjs` 会对本仓库真建一次索引（project 落在 `~/.cache`，不在仓库里）。想只验某个 profile：`node checks/check-plugin.mjs <profile>`。
+> `check-plugin.mjs` really indexes *this* repo once (the project lands in `~/.cache`, never in the repo). To verify a single profile: `node checks/check-plugin.mjs <profile>`.
 
-## 排错
+## Troubleshooting
 
-| 症状 | 原因与处置 |
+| Symptom | Cause & action |
 |---|---|
-| 当前会话工具清单里没有 `code_index`/`code_setup`，但 `code_setup` 能调通 | 工具清单是**会话级快照**：新开的对话才看得到。"没列出"≠"没注册" |
-| `code_setup` 报 `status: NOT READY` | 看它给的缺失项与安装命令，照做后再调一次（它会重试自举，不用重启） |
-| `清单(⑤): (未写)` | bootstrap 在写 `cbm.json` 前抛错了——把 `error:` 行原样报给维护者 |
-| 检索报 `ambiguous` + 候选列表 | 工作区里多个仓库有同名符号。用候选里的 `qualified_name`，或加 `file_pattern` 收窄 |
-| 明明改了代码检索结果还是旧的 | `code_index` 刷一次（约 8s）。MCP 模式下 daemon 也会 watch，但**动手前刷一次最便宜** |
-| 某个目录/文件死活搜不到 | 十有八九被 `.gitignore` 排除了（索引引擎尊重 gitignore + 默认跳过 `node_modules` 等）。`code_index` 返回里的 `excluded`/`not_indexed_files` 会列出原因 |
-| 桌面端装了但没生效 | 大概率装错了 profile。`--dump-config` 里搜 `codebase-memory` 确认进没进组合 |
+| `code_index`/`code_setup` missing from the current session's tool list, yet calling them works | The tool list is a **per-session snapshot**: only newly opened conversations see it. "not listed" ≠ "not registered" |
+| `code_setup` says `status: NOT READY` | Follow the missing-piece hints it prints, then call it again (it re-bootstraps; no restart needed) |
+| Manifest line shows `(not written)` | bootstrap threw before writing `cbm.json` — hand the `error:` line to a maintainer verbatim |
+| Search returns `ambiguous` + candidates | Multiple repos in the workspace define the same symbol name. Use one candidate's `qualified_name`, or scope with `file_pattern` |
+| Results look stale right after edits | Refresh with `code_index` (~8 s). In MCP mode the daemon also watches, but refreshing before acting is the cheap, deterministic option |
+| A file/directory never shows up | Nine times out of ten `.gitignore` excludes it (the engine honors gitignore + skips `node_modules` etc. by default). The `excluded` / `not_indexed_files` fields in `code_index` output list why |
+| Installed on desktop, nothing happens | Wrong profile, most likely. Confirm with `--dump-config` that `codebase-memory` is in the composition |
 
-## 工程备注（给要改它的人）
+## Engineering notes (for whoever modifies it)
 
-- **boot 绝不 throw**：依赖缺失只记进状态（`code_setup` 报），boot 抛错会炸掉整个 profile，爆炸半径太大。前提检查全部落在工具调用点——"前提不成立即 throw"。
-- **Windows 三连坑**（都已绕开）：PATH 上的 `npm.cmd` 不能无 shell spawn → 探测 `npm-cli.js` 直跑；cbm 的 `.cmd` shim 同理 → 清单里写绝对 `.exe`；PowerShell 5.1 按 ANSI 读无 BOM 的中文 `.ps1` → 仓库脚本一律 `.mjs` 用 node 跑。
-- **`ctx.subprocess.spawn` 的两条真实契约**（本版插件曾各栽一次，验收的假 ctx 现在照抄了它们）：
-  1. `cwd` 必填——真实实现对 `spec.cwd.includes('\0')` 求值，`undefined` 直接 TypeError；
-  2. `collected.stdout.readFrom(n)` 返回 `{ text, nextOffset, lossy }`，不是字符串。
-- **改完代码必须 sync 再重启**：pnpm 对 `file:` 依赖按 lockfile 判定，内容变化不重拷贝。`node scripts/sync.mjs` 直拷到各 profile；不能用 `link:`（Node 按 realpath 解析，仓库路径下裸导入 `@deepseek-ai/*` 会加载失败）。运行中的 host 锁着 composition，sync 只拷有差异的文件。
-- **验收必须能自证伪**：补强检查后，先对**未同步的旧代码**跑一遍——能复现线上同一条错误才算有牙，再修再绿。
+- **Never throw at boot**: missing dependencies only update the reported state (`code_setup`), because a boot throw kills the whole profile. All precondition checks live at the tool-call site — "precondition unmet ⇒ throw" applies to calls, not startup.
+- **Two real contracts of `ctx.subprocess.spawn`** (this plugin shipped a bug past each of them once; the acceptance fake ctx now mirrors both):
+  1. `cwd` is required — the implementation evaluates `spec.cwd.includes('\0')`, so `undefined` throws TypeError;
+  2. `collected.stdout.readFrom(n)` returns `{ text, nextOffset, lossy }`, not a string — `String()` of it is `"[object Object]"`.
+- **Windows trio**, all worked around explicitly in code: PATH's `npm.cmd` cannot be spawned without a shell → probe `npm-cli.js` and run it under node; the engine's `.cmd` shim, same story → the manifest always points at the absolute `.exe`; PowerShell 5.1 reads BOM-less Chinese `.ps1` as ANSI → every script here is `.mjs` run by node.
+- **After edits: sync, then restart.** pnpm treats `file:` dependencies as immutable by lockfile — content changes are never re-copied. `node scripts/sync.mjs` copies straight into each installed profile and re-hashes to verify. `link:` (junction) is *not* an option: Node resolves realpath, and bare `@deepseek-ai/*` imports fail from the repo path. A running host locks the composition, so sync only touches files that differ.
+- **Checks must be falsifiable**: after hardening a check, run it against the *old, unsynced* code first — only reproducing the exact production error (FAIL, exit 1) proves it has teeth; then fix, then go green.
 
-## 已知限制与不做
+## Known limitations & non-goals
 
-- **平台**：当前实现按 Windows 写死（`.exe` 探测、`USERPROFILE` 回退、npm-cli.js 候选）。Linux/macOS 用户欢迎提 PR 或 issue。
-- **刷新是全量的**：`code_index` 每次重解析整个工作区（中型仓库约 8s）。图新鲜度以你最后一次调用为准。
-- 数据类文件不进索引：`.gitignore` 命中的目录（题库、sqlite、构建产物）本来就不该由**代码**索引来管。
-- **不做**：移植 mcp-adapter、自研索引引擎、自写下载器、自建 watcher、把索引产物入库、索引状态侧栏 UI、跨项目智能路由（理由见[为什么需要它](#为什么需要它这个插件存在的全部理由)——工作区选择本来就是人的决定）。
+- **Platform**: the current implementation hardcodes Windows (`USERPROFILE` fallback, `.exe` probing, npm-cli.js candidates). Linux/macOS users: issues and PRs welcome.
+- **Refresh is full**: `code_index` re-parses the whole workspace every time (~8 s for a mid-size repo). Graph freshness = your last call.
+- Data-ish files are simply not code: anything your `.gitignore` excludes (databases, build output, question banks) will never appear in the graph — by design.
+- **Explicit non-goals**: porting the MCP adapter, writing an indexing engine, rolling our own downloader, building a watcher, committing index artifacts to repos, an index-status sidebar UI, and smart cross-project routing (see [why](#why-this-plugin-exists) — choosing the workspace is, and should remain, a human decision).
 
 ## License
 
