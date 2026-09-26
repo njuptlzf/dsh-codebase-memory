@@ -63,13 +63,16 @@ git clone https://github.com/njuptlzf/dsh-codebase-memory
 dsh plugin --profile <你的profile> add file:<clone 出来的绝对路径>
 ```
 
-> **先确认目标 profile。** 桌面端和 web 是两个 profile，装错的 symptoms 非常干净：重启后工具完全不出现。不确定就先 `dsh --profile <name> --dump-config` 搜 `codebase-memory`。
+> **先确认目标 profile。** profile 是随 app 走的——桌面端跑自己的（官方桌面包叫 `tauri`），web 跑另一个（`web`）；桌面安装不认识的 profile 名会被直接拒绝。不确定就 `dsh --profile <name> --dump-config` 搜 `codebase-memory`。
 >
-> `dsh plugin add` 在依赖多的 profile 里可能长时间不返回（实测超过 10 分钟）。它实际是两步：pnpm 装包 + 把名字写进 `dsh.profile.bundles`。卡住就手动补 bundles 条目——插件生效只需要"文件在 node_modules 里 + 名字在 bundles 里"：
+> `dsh plugin` 的本质是在 profile 目录里跑 pnpm，随后**自动对账 `dsh.profile.bundles`——但仅在 pnpm 干净退出之后**：声明了 `dsh.bundle` 的依赖进层栈，被移除的出层栈。插件生效 = "文件在 node_modules 里 + 名字在 bundles 里"。
 >
-> ```jsonc
-> "dsh": { "profile": { "bundles": [ /* ... */, "dsh-codebase-memory" ] } }
-> ```
+> CLI 的四个行为值得提前知道：
+>
+> - **`add .` 是坑**——相对路径按**调用目录**解析，在别的目录跑 `add .` 会静默链到那个目录。在 clone 的仓库目录里执行、或直接传绝对 `file:` 路径才是安全的。
+> - **git 装法会触发构建**——pnpm 默认拦截 `prepare` 脚本：把它打印的那个键加进 profile 的 `pnpm-workspace.yaml` 的 `allowBuilds` 再跑一遍。
+> - **首次执行可能要几分钟**——插件多的 profile 里 pnpm 解析慢，是等待不是卡死。
+> - **别在 Windows PowerShell 5.1 里带 stderr 重定向地脚本化调用**——启动 shim（`$ErrorActionPreference='Stop'`）会把任何一行 stderr（pnpm 进度、node 警告）升级成终止错误，死在 pnpm 启动之前：exit 1、日志空、状态半吊子。用交互终端（或 PowerShell 7）执行；之后刷新代码用插件自带的 sync 脚本。
 
 ### ③ 重启，然后验证
 
@@ -207,6 +210,8 @@ CHAIN OK（代理工具 mcp，cbm 15 工具被发现）
 | 明明改了代码检索结果还是旧的 | `code_index` 刷一次（约 8s）。MCP 模式下 daemon 也会 watch，但**动手前刷一次最便宜** |
 | 某个目录/文件死活搜不到 | 十有八九被 `.gitignore` 排除了（索引引擎尊重 gitignore + 默认跳过 `node_modules` 等）。`code_index` 返回里的 `excluded`/`not_indexed_files` 会列出原因 |
 | 桌面端装了但没生效 | 大概率装错了 profile。`--dump-config` 里搜 `codebase-memory` 确认进没进组合 |
+| `dsh plugin add .` 装出来的不是你的 clone | 相对路径按**调用目录**解析——在别的目录跑 `add .` 链的就是那个目录。回到仓库目录里执行，或传绝对路径 |
+| `dsh plugin …` 秒退、日志为空 | Windows PowerShell 5.1 + stderr 重定向 + `$ErrorActionPreference='Stop'` 把 shim 在 pnpm 启动前打死。换交互终端（或 PowerShell 7）执行 |
 
 ## 工程备注（给要改它的人）
 

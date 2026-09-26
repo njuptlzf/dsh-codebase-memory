@@ -66,13 +66,16 @@ git clone https://github.com/njuptlzf/dsh-codebase-memory
 dsh plugin --profile <your-profile> add file:<absolute-path-to-the-clone>
 ```
 
-> **Confirm the target profile first.** Desktop and web are separate profiles; installing into the wrong one fails in a very quiet way — after restart the tools simply never appear. When unsure: `dsh --profile <name> --dump-config` and search for `codebase-memory`.
+> **Confirm the target profile.** Profiles are per-app — the desktop build runs its own (`tauri` in the official desktop package), the web build another (`web`) — and a profile name unknown to your desktop install is rejected up front. The right profile is simply the one your app boots with; when unsure: `dsh --profile <name> --dump-config` and search for `codebase-memory`.
 >
-> `dsh plugin add` may hang for a long time in dependency-heavy profiles (observed: >10 min). It is really two steps: pnpm installs the package, then the CLI adds the name to `dsh.profile.bundles`. If it stalls, do the second step by hand — the plugin goes live given "files in node_modules + name in bundles":
+> `dsh plugin` runs pnpm in the profile directory, then **reconciles `dsh.profile.bundles` for you** — but only when pnpm exits cleanly: a dependency declaring `dsh.bundle` joins the layer stack, a removed one leaves it. The plugin is live given "files in node_modules + name in bundles".
 >
-> ```jsonc
-> "dsh": { "profile": { "bundles": [ /* ... */, "dsh-codebase-memory" ] } }
-> ```
+> Four behaviors from the CLI worth knowing:
+>
+> - **`add .` is a trap** — relative specs are re-anchored to your *invoking* directory, so `add .` from elsewhere silently links *that* directory instead. From inside the cloned repo (or with an absolute `file:` path) it's safe.
+> - **Git-hosted installs build on install** — pnpm blocks `prepare` scripts until you allow them; add the printed key to `allowBuilds` in the profile's `pnpm-workspace.yaml`, then re-run.
+> - **First run can take minutes** on a profile with many plugins — that is pnpm resolution, not a hang.
+> - **Don't script it with redirected stderr under Windows PowerShell 5.1** — the launcher shim (`$ErrorActionPreference='Stop'`) promotes any stderr line (pnpm progress, a node warning) into a fatal error *before* pnpm starts: exit 1, empty log, half-done state. Run it in an interactive terminal (or PowerShell 7); to refresh code afterwards, use the plugin's own sync script instead.
 
 ### 3. Restart, then verify
 
@@ -210,6 +213,8 @@ arm C proxied, cache w/ resour.:  3 tools,  4871 B ≈ 1218 tokens  (3.6x)
 | Results look stale right after edits | Refresh with `code_index` (~8 s). In MCP mode the daemon also watches, but refreshing before acting is the cheap, deterministic option |
 | A file/directory never shows up | Nine times out of ten `.gitignore` excludes it (the engine honors gitignore + skips `node_modules` etc. by default). The `excluded` / `not_indexed_files` fields in `code_index` output list why |
 | Installed on desktop, nothing happens | Wrong profile, most likely. Confirm with `--dump-config` that `codebase-memory` is in the composition |
+| `dsh plugin add .` installed something — but not your clone | Relative specs anchor to the *invoking* directory. Re-run from inside the repo, or pass an absolute path |
+| `dsh plugin …` exits 1 immediately with an empty log | Windows PowerShell 5.1 + stderr redirection + `$ErrorActionPreference='Stop'` killed the launcher shim before pnpm ran. Use an interactive terminal or PowerShell 7 |
 
 ## Engineering notes (for whoever modifies it)
 
