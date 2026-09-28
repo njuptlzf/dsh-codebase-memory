@@ -133,6 +133,7 @@ async function verify(profile) {
   const a = await mount({})
   const setup = await a.tools.get('code_setup').execute({}, withSignal(REPO))
   record('A 链路就绪', /status: OK/.test(setup), setup.split('\n')[0])
+  record('A auto_index 默认开且已落进引擎配置', /^auto_index: true/m.test(setup), /auto_index:.*$/m.exec(setup)?.[0] ?? '(报表里没有 auto_index 行)')
   record('A prompt 段就位', a.sections.some((s) => s.name === 'codebase-memory' && s.order === 850))
   record('A prompt 段已就绪文案', /code_index/.test(a.sections.at(-1).text()))
 

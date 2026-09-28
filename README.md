@@ -182,6 +182,7 @@ Add `config:` to the `codebase-memory` row in the composition:
 | `adapterVersion` | `2.29.0-0.0.4` | pinned; **the single upgrade entry point** |
 | `adapterDir` | `$DSH_HOME/vendor/mcp-adapter` | where layer ② and `cbm.json` live |
 | `cbmPath` | auto-probe | leave empty to probe official → vendor → PATH |
+| `autoIndex` | `true` | Aligns the engine's `auto_index` at bootstrap (read-first, write only if it differs). **Scope warning:** this lands in the machine-wide `~/.cache/codebase-memory-mcp/_config.db`, shared with every other MCP client on this box — set it to `false` if you don't want this plugin deciding that. Measured semantics: it indexes projects that have **no** index yet when a session starts; it does **not** refresh stale coordinates, so it is not drift protection (`code_index` + `check_index_coverage` still are) |
 
 ## Verification
 

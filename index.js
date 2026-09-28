@@ -50,6 +50,7 @@ export const Config = z.object({
   adapterVersion: z.string().default(DEFAULT_ADAPTER_VERSION),
   adapterDir: z.string().default(''),
   cbmPath: z.string().default(''),
+  autoIndex: z.boolean().default(true),
 })
 
 const dshHome = () => process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -61,6 +62,7 @@ function normalize(config = {}) {
     adapterVersion: config.adapterVersion || DEFAULT_ADAPTER_VERSION,
     adapterDir: config.adapterDir || join(dshHome(), 'vendor', 'mcp-adapter'),
     cbmPath: config.cbmPath || '',
+    autoIndex: config.autoIndex ?? true,
     notes: [],
   }
   if (!BOOTSTRAP_MODES.includes(cfg.bootstrap)) {
@@ -194,6 +196,33 @@ function writeAdapterConfig(cfg, state) {
 
 const push = (state, note) => { if (note) state.notes.push(note) }
 
+/**
+ * 把引擎的 auto_index 对齐到本插件的配置值（默认开）。
+ *
+ * 实测语义（0.11.0，两臂对照）：auto_index **只在 MCP 会话启动、且该项目还没有索引时**补一次
+ * 全量；对"已索引但坐标陈旧"的项目**一次都不重建**（indexed_at 前后不变）。所以它买的是
+ * "新工作区开箱即用"，**不是"防漂移"**——防漂移仍然只有 code_index + check_index_coverage。
+ *
+ * 作用域是**机器级**：配置存在 ~/.cache/codebase-memory-mcp/_config.db，同机其它 MCP client
+ * 共用一份。因此先读再写（幂等、值相同不重复写），且失败只记 note——boot 绝不 throw。
+ */
+async function ensureAutoIndex(ctx, cfg, state, signal) {
+  const want = cfg.autoIndex ? 'true' : 'false'
+  try {
+    const cur = await run(ctx, [state.cbmPath, 'config', 'get', 'auto_index'], { maxBytes: 8 * 1024, signal })
+    const have = (cur.stdout || '').trim().split('\n').pop()
+    if (cur.exitCode === 0 && have === want) {
+      state.autoIndex = want
+      return
+    }
+    const set = await run(ctx, [state.cbmPath, 'config', 'set', 'auto_index', want], { maxBytes: 8 * 1024, signal })
+    if (set.exitCode === 0) state.autoIndex = want
+    else push(state, `auto_index 没能设为 ${want}（退出码 ${set.exitCode}）：${(set.stderr || set.stdout).trim().slice(-160)}`)
+  } catch (error) {
+    push(state, `auto_index 设置异常，已忽略：${String(error?.message ?? error).slice(0, 160)}`)
+  }
+}
+
 /** 幂等自举：成功过一次就不再重复；未就绪时每次都重试（补装后无需重启）。 */
 async function bootstrap(ctx, cfg, state, signal, { force = false } = {}) {
   if (state.ok && !force) return state
@@ -203,6 +232,7 @@ async function bootstrap(ctx, cfg, state, signal, { force = false } = {}) {
     const r = await run(ctx, [state.cbmPath, '--version'], { maxBytes: 64 * 1024, signal })
     state.cbmVersion = (r.stdout || r.stderr).trim().split('\n')[0]
     writeAdapterConfig(cfg, state)
+    await ensureAutoIndex(ctx, cfg, state, signal)
   }
   state.ok = state.adapter === 'ready' && state.cbm === 'ready'
   return state
@@ -226,6 +256,7 @@ function report(cfg, state) {
     `索引引擎(①): ${state.cbm}  ${state.cbmPath || '(未找到)'}${state.cbmVersion ? '  ' + state.cbmVersion : ''}`,
     `清单(⑤): ${state.configPath ?? '(未写)'}  exclude=${JSON.stringify(EXCLUDE_TOOLS)}`,
     `代理工具: ${PROXY_TOOL}  bootstrap=${cfg.bootstrap}  adapterVersion=${cfg.adapterVersion}`,
+    `auto_index: ${state.autoIndex || '(未设置)'}（期望 ${cfg.autoIndex ? 'true' : 'false'}；机器级共享配置，只补"无索引的新项目"，不刷新陈旧坐标）`,
   ]
   if (cfg.notes.length) lines.push('notes: ' + cfg.notes.join(' / '))
   if (state.notes.length) lines.push('notes: ' + state.notes.join(' / '))
@@ -271,7 +302,7 @@ function usageSection(state) {
  */
 export async function apply(ctx, config) {
   const cfg = normalize(config)
-  const state = { adapter: 'unknown', cbm: 'unknown', ok: false, notes: [], lastError: '' }
+  const state = { adapter: 'unknown', cbm: 'unknown', ok: false, autoIndex: '', notes: [], lastError: '' }
 
   const ac = new AbortController()
   ctx.effect(() => () => ac.abort(), 'dsh-codebase-memory.abort')

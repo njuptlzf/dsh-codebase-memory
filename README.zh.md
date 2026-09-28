@@ -179,6 +179,7 @@ code_index（建索引 / 改完代码后刷新）→ 拿到 project
 | `adapterVersion` | `2.29.0-0.0.4` | 钉死；**唯一升级入口** |
 | `adapterDir` | `$DSH_HOME/vendor/mcp-adapter` | 压缩层与 `cbm.json` 的落点 |
 | `cbmPath` | 自动探测 | 留空则按 官方安装位 → vendor → PATH 探测 |
+| `autoIndex` | `true` | 自举时把引擎的 `auto_index` 对齐到该值（先读后写，值相同不重复写）。**作用域警告**：它落在机器级共享的 `~/.cache/codebase-memory-mcp/_config.db`，同机所有 MCP client 共用——不想让本插件替你决定就设成 `false`。实测语义：只给**尚无索引**的项目在会话启动时补一次全量，**不刷新陈旧坐标**，所以它不是防漂移手段（防漂移仍是 `code_index` + `check_index_coverage`） |
 
 ## 验收
 
