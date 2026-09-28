@@ -21,7 +21,7 @@
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -51,6 +51,7 @@ export const Config = z.object({
   adapterDir: z.string().default(''),
   cbmPath: z.string().default(''),
   autoIndex: z.boolean().default(true),
+  sessionRefresh: z.boolean().default(true),
 })
 
 const dshHome = () => process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -63,6 +64,7 @@ function normalize(config = {}) {
     adapterDir: config.adapterDir || join(dshHome(), 'vendor', 'mcp-adapter'),
     cbmPath: config.cbmPath || '',
     autoIndex: config.autoIndex ?? true,
+    sessionRefresh: config.sessionRefresh ?? true,
     notes: [],
   }
   if (!BOOTSTRAP_MODES.includes(cfg.bootstrap)) {
@@ -182,7 +184,10 @@ function writeAdapterConfig(cfg, state) {
         args: [],
         // 二进制默认往 stderr 写 warn，会污染诊断；none 让它安静。
         env: { CBM_LOG_LEVEL: 'none' },
-        lifecycle: 'lazy',
+        // lazy-keep-alive：首次使用后常驻。plain `lazy` 会走 adapter 全局默认 idleTimeout=10 分钟
+        // 被回收（源码 init.ts: persistsAfterFirstSpawn = eager || lazy-keep-alive），一被回收，
+        // cbm 的 session-managed daemon 与 watcher 一起消失——实测 daemon 恰好只活 10 分钟。
+        lifecycle: 'lazy-keep-alive',
         // cbm 不暴露 MCP resources；开着只会多一个常驻工具定义（实测 3→2 个工具）。
         exposeResources: false,
         excludeTools: EXCLUDE_TOOLS,
@@ -296,13 +301,90 @@ function usageSection(state) {
   ].join('\n')
 }
 
+// ── H2：会话启动时的补偿刷新 ─────────────────────────────────────────────────
+// 为什么需要：引擎的自动更新依赖"服务进程 cwd 那个 project 的 git watcher"，而一个 MCP server
+// 进程只有一个静态 cwd，且 watcher 随客户端会话存活（实测：会话一断，permanent daemon 在也不
+// 工作）。DSH 是多会话、工作区可变，所以那条路结构上覆盖不到会话工作区——后果是坐标陈旧时
+// get_code_snippet **静默返回邻居代码**（实测真实仓库 59 个符号里 20 个错位，见 README）。
+// 闸门唯一理由是成本：一次 index_repository 墙钟主要是固定开销（300 文件 18s / 1000 文件 21s），
+// 所以"每次会话都刷"不可接受，而"git 状态没变就跳过"只要几十毫秒。
+
+const REFRESH_MIN_INTERVAL_MS = 5 * 60 * 1000
+
+/** 同一工作区的 git 状态摘要；非 git 工作区返回 null（与引擎 auto_watch 的 git-only 行为一致）。 */
+async function workspaceDigest(ctx, cwd, signal) {
+  const head = await run(ctx, ['git', 'rev-parse', 'HEAD'], { cwd, maxBytes: 16 * 1024, signal })
+  if (head.exitCode !== 0) return null
+  const dirty = await run(ctx, ['git', 'status', '--porcelain'], { cwd, maxBytes: 256 * 1024, signal })
+  if (dirty.exitCode !== 0) return null
+  const text = dirty.stdout || ''
+  let hash = 0
+  for (let i = 0; i < text.length; i++) hash = (hash * 31 + text.charCodeAt(i)) | 0
+  return `${(head.stdout || '').trim()}|${text.length}|${hash}`
+}
+
+/** 该项目是否已在图里：按 root_path 精确匹配，不自己重算 cbm 的命名规则。 */
+async function alreadyIndexed(ctx, state, cwd, signal) {
+  const listing = await run(ctx, [state.cbmPath, 'cli', '--quiet', 'list_projects'], { cwd, maxBytes: 256 * 1024, signal })
+  if (listing.exitCode !== 0) return false
+  const norm = (p) => p.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase()
+  return (listing.stdout || '').split('\n').some((line) => {
+    const parts = line.trim().split(/\s+/)
+    return parts.length >= 2 && norm(parts[1]) === norm(cwd)
+  })
+}
+
+/** detached 刷新的 stdout 没人看，不留日志就无从排障。写不了日志也绝不打扰会话。 */
+function refreshLog(cfg, line) {
+  try {
+    mkdirSync(cfg.adapterDir, { recursive: true })
+    writeFileSync(join(cfg.adapterDir, 'refresh.log'), `${new Date().toISOString()} ${line}\n`, { flag: 'a' })
+  } catch { /* 忽略 */ }
+}
+
+const readStamps = (path) => { try { return JSON.parse(readFileSync(path, 'utf8')) } catch { return {} } }
+
+/**
+ * 会话启动补偿刷新：闸门 → 后台跑。全程不抛、不 await（调用方是同步监听器）。
+ * 只有"git 状态变了 且 该项目已索引过"才会真的付出那次 ~15–30s 的后台开销。
+ */
+async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
+  const cwd = agent?.session?.header?.cwd
+  if (!cwd) { refreshLog(cfg, 'skip (无会话 cwd)'); return }
+  if (state.cbm !== 'ready') { refreshLog(cfg, `skip ${cwd}: 引擎未就绪`); return }
+  const stampPath = join(cfg.adapterDir, 'refresh-stamps.json')
+  const stamps = readStamps(stampPath)
+  const last = stamps[cwd]
+  if (last && Date.now() - (last.at ?? 0) < REFRESH_MIN_INTERVAL_MS) { refreshLog(cfg, `skip ${cwd}: 冷却中`); return }
+  if (state.refreshing.has(cwd)) { refreshLog(cfg, `skip ${cwd}: 已有一次刷新在跑`); return }
+  const digest = await workspaceDigest(ctx, cwd, signal)
+  if (digest === null) { refreshLog(cfg, `skip ${cwd}: 非 git 工作区（与引擎 auto_watch 一致）`); return }
+  if (last && last.digest === digest) { refreshLog(cfg, `skip ${cwd}: git 状态未变`); return }
+  if (!(await alreadyIndexed(ctx, state, cwd, signal))) { refreshLog(cfg, `skip ${cwd}: 尚未索引过（不替用户制造索引）`); return }
+  state.refreshing.add(cwd)
+  refreshLog(cfg, `refresh ${cwd}（git 状态变了）`)
+  try {
+    const r = await run(ctx, [state.cbmPath, 'cli', '--quiet', 'index_repository', '--repo-path', cwd], {
+      cwd, maxBytes: 1024 * 1024, graceMs: 60000, signal,
+    })
+    refreshLog(cfg, `done ${cwd} exit=${r.exitCode}`)
+    if (r.exitCode === 0) {
+      writeFileSync(stampPath, JSON.stringify({ ...stamps, [cwd]: { at: Date.now(), digest } }, null, 2), 'utf8')
+    }
+  } catch (error) {
+    refreshLog(cfg, `fail ${cwd}: ${String(error?.message ?? error).slice(0, 160)}`)
+  } finally {
+    state.refreshing.delete(cwd)
+  }
+}
+
 /**
  * @param ctx - host 上下文（tools + subprocess + systemPrompt）。
  * @param config - 见 Config。
  */
 export async function apply(ctx, config) {
   const cfg = normalize(config)
-  const state = { adapter: 'unknown', cbm: 'unknown', ok: false, autoIndex: '', notes: [], lastError: '' }
+  const state = { adapter: 'unknown', cbm: 'unknown', ok: false, autoIndex: '', refreshing: new Set(), notes: [], lastError: '' }
 
   const ac = new AbortController()
   ctx.effect(() => () => ac.abort(), 'dsh-codebase-memory.abort')
@@ -323,6 +405,21 @@ export async function apply(ctx, config) {
     order: 850,
     text: () => usageSection(state),
   }), 'dsh-codebase-memory.usage-section')
+
+  // H2：会话启动补偿刷新。监听器必须**同步且绝不抛**——它跑在 agent 启动的发布路径上，
+  // 所以这里只做特性探测 + 启动后台任务（`on` 不存在就静默降级，不违"boot 绝不 throw"）。
+  if (cfg.sessionRefresh && typeof ctx.on === 'function') {
+    ctx.on('agent/session-start', (payload) => {
+      try {
+        const cwd = payload?.agent?.session?.header?.cwd
+        // 绝不静默吞掉失败：detached 的后台任务没人看 stdout，只有日志能事后定位。
+        void refreshSessionWorkspace(ctx, cfg, state, payload?.agent, ac.signal)
+          .catch((error) => refreshLog(cfg, `fail ${cwd ?? '(无 cwd)'}: 未捕获 ${String(error?.message ?? error).slice(0, 160)}`))
+      } catch (error) {
+        push(state, `会话启动刷新未能启动（已忽略）：${String(error?.message ?? error).slice(0, 120)}`)
+      }
+    })
+  }
 
   ctx.tools.register(defineTool({
     name: 'code_setup',

@@ -15,8 +15,9 @@
  *   C 两工作区区分    两个不同工作区 → 两个不同 project（R1 的判据）
  *   D 前提自证伪      cbm 找不到时必须 throw 并给出安装命令，不静默降级
  */
-import { spawn } from 'node:child_process'
-import { existsSync, readdirSync } from 'node:fs'
+import { execFileSync, spawn } from 'node:child_process'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -49,10 +50,11 @@ const record = (label, ok, detail = '') => {
 }
 
 /** 把 ctx.subprocess 接到真的 node:child_process 上，其余服务用最小替身。 */
-function makeCtx(tools, sections) {
+function makeCtx(tools, sections, events = {}) {
   return {
     effect: (fn) => fn(),
-    on: () => {},
+    // 记录监听器而不是吞掉：H2 的会话启动刷新挂在 'agent/session-start' 上，验收要能调到它。
+    on: (name, fn) => { (events[name] ??= []).push(fn) },
     tools: { register: (tool) => tools.set(tool.name, tool) },
     systemPrompt: { section: (section) => { sections.push(section); return section } },
     subprocess: {
@@ -122,11 +124,12 @@ async function verify(profile) {
   const mount = async (config) => {
     const tools = new Map()
     const sections = []
-    await apply(makeCtx(tools, sections), config)
+    const events = {}
+    await apply(makeCtx(tools, sections, events), config)
     if (!tools.has('code_index') || !tools.has('code_setup')) {
       throw new Error(`期望注册 code_index + code_setup，实际 ${[...tools.keys()].join(',')}`)
     }
-    return { tools, sections }
+    return { tools, sections, events }
   }
 
   // ── 臂 A：链路就绪 ──────────────────────────────────────────────────────────
@@ -149,6 +152,85 @@ async function verify(profile) {
   // 预算：这段文本会注入本工作区**每一次模型调用**，所以长度是成本契约（非风格偏好）。
   // 基线（接入说明最初版）约 843 字符；放宽到 1150 给两处静默/响亮坑的说明留空间。
   record('A prompt 段不过预算', prompt.length <= 1150, `${prompt.length} 字符（上限 1150）`)
+
+  // ── 臂 E：A 的 lifecycle + H2 的会话启动补偿刷新 ──────────────────────────────
+  const manifest = JSON.parse(readFileSync(join(ADAPTER_DIR, 'cbm.json'), 'utf8'))
+  record('E 清单用 lazy-keep-alive（会话内不被 10 分钟回收）',
+    manifest.mcpServers?.cbm?.lifecycle === 'lazy-keep-alive', String(manifest.mcpServers?.cbm?.lifecycle))
+
+  const startHandlers = a.events['agent/session-start'] ?? []
+  record('E 注册了 agent/session-start 监听', startHandlers.length === 1, `handlers=${startHandlers.length}`)
+  const off = await mount({ sessionRefresh: false })
+  record('E sessionRefresh=false 时确实不注册监听', (off.events['agent/session-start'] ?? []).length === 0)
+
+  // 非 git 工作区必须被闸门挡下：既证明监听器跑通了，也证明它没为无意义的仓库付索引开销。
+  const nonGit = join(tmpdir(), `cbm-check-nongit-${process.pid}`)
+  mkdirSync(nonGit, { recursive: true })
+  let syncThrow = null
+  try {
+    startHandlers[0]?.({ agent: { session: { header: { cwd: nonGit } } }, source: 'startup' })
+  } catch (error) {
+    syncThrow = String(error?.message ?? error)
+  }
+  record('E 监听器同步返回且不抛（不会 veto 会话启动）', syncThrow === null, syncThrow ?? '')
+  await new Promise((resolve) => setTimeout(resolve, 6000))
+  const refreshLogPath = join(ADAPTER_DIR, 'refresh.log')
+  const logText = existsSync(refreshLogPath) ? readFileSync(refreshLogPath, 'utf8') : ''
+  const mine = logText.split('\n').filter((line) => line.includes(String(process.pid)))
+  record('E 非 git 工作区被闸门跳过', mine.some((line) => /非 git 工作区/.test(line)), (mine.at(-1) ?? '(日志里没有本次记录)').slice(0, 130))
+  rmSync(nonGit, { recursive: true, force: true })
+
+  // ── 臂 F（可选，CBM_CHECK_REFRESH=1）：H2 的**正向**路径真的会刷新 ────────────
+  // 默认不跑：它要建 git 仓库、真跑一次 index_repository（约 20–40s）。但它是这条链上
+  // 唯一能证明"闸门放行后会真的刷新且第二次不再重复"的检查，所以留在仓库里可随时跑。
+  if (process.env.CBM_CHECK_REFRESH === '1') {
+    const repo = join(tmpdir(), `cbm-check-refresh-${process.pid}-${profile}`)
+    rmSync(repo, { recursive: true, force: true })
+    mkdirSync(repo, { recursive: true })
+    const runSync = (argv, opts = {}) => execFileSync(argv[0], argv.slice(1), { encoding: 'utf8', maxBuffer: 1 << 26, ...opts })
+    const gitc = (args) => runSync(['git', ...args], { cwd: repo, stdio: ['ignore', 'pipe', 'ignore'] })
+    try {
+      writeFileSync(join(repo, 'r.ts'), 'export function before(n: number): number {\n  return n;\n}\n', 'utf8')
+      gitc(['init', '-q']); gitc(['add', '-A']); gitc(['-c', 'user.email=c@x', '-c', 'user.name=c', 'commit', '-qm', 'init'])
+      const project = repo.replace(/[:\\/]+/g, '-')
+      runSync([CBM_EXE, 'cli', '--quiet', 'index_repository', '--repo-path', repo])
+      const projBefore = /indexed_at: (\S+)/.exec(runSync([CBM_EXE, 'cli', '--quiet', 'index_status', '--project', project]))?.[1]
+      // 未提交改动 ⇒ git 摘要变化 ⇒ 闸门应放行
+      writeFileSync(join(repo, 'r.ts'), 'export function before(n: number): number {\n  return n;\n}\nexport function h2probe(z: number): number {\n  return z + 1;\n}\n', 'utf8')
+      // 清掉这个路径的历史 stamp：冷却闸门会读它，测试必须可控，否则重跑会命中 5 分钟冷却
+      const stampPath = join(ADAPTER_DIR, 'refresh-stamps.json')
+      try {
+        const st = JSON.parse(readFileSync(stampPath, 'utf8'))
+        delete st[repo]
+        writeFileSync(stampPath, JSON.stringify(st, null, 2), 'utf8')
+      } catch { /* 没有 stamp 文件就正好 */ }
+      const countRuns = () => (readFileSync(refreshLogPath, 'utf8')
+        .match(new RegExp(`^\\S+ refresh ${repo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'gm')) ?? []).length
+
+      // ① 第一次触发：闸门应放行并**真的**刷新
+      const runsBefore = countRuns()
+      startHandlers[0]?.({ agent: { session: { header: { cwd: repo } } }, source: 'startup' })
+      let done = false
+      for (let i = 0; i < 30 && !done; i++) {
+        await new Promise((r) => setTimeout(r, 4000))
+        done = new RegExp(`done .*${process.pid}[^\\n]*-${profile}[^\\n]*exit=0`).test(readFileSync(refreshLogPath, 'utf8'))
+      }
+      const projAfter = /indexed_at: (\S+)/.exec(runSync([CBM_EXE, 'cli', '--quiet', 'index_status', '--project', project]))?.[1]
+      const searchable = !/results: 0/.test(runSync([CBM_EXE, 'cli', '--quiet', 'search_graph', '--project', project, '--query', 'h2probe']))
+      record('F 闸门放行后真的刷新了索引', done && countRuns() === runsBefore + 1 && projAfter !== projBefore, `indexed_at ${projBefore} → ${projAfter}`)
+      record('F 刷新后新符号可检索', searchable)
+
+      // ② 立刻再触发：git 摘要没变 ⇒ 只能走廉价路径，不能真跑第二次。
+      // 只数"真跑"的行（refresh <repo>）：诊断性的 skip 行本身会新增，不该算进去。
+      const runsBeforeSecond = countRuns()
+      startHandlers[0]?.({ agent: { session: { header: { cwd: repo } } }, source: 'startup' })
+      await new Promise((r) => setTimeout(r, 5000))
+      record('F 二次触发不再真跑刷新（未变化闸门）', countRuns() === runsBeforeSecond, `实际刷新次数 ${runsBeforeSecond} → ${countRuns()}`)
+    } finally {
+      try { runSync([CBM_EXE, 'cli', '--quiet', 'delete_project', '--project', repo.replace(/[:\\/]+/g, '-')]) } catch { /* 忽略 */ }
+      rmSync(repo, { recursive: true, force: true })
+    }
+  }
 
   // ── 臂 B：工作区绑定 ────────────────────────────────────────────────────────
   const indexTool = a.tools.get('code_index')
