@@ -103,19 +103,26 @@ Get-ChildItem ~/.cache/codebase-memory-mcp -Filter *.db
 
 ### 2. 标准动线
 
+按**任务顺序**记，四步就够（与注入 prompt 的文案同构，两处改了要一起改）：
+
 ```
 code_index（建索引 / 改完代码后刷新）→ 拿到 project
-→ cbm_search_graph 定位符号 → cbm_get_code_snippet 读那一段
-→ 需要关系时 cbm_trace_path / cbm_detect_changes
+→ 定位   cbm_search_graph   → qualified_name 与 file+行号
+→ 取原文 cbm_get_code_snippet（带 format:"json"，才是逐字节原文）
+→ 验鲜   cbm_check_index_coverage（freshness=metadata_changed ⇒ 先 code_index 再动手）
+→ 需要关系时 cbm_trace_path
 ```
 
-检索一律走代理工具 `mcp__cbm__mcp`，`args` **直接传对象**（不需要 JSON 字符串）：
+检索一律走代理工具 `mcp__cbm__mcp`，`args` **直接传对象**：
 
 ```jsonc
 {"tool": "cbm_search_graph", "args": {"project": "<project>", "query": "符号名", "limit": 10}}
-{"tool": "cbm_get_code_snippet", "args": {"project": "<project>", "qualified_name": "<search_graph 给的 qn>"}}
+{"tool": "cbm_get_code_snippet", "args": {"project": "<project>", "qualified_name": "<qn>", "format": "json"}}
+{"tool": "cbm_check_index_coverage", "args": {"project": "<project>", "paths": ["apps/server/src/x.ts"]}}
 {"tool": "cbm_trace_path", "args": {"project": "<project>", "function_name": "X", "direction": "callers"}}
 ```
+
+> `format` 不带就是 `tree`——那是排版信封，会给每行贴固定前导空格，照抄当锚点必不匹配（详见[已知限制](#已知限制与不做)）。
 
 多步查询用 `mcp__cbm__mcpScript` 一次跑完（实测两次 `search_graph` 合计 73ms），别拆成多次往返。
 

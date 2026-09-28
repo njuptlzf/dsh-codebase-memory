@@ -136,6 +136,19 @@ async function verify(profile) {
   record('A prompt 段就位', a.sections.some((s) => s.name === 'codebase-memory' && s.order === 850))
   record('A prompt 段已就绪文案', /code_index/.test(a.sections.at(-1).text()))
 
+  // ── prompt 契约（动线齐 / args 形状对 / 不埋过期常量）──────────────────────────
+  const prompt = a.sections.at(-1).text()
+  const needCallables = ['cbm_search_graph', 'cbm_get_code_snippet', 'cbm_check_index_coverage']
+  const missing = needCallables.filter((needle) => !prompt.includes(needle))
+  record('A prompt 动线含可调用工具名', missing.length === 0, missing.length ? `缺 ${missing.join(', ')}` : '')
+  record('A prompt 取原文示例带 format:json', /"format":"json"/.test(prompt))
+  // args 必须是对象形状：出现 \" 说明示例写成了转义 JSON 字符串，与 README 的教法语义冲突
+  record('A prompt args 用对象形状', !/\\"/.test(prompt), /\\"/.test(prompt) ? '渲染文本里有 \\"，即示例把 args 写成了字符串' : '')
+  record('A prompt 不含易过期常量', !/0\.1\d\.\d|\+\d\s*空格|逃不掉/.test(prompt))
+  // 预算：这段文本会注入本工作区**每一次模型调用**，所以长度是成本契约（非风格偏好）。
+  // 基线（接入说明最初版）约 843 字符；放宽到 1150 给两处静默/响亮坑的说明留空间。
+  record('A prompt 段不过预算', prompt.length <= 1150, `${prompt.length} 字符（上限 1150）`)
+
   // ── 臂 B：工作区绑定 ────────────────────────────────────────────────────────
   const indexTool = a.tools.get('code_index')
   const paramKeys = Object.keys(indexTool.parameters ?? {})

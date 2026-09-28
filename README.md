@@ -106,19 +106,26 @@ Measured order of magnitude (mid-size TS repo, ~700 files): first build 10–13 
 
 ### 2. The standard flow
 
+Learn it as **four task-ordered steps** (this mirrors the text injected into the system prompt — change both or neither):
+
 ```
 code_index (build / refresh after edits) → you have the project name
-→ cbm_search_graph to locate symbols → cbm_get_code_snippet to read exactly that range
-→ for relationships: cbm_trace_path / cbm_detect_changes
+→ locate:  cbm_search_graph        → qualified_name + file + line range
+→ read:    cbm_get_code_snippet     (pass format:"json" — that's the byte-exact source)
+→ verify:  cbm_check_index_coverage (freshness=metadata_changed ⇒ re-run code_index first)
+→ for relationships: cbm_trace_path
 ```
 
 All retrieval goes through the proxy tool `mcp__cbm__mcp`; pass `args` **as a plain object** (no JSON-string double encoding):
 
 ```jsonc
-{"tool": "cbm_search_graph",     "args": {"project": "<project>", "query": "symbolName", "limit": 10}}
-{"tool": "cbm_get_code_snippet", "args": {"project": "<project>", "qualified_name": "<qn from search_graph>"}}
-{"tool": "cbm_trace_path",       "args": {"project": "<project>", "function_name": "X", "direction": "callers"}}
+{"tool": "cbm_search_graph",         "args": {"project": "<project>", "query": "symbolName", "limit": 10}}
+{"tool": "cbm_get_code_snippet",     "args": {"project": "<project>", "qualified_name": "<qn from search_graph>", "format": "json"}}
+{"tool": "cbm_check_index_coverage", "args": {"project": "<project>", "paths": ["apps/server/src/x.ts"]}}
+{"tool": "cbm_trace_path",           "args": {"project": "<project>", "function_name": "X", "direction": "callers"}}
 ```
+
+> Omitting `format` gives you `tree` — a typesetting envelope that rewrites leading whitespace on every line, so copied text never matches the file. See [known limitations](#known-limitations--non-goals).
 
 For multi-step lookups, run them in one `mcp__cbm__mcpScript` call instead of round-tripping (measured: two `search_graph` calls in 73 ms total).
 
