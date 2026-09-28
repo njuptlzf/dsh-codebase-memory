@@ -155,8 +155,8 @@ async function verify(profile) {
 
   // ── 臂 E：A 的 lifecycle + H2 的会话启动补偿刷新 ──────────────────────────────
   const manifest = JSON.parse(readFileSync(join(ADAPTER_DIR, 'cbm.json'), 'utf8'))
-  record('E 清单用 lazy-keep-alive（会话内不被 10 分钟回收）',
-    manifest.mcpServers?.cbm?.lifecycle === 'lazy-keep-alive', String(manifest.mcpServers?.cbm?.lifecycle))
+  record('E 清单用 keep-alive（启动即连接，消除会话启动竞态）',
+    manifest.mcpServers?.cbm?.lifecycle === 'keep-alive', String(manifest.mcpServers?.cbm?.lifecycle))
 
   const startHandlers = a.events['agent/session-start'] ?? []
   record('E 注册了 agent/session-start 监听', startHandlers.length === 1, `handlers=${startHandlers.length}`)

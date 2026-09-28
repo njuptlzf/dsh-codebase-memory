@@ -184,10 +184,16 @@ function writeAdapterConfig(cfg, state) {
         args: [],
         // 二进制默认往 stderr 写 warn，会污染诊断；none 让它安静。
         env: { CBM_LOG_LEVEL: 'none' },
-        // lazy-keep-alive：首次使用后常驻。plain `lazy` 会走 adapter 全局默认 idleTimeout=10 分钟
-        // 被回收（源码 init.ts: persistsAfterFirstSpawn = eager || lazy-keep-alive），一被回收，
-        // cbm 的 session-managed daemon 与 watcher 一起消失——实测 daemon 恰好只活 10 分钟。
-        lifecycle: 'lazy-keep-alive',
+        // keep-alive：**启动即连接**（adapter 源码 init.ts:290-295 —— 只有 keep-alive/eager 进
+        // startupServers）并打 keep-alive 标记（init.ts:264 markKeepAlive，带健康检查重连）。
+        //   · 不用 lazy / lazy-keep-alive：那两者是"首次使用才连"，于是 cbm 的 auto_index 与
+        //     watcher baseline 会与**第一次工具调用并发**——这正是 DSH 有启动竞态、Claude Code
+        //     没有的原因（后者在会话启动时连接已配置的 MCP server）。
+        //   · 不用 eager：CHANGELOG 明写 eager 是 "connect at startup, no auto-reconnect"。
+        //   · 它消除的是**启动竞态**，不是陈旧窗口：变更仍靠 git 轮询（实测 18–30s 才感知），
+        //     且只盯"服务进程 cwd"那一个 project——多工作区仍靠 sessionRefresh 补。
+        // 代价：DSH host 一启动就常驻一个 cbm 进程（实测约 17MB RSS）。
+        lifecycle: 'keep-alive',
         // cbm 不暴露 MCP resources；开着只会多一个常驻工具定义（实测 3→2 个工具）。
         exposeResources: false,
         excludeTools: EXCLUDE_TOOLS,
