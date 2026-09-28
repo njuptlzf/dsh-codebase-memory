@@ -251,12 +251,15 @@ function usageSection(state) {
     `检索：都用代理工具 \`${PROXY_TOOL}\`，arguments 是 JSON 对象：`,
     '- 发现工具：{"server":"cbm"} 列出全部；{"search":"关键词"} 搜；{"describe":"cbm_search_graph"} 看参数',
     '- 找符号：{"tool":"cbm_search_graph","args":"{\\"project\\":\\"<project>\\",\\"query\\":\\"关键词\\"}"}',
-    '- 读源码：{"tool":"cbm_get_code_snippet","args":"{\\"project\\":\\"<project>\\",\\"qualified_name\\":\\"<qn>\\"}"}',
+    '- 读源码：{"tool":"cbm_get_code_snippet","args":"{\\"project\\":\\"<project>\\",\\"qualified_name\\":\\"<qn>\\",\\"format\\":\\"json\\"}"}',
     '- 追调用链：{"tool":"cbm_trace_path","args":"{\\"project\\":\\"<project>\\",\\"function_name\\":\\"...\\"}"}',
     '',
     'graph 优先：先 search_graph 定位符号，再 get_code_snippet 只读那一段，比逐文件',
     'grep/read 省一个数量级 token。改完代码后用 code_index 刷新（增量）。',
     '不要用 cbm_index_repository（已从工具面移除）：索引一律走 `code_index`。',
+    '',
+    '取源码传 `format:"json"`：默认 tree 是排版信封、每行被贴前导空格，照抄当锚点必不匹配。',
+    '行号取自索引，代码改过没重新 code_index 会静默指到别处（check_index_coverage 可检出 metadata_changed）。',
   ].join('\n')
 }
 
