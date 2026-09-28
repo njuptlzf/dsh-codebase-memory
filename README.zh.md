@@ -215,7 +215,7 @@ CHAIN OK（代理工具 mcp，cbm 15 工具被发现）
 | `code_setup` 报 `status: NOT READY` | 看它给的缺失项与安装命令，照做后再调一次（它会重试自举，不用重启） |
 | `清单(⑤): (未写)` | bootstrap 在写 `cbm.json` 前抛错了——把 `error:` 行原样报给维护者 |
 | 检索报 `ambiguous` + 候选列表 | 工作区里多个仓库有同名符号。用候选里的 `qualified_name`，或加 `file_pattern` 收窄 |
-| 明明改了代码检索结果还是旧的 | 只能靠自己 `code_index` 刷（约 8s），别指望后台。`auto_index` 默认 `false`：watcher 只**报告**漂移（`check_index_coverage` → `freshness = metadata_changed`），不会**修复**；而 `lifecycle: lazy` 下根本没有常驻进程在 watch（实测：daemon 才活 10 分钟，索引已经旧 3 天）。想让它真的自动重建，要显式 `codebase-memory-mcp config set auto_index true`（另有 `auto_index_limit` 上限）——代价是引擎会自己挑时机重解析，所以默认关 |
+| 明明改了代码检索结果还是旧的 | 先说好消息：**会话活着时引擎确实会自愈**——会话会拉起 `session-managed` daemon（`codebase-memory-mcp daemon status` 可查），它的 **git watcher 会自己重索引**；在临时仓库实测，**未提交**的改动 **约 30 秒**就被感知。但要三个前提同时成立，而 DSH 里通常缺两个：① watcher 只认**服务进程 cwd 对应的那个 project**——`auto_watch` 是 *git* watcher，而我们的清单**没有设 `cwd`**，于是它盯的是宿主 cwd 而非会话工作区；② 那个根目录得真是 git 仓库（像 `C:\Users\kingdee\work` 就不是）；③ `lifecycle: "lazy"` 会让服务在 adapter 默认 **10 分钟**空闲后被回收（`idleTimeout` 默认 10，只有 `eager`/`lazy-keep-alive` 会归零），daemon 与 watcher 一起没——这就是索引能旧好几天的原因。所以：`check_index_coverage --paths` 负责发现，`code_index` 负责保证。`auto_index` 只管"从没索引过的项目" |
 | 从片段里复制的锚点，`edit` 死活匹配不上 | 默认的 `tree` 渲染给每行贴了固定前导空格（`get_code_snippet` +2、`search_code --mode full` +8），照抄的文本不是文件字节。**调用时传 `format: "json"`**——它的 `source` 逐字节等于文件；或者锚点走 `read` |
 | 片段返回的代码不是它声称的那个符号 | 行号来自索引、正文来自磁盘：文件在上次 `code_index` 之后行号漂移过，你拿到的就是**邻居**——却仍带着正确的 `name`/`source_mode`，**不报错**。用 `check_index_coverage --paths <文件>` 检出（`freshness = metadata_changed`），再 `code_index`；`index_status` 一直报 `ready`，看不出来 |
 | 某个目录/文件死活搜不到 | 十有八九被 `.gitignore` 排除了（索引引擎尊重 gitignore + 默认跳过 `node_modules` 等）。`code_index` 返回里的 `excluded`/`not_indexed_files` 会列出原因 |
