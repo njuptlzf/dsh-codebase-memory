@@ -240,7 +240,7 @@ CHAIN OK（代理工具 mcp，cbm 15 工具被发现）
   2. *坐标仍可能过期——这条才真危险*：`start_line`/`end_line` 取自索引、正文取自磁盘，所以未重新索引的改动之后，片段会**静默返回偏移过的、看着像真的但是错的区域**——`name` 和 `source_mode: full` 照旧、不报错。[上游 issue #1750](https://github.com/DeusData/codebase-memory-mcp/issues/1750) 记的就是它（仍 open）。`index_status` **看不出来**（一直报 `ready`），但 `check_index_coverage --paths <文件>` 能：`freshness = metadata_changed`、`recommended_action = read_source_and_reindex`——那是**信号**、不是修复。所以改完就 `code_index`，动手前用 `read` 取锚点。
   片段把 CRLF 归一成 LF **不算坑**：DSH 的 `edit` 是行尾感知的（LF 锚点能命中 CRLF 文件，写回时 CRLF 原样保留）。
 - **平台**：当前实现按 Windows 写死（`.exe` 探测、`USERPROFILE` 回退、npm-cli.js 候选）。Linux/macOS 用户欢迎提 PR 或 issue。
-- **刷新是全量的**：`code_index` 每次重解析整个工作区（中型仓库约 8s）。图新鲜度以你最后一次调用为准。
+- **刷新是增量的——墙钟耗时主要花在固定开销上，而不是重解析。** 用节点 id 在临时 git 仓库上实测：**零改动**的 `code_index` **什么都不动**（每个节点 id 与 `sqlite_sequence` 完全一致）；**只改 1 个文件**时，只有**那个文件**的节点被换了 id——**19/19 未改动文件 id 分毫不动**。所以它并不是"每次重解析整个工作区"。你真正付的是每次运行的固定开销（进程启动、开库、变更检测）：1000 文件仓库约 21s、ruankao-ai 28–30s，而且几乎不随文件数增长（300 文件 ≈ 18s → 1000 文件 ≈ 21s）。**watcher** 是另一条代码路径：改 1 个文件后它还会把靠后的文件**重编号**（实测 `[18,53,54] → [18,54,55]`，而全局只多了 1 个 id），所以它的写入面比 CLI 路径宽。图新鲜度以你最后一次调用为准。
 - 数据类文件不进索引：`.gitignore` 命中的目录（题库、sqlite、构建产物）本来就不该由**代码**索引来管。
 - **不做**：移植 mcp-adapter、自研索引引擎、自写下载器、自建 watcher、把索引产物入库、索引状态侧栏 UI、跨项目智能路由（理由见[为什么需要它](#为什么需要它这个插件存在的全部理由)——工作区选择本来就是人的决定）。
 
