@@ -173,7 +173,8 @@ This workspace is code-indexed (dsh-codebase-memory). Before reading code:
 - Multi-repo workspaces must scope: `file_pattern="**/<repo>/**"`; resolve duplicate names via `qualified_name`.
 - Batch multi-step lookups with `mcp__cbm__mcpScript` instead of many round trips.
 - Use grep/Read only for literals (strings / config values / log text) or where the index clearly misses the path.
-- After edits, refresh with `code_index` (~8 s full re-parse; worth it).
+- Point the **workspace at the repo itself** (a non-git parent directory is never watched).
+- After edits, refresh with `code_index` (wall clock ~20–30 s, mostly fixed per-run overhead — it is not a full re-parse).
 ```
 
 Three rules of thumb for writing this kind of instruction:
