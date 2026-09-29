@@ -1,0 +1,116 @@
+# 上游兼容性检查：codebase-memory-mcp 一旦发新版，就下载**那个版本**并跑本仓库的检查。
+#
+# 为什么需要它：本插件不 import 引擎，只 shell 它的二进制（CLI + MCP 工具面）。所以引擎升级
+# 不会在安装期报错，只可能在使用期因为"某个工具/字段/语义变了"而坏掉。这个 workflow 就是那条
+# 探针——它回答"这次升级到底破没破契约"，而不是"有没有新版"。
+#
+# 两个事实源：
+#   · 本插件实测通过的版本 = package.json 的 dsh.testedEngine（插件运行期提示也读它，别改两处）
+#   · 引擎安装位置 = $DSH_HOME/vendor/codebase-memory-mcp/bin/（checks/check-plugin.mjs 就按这个路径找）
+# 官方安装脚本支持 $env:CBM_DOWNLOAD_URL 覆盖下载基址，所以能钉版本装。
+name: upstream-compat
+
+on:
+  schedule:
+    - cron: '0 3 * * 1' # 每周一 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  compat:
+    # 插件本身按 Windows 写死（.exe 探测、USERPROFILE 回退），所以必须跑 windows
+    runs-on: windows-latest
+    env:
+      DSH_HOME: ${{ github.workspace }}\.ci-dsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 读实测版本 + 查上游最新 release
+        id: probe
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tested = (Get-Content package.json -Raw | ConvertFrom-Json).dsh.testedEngine
+          $rel = Invoke-RestMethod -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; 'User-Agent' = 'dsh-ci' } `
+            'https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest'
+          $tag = $rel.tag_name -replace '^v', ''
+          # 只比 minor：testedEngine 写 '0.11'，release 写 '0.11.0'
+          $mine = ($tested -split '\.')[0..1] -join '.'
+          $theirs = ($tag -split '\.')[0..1] -join '.'
+          "tested=$tested"    >> $env:GITHUB_OUTPUT
+          "tag=$tag"          >> $env:GITHUB_OUTPUT
+          "need=$($mine -ne $theirs)" >> $env:GITHUB_OUTPUT
+          Write-Host "实测通过=$tested  上游最新=$tag  ⇒ 需要跑=$($mine -ne $theirs)"
+
+      - name: 钉版本安装引擎并放到 checks 期望的位置
+        if: steps.probe.outputs.need == 'true'
+        shell: pwsh
+        env:
+          TAG: ${{ steps.probe.outputs.tag }}
+        run: |
+          # 用官方脚本 + CBM_DOWNLOAD_URL 钉到指定 tag（脚本自带 checksums 校验）
+          $env:CBM_DOWNLOAD_URL = "https://github.com/DeusData/codebase-memory-mcp/releases/download/$env:TAG"
+          irm https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.ps1 -OutFile install.ps1
+          Unblock-File .\install.ps1
+          .\install.ps1 -y --skip-config
+          # 安装脚本落在 ~/.local/bin；checks/check-plugin.mjs 按 $DSH_HOME/vendor/... 找，所以拷过去
+          $bin = Join-Path $env:USERPROFILE '.local\bin\codebase-memory-mcp.exe'
+          if (-not (Test-Path $bin)) { throw "安装后找不到 $bin" }
+          $dest = Join-Path $env:DSH_HOME 'vendor\codebase-memory-mcp\bin'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item $bin (Join-Path $dest 'codebase-memory-mcp.exe') -Force
+          & (Join-Path $dest 'codebase-memory-mcp.exe') --version
+
+      - name: 跑本仓库的四联检查
+        if: steps.probe.outputs.need == 'true'
+        id: checks
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          npm run check 2>&1 | Tee-Object -FilePath check.log
+          "ok=$($LASTEXITCODE -eq 0)" >> $env:GITHUB_OUTPUT
+
+      - name: 有新版本时开/更新 issue（附结论）
+        if: steps.probe.outputs.need == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.probe.outputs.tag }}
+          TESTED: ${{ steps.probe.outputs.tested }}
+          OK: ${{ steps.checks.outputs.ok }}
+        run: |
+          $verdict = if ($env:OK -eq 'true') {
+            "✅ 四联检查**全部通过** ⇒ 兼容，只需把 package.json 的 ``dsh.testedEngine`` 升到 ``$env:TAG``。"
+          } else {
+            "❌ 检查**失败** ⇒ 契约可能已变（工具名/参数/字段/排版/语义），需要本次修复后再升 ``testedEngine``。"
+          }
+          $body = @"
+          上游 release ``$env:TAG`` 出现（本插件实测通过：``$env:TESTED``）。
+
+          $verdict
+
+          检查日志见本 run 的 artifact / 步骤输出。
+          "@
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; 'User-Agent' = 'dsh-ci' }
+          $existing = Invoke-RestMethod -Headers $headers `
+            'https://api.github.com/search/issues?q=repo:njuptlzf/dsh-codebase-memory+state:open+label:upstream-compat'
+          if ($existing.total_count -gt 0) {
+            $n = $existing.items[0].number
+            Invoke-RestMethod -Method Post -Headers $headers -ContentType 'application/json' `
+              -Uri "https://api.github.com/repos/njuptlzf/dsh-codebase-memory/issues/$n/comments" `
+              -Body (@{ body = $body } | ConvertTo-Json) | Out-Null
+            Write-Host "已追加评论到 issue #$n"
+          } else {
+            $created = Invoke-RestMethod -Method Post -Headers $headers -ContentType 'application/json' `
+              -Uri 'https://api.github.com/repos/njuptlzf/dsh-codebase-memory/issues' `
+              -Body (@{ title = "上游兼容性：codebase-memory-mcp $env:TAG"; body = $body; labels = @('upstream-compat') } | ConvertTo-Json)
+            Write-Host "已新建 issue #$($created.number)"
+          }

@@ -260,11 +260,37 @@ function cbmInstallHint(state) {
   ].join('\n')
 }
 
+/**
+ * 本插件实测通过的引擎版本。**唯一事实源是 package.json 的 `dsh.testedEngine`**——
+ * 定时兼容性 CI（.github/workflows/upstream-compat.yml）读的是同一个字段，避免两处漂移。
+ */
+function testedEngine() {
+  try {
+    return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))?.dsh?.testedEngine ?? ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 引擎版本判定：`'ok'`（同一 minor）/ `'untested'`（超出实测范围）/ `''`（版本拿不到）。
+ * 导出是为了让验收能直接证伪这条逻辑，而不必伪造一个"未实测的引擎"。
+ */
+export function engineVerdict(version, tested = testedEngine()) {
+  const pick = (v) => String(v ?? '').match(/\d+\.\d+(?:\.\d+)?/)?.[0] ?? ''
+  const got = pick(version)
+  const want = pick(tested)
+  if (!got || !want) return ''
+  const minor = (v) => v.split('.').slice(0, 2).join('.')
+  return minor(got) === minor(want) ? 'ok' : 'untested'
+}
+
 function report(cfg, state) {
   const lines = [
     `status: ${state.ok ? 'OK' : 'NOT READY'}`,
     `压缩层(②): ${state.adapter}  ${cfg.adapterMjs}`,
     `索引引擎(①): ${state.cbm}  ${state.cbmPath || '(未找到)'}${state.cbmVersion ? '  ' + state.cbmVersion : ''}`,
+    `引擎实测: 实测通过 ${testedEngine() || '(未声明)'}；当前 ${state.cbmVersion || '(未探测)'}${engineVerdict(state.cbmVersion) === 'untested' ? '  ⚠ 超出实测范围——工具面可能已变，跑 npm run check' : ''}`,
     `清单(⑤): ${state.configPath ?? '(未写)'}  exclude=${JSON.stringify(EXCLUDE_TOOLS)}`,
     `代理工具: ${PROXY_TOOL}  bootstrap=${cfg.bootstrap}  adapterVersion=${cfg.adapterVersion}`,
     `auto_index: ${state.autoIndex || '(未设置)'}（期望 ${cfg.autoIndex ? 'true' : 'false'}；机器级共享配置，只补"无索引的新项目"，不刷新陈旧坐标）`,

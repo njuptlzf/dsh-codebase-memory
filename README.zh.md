@@ -10,6 +10,8 @@
 - [为什么需要它](#为什么需要它这个插件存在的全部理由)
 - [安装](#安装)
 - [怎么用](#怎么用)（含[话术清单](#3-话术清单实测有效)与 [AGENTS.md 模板](#4-怎么写-agentsmd一劳永逸)）
+- [DSH 怎么找到它，模型又怎么开始用它](#dsh-怎么找到它模型又怎么开始用它)
+- [引擎兼容性（codebase-memory-mcp 变了会怎样）](#引擎兼容性codebase-memory-mcp-变了会怎样)
 - [配置](#配置可选)
 - [验收](#验收)
 - [排错](#排错)
@@ -179,6 +181,42 @@ code_index（建索引 / 改完代码后刷新）→ 拿到 project
 1. **写规则，不写说明书**——「分析代码前先按此路径走」比「可以用索引」有效得多；模型默认走 grep 不是因为不知道，是因为没人禁止。
 2. **给出口**——"只有 X 才用 grep"比"永远别 grep"更对，字面量检索确实是 grep 的活。
 3. **把最大的坑写死**——project 名怎么拿、多仓库怎么收窄，这两条不写，模型试错一次就退回 grep。
+
+## DSH 怎么找到它，模型又怎么开始用它
+
+**被加载是 per-host 的，不是 per-workspace 的。** 一旦装进某个 profile，插件对**每个会话**都生效，与打开哪个仓库无关。把 git 仓库当工作区打开，改变的是**索引能不能保鲜**（watcher 终于轮询得到它——见 §1），不是插件是否被加载。
+
+识别是**两侧各一个标记**，而且都不是 `systemPrompt`：
+
+| 侧 | 标记 | 含义 |
+|---|---|---|
+| 本包 | `package.json` → `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }`，以及 `exports` 暴露 `index.js` 与 patch | "我是 DSH bundle，加载时打这个补丁" |
+| profile | `~/.dsh/profiles/<p>/package.json` → ①`dependencies["dsh-codebase-memory"]` ②`dsh.profile.bundles[]` 里有这个名字 | ①文件在 `node_modules` 里 ②**这才是"启用"** |
+
+`dsh plugin --profile <p> add file:<repo>` 一次写全这两处。之后开发循环是 `node scripts/sync.mjs` → **重启 host**（`cordis.yml` 在加载时按 bundle 列表组合；而 pnpm 把 `file:` 依赖当不可变对象——`sync.mjs` 就是为此存在）。
+
+**采纳（让模型真的用 cbm 搜代码）**是另一个更弱的问题，三档杠杆，越靠后越硬：
+
+1. **prompt 段（已接线）**：`inject: ['systemPrompt']` → `ctx.systemPrompt.section({ name: 'codebase-memory', order: 850, text: usageSection(state) })`，内容就是那 4 步动线（定位 → 取原文 `format:"json"` → 验鲜）＋"比逐文件 grep/read 省一个数量级 token"的论证。
+2. **仓库自己的 `AGENTS.md`（推荐，零安装）**：按项目生效、可版本化、更贴近"这个仓库该怎么干活"。§4 有可复制模板，`ruankao-ai/AGENTS.md` 就是实际用例。
+3. **`PreToolUse` 钩子（强制档，需额外装包）**：DSH 钩子匹配的是**模型看到的工具名**（`ctx.on("tools/pre-execute", … runPoint("PreToolUse", exec.name, …))`），所以能匹配 `grep|glob|read`，命中后可以"附加上下文"或"拦下并给理由"。这是唯一能**干涉**而不只是说服的一档，代价是环境改动：本机**两个 profile 都没装** `dsh-hooks-claude-code`（它的模块只在 DSH 安装树里，`.dsh-module-fallback` 又没有 `@deepseek-ai/*`），所以挂它 = 往 profile 装这个包 + 加进 `dsh.profile.bundles` + 给它一个 `configPath` 指向 `hooks.json` + 重启。只有在模型持续无视索引时才值得付。
+
+## 引擎兼容性（codebase-memory-mcp 变了会怎样）
+
+**本插件按"契约"依赖引擎，不按包版本**——它从不 import cbm，只 shell 它的二进制（单独安装、运行期才发现版本，`code_setup` 会打印）。所以上游升级**不会**在安装期报错，只可能在**使用期**坏在我们依赖的东西上：
+
+```
+1 二进制发现：PATH / 官方安装位 / vendor；--version
+2 CLI：cli --quiet --json <tool>；config get|set；daemon start|stop|status；index_repository --repo-path
+3 MCP 工具与形状：search_graph；get_code_snippet + format:"json"；
+  check_index_coverage --paths → freshness / recommended_action；trace_path；list_projects；index_status
+4 行为语义：watch 注册规则（只有创建者）、非 git 时 strategy=none、刷新的增量性、
+  tree vs json 排版、CRLF→LF 归一
+```
+
+- **运行期守卫（插件内）**：`package.json → dsh.testedEngine` 是"我们实测通过哪个版本"的唯一事实源。`code_setup` 会打印 `引擎实测: 实测通过 <tested>；当前 <version>`，超出该范围时追加警告——**只警告，不 throw**。
+- **定时 CI（`.github/workflows/upstream-compat.yml`）**：每周（+手动触发）问上游最新 release，与 `dsh.testedEngine` 比 minor；不一致时**钉版本**装那个 release（用 `CBM_DOWNLOAD_URL` 覆盖官方安装脚本的下载基址）并跑 `npm run check`（patch → plugin → chain → tokens），然后开/更新 issue，给出结论：✅ 兼容 ⇒ 只需把 `testedEngine` 升上去；❌ 失败 ⇒ 契约变了，插件需要改。
+- **上游变更何时才需要发新插件版本？** 只有上面四条里哪条动了才需要。引擎内部改进（新语言、提速、新工具）**无需**发插件版本——用户自己 `codebase-memory-mcp update` 即可。CI 的作用就是告诉你这次属于哪一种。MCP adapter 是**另一条独立的升级轴**，仍然钉死在 `DEFAULT_ADAPTER_VERSION`。
 
 ## 配置（可选）
 

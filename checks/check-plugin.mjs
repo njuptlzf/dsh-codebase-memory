@@ -117,7 +117,7 @@ async function verify(profile) {
   console.log(`\n[${profile}] ${installed}`)
 
   const mod = await import(pathToFileURL(installed).href)
-  const { apply, name, inject } = mod
+  const { apply, name, inject, engineVerdict } = mod
   if (name !== 'dsh-codebase-memory') throw new Error(`unexpected plugin name: ${name}`)
   record('装载', true, `name=${name}  inject=${inject.join(',')}`)
 
@@ -137,6 +137,12 @@ async function verify(profile) {
   const setup = await a.tools.get('code_setup').execute({}, withSignal(REPO))
   record('A 链路就绪', /status: OK/.test(setup), setup.split('\n')[0])
   record('A auto_index 默认开且已落进引擎配置', /^auto_index: true/m.test(setup), /auto_index:.*$/m.exec(setup)?.[0] ?? '(报表里没有 auto_index 行)')
+  record('A code_setup 报出引擎实测范围', /^引擎实测: 实测通过 \d/m.test(setup), /^引擎实测:.*$/m.exec(setup)?.[0]?.slice(0, 150) ?? '(没有 引擎实测 行)')
+  // 版本判定直接调用导出函数证伪，不必伪造一个"未实测的引擎"
+  record('A 版本判定可证伪（同 minor=ok / 跨 minor=untested / 空=未声明）',
+    typeof engineVerdict === 'function'
+      && engineVerdict('0.11.0', '0.11') === 'ok' && engineVerdict('0.12.0', '0.11') === 'untested' && engineVerdict('', '0.11') === '',
+    typeof engineVerdict !== 'function' ? '插件未导出 engineVerdict' : `0.11.0→${engineVerdict('0.11.0', '0.11')}  0.12.0→${engineVerdict('0.12.0', '0.11')}  空→'${engineVerdict('', '0.11')}'`)
   record('A prompt 段就位', a.sections.some((s) => s.name === 'codebase-memory' && s.order === 850))
   record('A prompt 段已就绪文案', /code_index/.test(a.sections.at(-1).text()))
 

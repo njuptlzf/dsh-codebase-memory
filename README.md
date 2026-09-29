@@ -10,6 +10,8 @@ A [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) host
 - [Why this plugin exists](#why-this-plugin-exists)
 - [Install](#install)
 - [Usage](#usage) — including [prompting recipes](#3-prompting-recipes-what-actually-triggers-it) and an [AGENTS.md template](#4-encoding-it-in-agentsmd-make-it-permanent)
+- [How DSH finds it, and how the model starts using it](#how-dsh-finds-it-and-how-the-model-starts-using-it)
+- [Engine compatibility (what happens when codebase-memory-mcp changes)](#engine-compatibility-what-happens-when-codebase-memory-mcp-changes)
 - [Configuration](#configuration-optional)
 - [Verification](#verification)
 - [Troubleshooting](#troubleshooting)
@@ -182,6 +184,42 @@ Three rules of thumb for writing this kind of instruction:
 1. **Write rules, not manuals** — "before reading code, follow this path" beats "you may use the index". The model defaults to grep not because it doesn't know better, but because nobody said otherwise.
 2. **Leave an exit** — "grep only for literals" is more correct than "never grep". Literal-string search genuinely belongs to grep.
 3. **Hard-code the two biggest traps** — how to obtain the project name, and how to scope a multi-repo workspace. Omit these and the model falls back to grep after one failed attempt.
+
+## How DSH finds it, and how the model starts using it
+
+**Being loaded is per host, not per workspace.** Once installed into a profile, the plugin is active for *every* session regardless of which repo is opened. Opening a git repo as the workspace changes **whether the index stays fresh** (the watcher can finally poll it — see §1), not whether the plugin is loaded.
+
+Recognition is two-sided, and neither side is `systemPrompt`:
+
+| Side | Marker | Meaning |
+|---|---|---|
+| this package | `package.json` → `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }`, plus `exports` for `index.js` + the patch | "I am a DSH bundle; apply this patch when loading me" |
+| the profile | `~/.dsh/profiles/<p>/package.json` → ①`dependencies["dsh-codebase-memory"]` ②`dsh.profile.bundles[]` contains the name | ① files are present in `node_modules` ② **this is what "enabled" means** |
+
+`dsh plugin --profile <p> add file:<repo>` writes both. Then the dev loop is `node scripts/sync.mjs` → **restart the host** (`cordis.yml` is composed from the bundle list at load; `file:` deps are immutable to pnpm, which is exactly why `sync.mjs` exists).
+
+**Adoption — getting the model to actually search with cbm** — is a separate, weaker problem. Three levers, strongest last:
+
+1. **Prompt section (already wired).** `inject: ['systemPrompt']` → `ctx.systemPrompt.section({ name: 'codebase-memory', order: 850, text: usageSection(state) })`. That text is the 4-step flow (locate → read with `format:"json"` → verify freshness) plus the token argument for preferring the graph over file-by-file Reads.
+2. **The repo's own `AGENTS.md` (recommended, zero install).** Per-project, versionable, and closer to "how this repo wants to be worked on". §4 has a copy-paste template. `ruankao-ai/AGENTS.md` is a real example of this in use.
+3. **A `PreToolUse` hook (enforcement, needs an extra package).** DSH hooks are matched on **the tool name the model sees** (`ctx.on("tools/pre-execute", … runPoint("PreToolUse", exec.name, …))`), so a hook can match `grep|glob|read` and either append context or block with a reason. This is the only lever that can *interfere* rather than persuade — and it costs an environment change: `dsh-hooks-claude-code` is **not installed in any profile here** (its module is only in the DSH install tree, and `.dsh-module-fallback` carries no `@deepseek-ai/*`), so mounting it means installing that package into the profile, adding it to `dsh.profile.bundles`, pointing its `configPath` at a `hooks.json`, and restarting. Only worth it if the model keeps ignoring the index.
+
+## Engine compatibility (what happens when codebase-memory-mcp changes)
+
+**This plugin depends on the engine by contract, not by package version** — it never imports cbm, it shells the binary (installed separately; its version is discovered at runtime and printed by `code_setup`). So an upstream bump will not fail at install time; it can only break at *use* time, if something we rely on moved:
+
+```
+1 binary discovery: PATH / official install dir / vendor; --version
+2 CLI: cli --quiet --json <tool>; config get|set; daemon start|stop|status; index_repository --repo-path
+3 MCP tools & shapes: search_graph; get_code_snippet + format:"json";
+  check_index_coverage --paths → freshness / recommended_action; trace_path; list_projects; index_status
+4 behaviour: watch registration (creator-only), strategy=none for non-git, incremental refresh,
+  tree vs json rendering, CRLF→LF normalisation
+```
+
+- **Runtime guard (in this plugin).** `package.json → dsh.testedEngine` is the single source of truth for the version we have actually verified. `code_setup` prints `引擎实测: 实测通过 <tested>；当前 <version>` and appends a warning when the running engine is outside that range. It warns; it never throws.
+- **Scheduled CI (`.github/workflows/upstream-compat.yml`).** Weekly (plus manual dispatch) it asks upstream for the latest release, compares the minor version with `dsh.testedEngine`, and — when they differ — installs *that* release (`CBM_DOWNLOAD_URL` pins the official installer to the tag) and runs `npm run check` (patch → plugin → chain → tokens). It then opens or updates an issue with the verdict: ✅ compatible → just bump `testedEngine`; ❌ failing → the contract moved and this plugin needs a change.
+- **When does upstream change require a new plugin release?** Only when one of the four lines above moved. Engine-internal improvements (new languages, speed, new tools) need **no** plugin release — users just run `codebase-memory-mcp update`. The CI exists to tell you which of the two you are in. The MCP adapter is a *separate* upgrade axis and stays pinned to `DEFAULT_ADAPTER_VERSION`.
 
 ## Configuration (optional)
 

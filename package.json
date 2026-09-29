@@ -30,7 +30,8 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
-    }
+    },
+    "testedEngine": "0.11"
   },
   "scripts": {
     "sync": "node scripts/sync.mjs",
