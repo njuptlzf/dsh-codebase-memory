@@ -94,12 +94,22 @@ dsh plugin --profile <你的profile> add file:<clone 出来的绝对路径>
 2. project 名由路径推导（非字母数字换成 `-`，如 `D:/code/repo-a` → `D-code-repo-a`），但**以 `code_index` 返回的为准**。
 3. 之后所有检索，`project` 是**唯一的**路由键——每个工具调用都必须带上它。插件不做、也做不了"猜你这次问的是哪个仓库"。
 
+> ### ⚠ 工作区必须指向 **git 仓库本身**，不要用非 git 的父目录
+>
+> 这是唯一一个会**静默**拖垮一切的选择：cbm 的变更检测是**按 project** 的，而在多工作区宿主里"project 就是会话工作区"（引擎取的是 MCP 客户端的 cwd）。用父目录的实测后果：
+>
+> - 父目录不是 git 仓库 ⇒ `watcher.baseline … strategy=none` ⇒ **完全不轮询**（`watcher.changed` 从不触发）；
+> - 子仓库**永远不会**被 watch：watch 只为"**创建 session-managed daemon 的那个客户端**"的 cwd 注册；只是**加入**已有 daemon 的客户端什么都注册不上（用一个长期存活、cwd 指向子仓库的客户端实测两次：`watcher.watch`/`baseline`/`changed`/`unwatch` = **0/0/0/0**）；
+> - 而子仓库的符号仍留在**父目录那张图**里，于是 `get_code_snippet` 给出的是**陈旧坐标**，`index_status` 却一直报 `ready` —— 是**静默的错误答案**，不是报错。
+>
+> 选错的实测代价：真实仓库抽检 **59 个符号里 20 个**返回的区域不含该符号。修法：把**仓库根**作为工作区（它自成 project，watcher 会轮询它），或对该 project 显式刷新（`codebase-memory-mcp cli index_repository --repo-path <repo>`）。
+
 ```powershell
 # 每个 project 一个库文件，索引全在这里（不进代码仓库，重产物归缓存）：
 Get-ChildItem ~/.cache/codebase-memory-mcp -Filter *.db
 ```
 
-实测参考量级（本机，普通笔记本）：中型 TS 仓库（~700 文件）首建 10-13s、图 1700 节点上下；刷新一次约 8s（引擎是全量重解析，不是增量）；单次检索 <100ms。
+实测参考量级（本机）：中型仓库（1,946 节点）首建 **约 30s**；刷新一次墙钟相近（**1000 文件 21s**、**300 文件 18s**）——但它**不是**全量重解析：节点 id 级实测，零改动刷新**什么都不动**（所有 id 与 `sqlite_sequence` 不变），只改 1 个文件时只重插该文件的节点（**19/19** 未改动文件 id 分毫不动）。墙钟主要花在每次运行的固定开销上，几乎不随文件数增长。单次检索 <100ms。
 
 ### 2. 标准动线
 
@@ -216,7 +226,7 @@ CHAIN OK（代理工具 mcp，cbm 15 工具被发现）
 | `code_setup` 报 `status: NOT READY` | 看它给的缺失项与安装命令，照做后再调一次（它会重试自举，不用重启） |
 | `清单(⑤): (未写)` | bootstrap 在写 `cbm.json` 前抛错了——把 `error:` 行原样报给维护者 |
 | 检索报 `ambiguous` + 候选列表 | 工作区里多个仓库有同名符号。用候选里的 `qualified_name`，或加 `file_pattern` 收窄 |
-| 明明改了代码检索结果还是旧的 | 先说好消息：**会话活着时引擎确实会自愈**——会话会拉起 `session-managed` daemon（`codebase-memory-mcp daemon status` 可查），它的 **git watcher 会自己重索引**；在临时仓库实测，**未提交**的改动 **约 30 秒**就被感知。但要三个前提同时成立，而 DSH 里通常缺两个：① watcher 只认**服务进程 cwd 对应的那个 project**——`auto_watch` 是 *git* watcher，而我们的清单**没有设 `cwd`**，于是它盯的是宿主 cwd 而非会话工作区；② 那个根目录得真是 git 仓库（像 `C:\Users\kingdee\work` 就不是）；③ `lifecycle: "lazy"` 会让服务在 adapter 默认 **10 分钟**空闲后被回收（`idleTimeout` 默认 10，只有 `eager`/`lazy-keep-alive` 会归零），daemon 与 watcher 一起没——这就是索引能旧好几天的原因。所以：`check_index_coverage --paths` 负责发现，`code_index` 负责保证。`auto_index` 只管"从没索引过的项目" |
+| 明明改了代码检索结果还是旧的 | **先查工作区选择**（§1）：若会话工作区是非 git 的父目录，则**根本没有任何 watch**，等多久都没用。否则，先说好消息——**会话活着时引擎确实会自愈**——会话会拉起 `session-managed` daemon（`codebase-memory-mcp daemon status` 可查），它的 **git watcher 会自己重索引**；在临时仓库实测，**未提交**的改动 **约 30 秒**就被感知。但要三个前提同时成立，而 DSH 里通常缺两个：① watcher 只认**服务进程 cwd 对应的那个 project**——`auto_watch` 是 *git* watcher，而我们的清单**没有设 `cwd`**，于是它盯的是宿主 cwd 而非会话工作区；② 那个根目录得真是 git 仓库（像 `C:\Users\kingdee\work` 就不是）；③ `lifecycle: "lazy"` 会让服务在 adapter 默认 **10 分钟**空闲后被回收（`idleTimeout` 默认 10，只有 `eager`/`lazy-keep-alive` 会归零），daemon 与 watcher 一起没——这就是索引能旧好几天的原因。所以：`check_index_coverage --paths` 负责发现，`code_index` 负责保证。`auto_index` 只管"从没索引过的项目" |
 | 从片段里复制的锚点，`edit` 死活匹配不上 | 默认的 `tree` 渲染给每行贴了固定前导空格（`get_code_snippet` +2、`search_code --mode full` +8），照抄的文本不是文件字节。**调用时传 `format: "json"`**——它的 `source` 逐字节等于文件；或者锚点走 `read` |
 | 片段返回的代码不是它声称的那个符号 | 行号来自索引、正文来自磁盘：文件在上次 `code_index` 之后行号漂移过，你拿到的就是**邻居**——却仍带着正确的 `name`/`source_mode`，**不报错**。用 `check_index_coverage --paths <文件>` 检出（`freshness = metadata_changed`），再 `code_index`；`index_status` 一直报 `ready`，看不出来 |
 | 某个目录/文件死活搜不到 | 十有八九被 `.gitignore` 排除了（索引引擎尊重 gitignore + 默认跳过 `node_modules` 等）。`code_index` 返回里的 `excluded`/`not_indexed_files` 会列出原因 |
