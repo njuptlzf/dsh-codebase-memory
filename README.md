@@ -196,7 +196,7 @@ Recognition is two-sided, and neither side is `systemPrompt`:
 | this package | `package.json` → `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }`, plus `exports` for `index.js` + the patch | "I am a DSH bundle; apply this patch when loading me" |
 | the profile | `~/.dsh/profiles/<p>/package.json` → ①`dependencies["dsh-codebase-memory"]` ②`dsh.profile.bundles[]` contains the name | ① files are present in `node_modules` ② **this is what "enabled" means** |
 
-`dsh plugin --profile <p> add file:<repo>` writes both. Then the dev loop is `node scripts/sync.mjs` → **restart the host** (`cordis.yml` is composed from the bundle list at load; `file:` deps are immutable to pnpm, which is exactly why `sync.mjs` exists).
+`dsh plugin --profile <p> add file:<repo>` writes both. Then the dev loop is `node scripts/sync.mjs` → **restart the host** (`cordis.yml` is composed from the bundle list at load; `file:` deps are immutable to pnpm, which is exactly why `sync.mjs` exists). **`code_setup` reports the drift for you**: `同步状态: 一致` when the loaded copy matches the repo, or a ⚠ line naming the differing files of the three runtime files (`index.js` / `cordis.patch.yml` / `package.json`). That covers "edited the repo, forgot to sync" — it cannot detect "synced but did not restart", because running code has no hash of its own loaded bytes.
 
 **Adoption — getting the model to actually search with cbm** — is a separate, weaker problem. Three levers, strongest last:
 

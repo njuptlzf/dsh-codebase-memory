@@ -117,7 +117,7 @@ async function verify(profile) {
   console.log(`\n[${profile}] ${installed}`)
 
   const mod = await import(pathToFileURL(installed).href)
-  const { apply, name, inject, engineVerdict } = mod
+  const { apply, name, inject, engineVerdict, fileDrift } = mod
   if (name !== 'dsh-codebase-memory') throw new Error(`unexpected plugin name: ${name}`)
   record('装载', true, `name=${name}  inject=${inject.join(',')}`)
 
@@ -143,6 +143,24 @@ async function verify(profile) {
     typeof engineVerdict === 'function'
       && engineVerdict('0.11.0', '0.11') === 'ok' && engineVerdict('0.12.0', '0.11') === 'untested' && engineVerdict('', '0.11') === '',
     typeof engineVerdict !== 'function' ? '插件未导出 engineVerdict' : `0.11.0→${engineVerdict('0.11.0', '0.11')}  0.12.0→${engineVerdict('0.12.0', '0.11')}  空→'${engineVerdict('', '0.11')}'`)
+
+  record('A code_setup 报出「同步状态」', /^同步状态: /m.test(setup), /^同步状态:.*$/m.exec(setup)?.[0]?.slice(0, 170) ?? '(没有 同步状态 行)')
+  // 漂移判定对两个临时目录证伪：一致→[]；改一个文件→只命中它；读不到→null（不许误报成"不一致"）
+  const driftA = join(tmpdir(), `cbm-drift-a-${process.pid}`)
+  const driftB = join(tmpdir(), `cbm-drift-b-${process.pid}`)
+  mkdirSync(driftA, { recursive: true }); mkdirSync(driftB, { recursive: true })
+  for (const f of ['index.js', 'cordis.patch.yml', 'package.json']) {
+    writeFileSync(join(driftA, f), 'same', 'utf8'); writeFileSync(join(driftB, f), 'same', 'utf8')
+  }
+  const cleanDrift = typeof fileDrift === 'function' ? fileDrift(driftA, driftB) : undefined
+  writeFileSync(join(driftB, 'index.js'), 'changed', 'utf8')
+  const oneDrift = typeof fileDrift === 'function' ? fileDrift(driftA, driftB) : undefined
+  const missingDrift = typeof fileDrift === 'function' ? fileDrift(driftA, join(driftB, 'nope')) : undefined
+  record('A 漂移判定可证伪（一致→[]；改一个→只命中它；读不到→null）',
+    typeof fileDrift === 'function' && Array.isArray(cleanDrift) && cleanDrift.length === 0
+      && Array.isArray(oneDrift) && oneDrift.length === 1 && oneDrift[0] === 'index.js' && missingDrift === null,
+    typeof fileDrift !== 'function' ? '插件未导出 fileDrift' : `一致→${JSON.stringify(cleanDrift)} 改index.js→${JSON.stringify(oneDrift)} 读不到→${missingDrift}`)
+  rmSync(driftA, { recursive: true, force: true }); rmSync(driftB, { recursive: true, force: true })
   record('A prompt 段就位', a.sections.some((s) => s.name === 'codebase-memory' && s.order === 850))
   record('A prompt 段已就绪文案', /code_index/.test(a.sections.at(-1).text()))
 

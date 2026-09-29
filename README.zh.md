@@ -193,7 +193,7 @@ code_index（建索引 / 改完代码后刷新）→ 拿到 project
 | 本包 | `package.json` → `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }`，以及 `exports` 暴露 `index.js` 与 patch | "我是 DSH bundle，加载时打这个补丁" |
 | profile | `~/.dsh/profiles/<p>/package.json` → ①`dependencies["dsh-codebase-memory"]` ②`dsh.profile.bundles[]` 里有这个名字 | ①文件在 `node_modules` 里 ②**这才是"启用"** |
 
-`dsh plugin --profile <p> add file:<repo>` 一次写全这两处。之后开发循环是 `node scripts/sync.mjs` → **重启 host**（`cordis.yml` 在加载时按 bundle 列表组合；而 pnpm 把 `file:` 依赖当不可变对象——`sync.mjs` 就是为此存在）。
+`dsh plugin --profile <p> add file:<repo>` 一次写全这两处。之后开发循环是 `node scripts/sync.mjs` → **重启 host**（`cordis.yml` 在加载时按 bundle 列表组合；而 pnpm 把 `file:` 依赖当不可变对象——`sync.mjs` 就是为此存在）。**`code_setup` 会替你把漂移报出来**：拷贝与仓库一致时显示 `同步状态: 一致`，不一致时给一行 ⚠ 并点名三个运行时文件（`index.js` / `cordis.patch.yml` / `package.json`）里到底哪个不同。它覆盖"改了仓库忘了 sync"；**测不出**"sync 了但没重启"——运行中的代码没有对自己加载字节的哈希。
 
 **采纳（让模型真的用 cbm 搜代码）**是另一个更弱的问题，三档杠杆，越靠后越硬：
 

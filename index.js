@@ -21,9 +21,11 @@
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
+import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 export const name = 'dsh-codebase-memory'
 export const inject = ['tools', 'subprocess', 'systemPrompt']
@@ -285,6 +287,59 @@ export function engineVerdict(version, tested = testedEngine()) {
   return minor(got) === minor(want) ? 'ok' : 'untested'
 }
 
+/**
+ * 运行时三件套 = 与 `scripts/sync.mjs` 的拷贝清单一致。
+ * 为什么需要漂移告警：profile 以 `file:` 引用本插件，而 pnpm 把它当**不可变**依赖——
+ * 仓库里改了 index.js，除非跑 sync.mjs，profile 里的拷贝**不会**变。症状是"改了没生效"，
+ * 而且是静默的。这里把两份拷贝按哈希比出来，把静默失败变成一行可见的话。
+ * 注意它的能力边界：能测「仓库 ≠ 拷贝」（该 sync），**测不出**「sync 了但 host 没重启」
+ * （运行中的代码没有对自己加载字节的哈希）。
+ */
+const RUNTIME_FILES = ['index.js', 'cordis.patch.yml', 'package.json']
+
+/** 本模块被加载的位置（= profile 里的那份拷贝）所在的包目录。 */
+const loadedPackageDir = () => dirname(fileURLToPath(import.meta.url))
+
+/** 从 profile 的 package.json 反解仓库路径（`dependencies[dsh-codebase-memory] = "file:…"`）。 */
+function repoPathFromProfile() {
+  try {
+    const profileDir = dirname(dirname(loadedPackageDir())) // <profile>/node_modules/<pkg> → <profile>
+    const spec = JSON.parse(readFileSync(join(profileDir, 'package.json'), 'utf8'))?.dependencies?.['dsh-codebase-memory'] ?? ''
+    return /^file:(.+)$/.exec(String(spec))?.[1] ?? ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 比较两份拷贝里同名文件的 sha256，返回不一致的文件名数组。
+ * 任一侧读不到就返回 `null`（"无法判定"），绝不 throw——也不把读不到误报成"不一致"。
+ * 导出是为了让验收能对两个临时目录直接证伪这条逻辑，而不必去动真实的 profile。
+ */
+export function fileDrift(packageDir, repoDir, files = RUNTIME_FILES) {
+  if (!packageDir || !repoDir) return null
+  const differing = []
+  try {
+    for (const f of files) {
+      const digest = (dir) => createHash('sha256').update(readFileSync(join(dir, f))).digest('hex')
+      if (digest(packageDir) !== digest(repoDir)) differing.push(f)
+    }
+  } catch {
+    return null
+  }
+  return differing
+}
+
+/** 给 code_setup 报表用的一行。四种结果，都不抛。 */
+function syncStatusLine() {
+  const repo = repoPathFromProfile()
+  if (!repo) return '同步状态: (无法判定：profile 的 package.json 里没有 file: 依赖，或不可读)'
+  const drift = fileDrift(loadedPackageDir(), repo)
+  if (drift === null) return '同步状态: (无法判定：读不到 ' + RUNTIME_FILES.join(' / ') + ' 之一)'
+  if (drift.length === 0) return '同步状态: 一致（拷贝 = 仓库；已重启则为最新代码）'
+  return `同步状态: ⚠ ${drift.join(' / ')} 与仓库不一致——通常是改完仓库没跑 sync（node scripts/sync.mjs）；sync 后**仍需重启 host** 才生效`
+}
+
 function report(cfg, state) {
   const lines = [
     `status: ${state.ok ? 'OK' : 'NOT READY'}`,
@@ -294,6 +349,7 @@ function report(cfg, state) {
     `清单(⑤): ${state.configPath ?? '(未写)'}  exclude=${JSON.stringify(EXCLUDE_TOOLS)}`,
     `代理工具: ${PROXY_TOOL}  bootstrap=${cfg.bootstrap}  adapterVersion=${cfg.adapterVersion}`,
     `auto_index: ${state.autoIndex || '(未设置)'}（期望 ${cfg.autoIndex ? 'true' : 'false'}；机器级共享配置，只补"无索引的新项目"，不刷新陈旧坐标）`,
+    syncStatusLine(),
   ]
   if (cfg.notes.length) lines.push('notes: ' + cfg.notes.join(' / '))
   if (state.notes.length) lines.push('notes: ' + state.notes.join(' / '))
