@@ -9,7 +9,7 @@
 - [链路与分工](#链路与分工)
 - [为什么需要它](#为什么需要它这个插件存在的全部理由)
 - [安装](#安装)
-- [怎么用](#怎么用)（含[话术清单](#3-话术清单实测有效)与 [AGENTS.md 模板](#4-怎么写-agentsmd一劳永逸)）
+- [怎么用](#怎么用)（含[话术清单](#3-话术清单实测有效)、[AGENTS.md 模板](#4-怎么写-agentsmd一劳永逸)与 [SKILL 随插件维护](#5-skill-随插件仓库维护)）
 - [DSH 怎么找到它，模型又怎么开始用它](#dsh-怎么找到它模型又怎么开始用它)
 - [引擎兼容性（codebase-memory-mcp 变了会怎样）](#引擎兼容性codebase-memory-mcp-变了会怎样)
 - [配置](#配置可选)
@@ -181,6 +181,17 @@ code_index（建索引 / 改完代码后刷新）→ 拿到 project
 1. **写规则，不写说明书**——「分析代码前先按此路径走」比「可以用索引」有效得多；模型默认走 grep 不是因为不知道，是因为没人禁止。
 2. **给出口**——"只有 X 才用 grep"比"永远别 grep"更对，字面量检索确实是 grep 的活。
 3. **把最大的坑写死**——project 名怎么拿、多仓库怎么收窄，这两条不写，模型试错一次就退回 grep。
+
+### 5. SKILL 随插件仓库维护
+
+本仓库把配套 SKILL 放在 `skills/` 下，和插件代码一起版本化：
+
+- `skills/dsh-codebase-impact-analysis/SKILL.md`：改前影响、安全重命名、调用链/业务流程分析；细节规则在 `references/deep-rules.md` 按需加载。
+- `skills/dsh-cbm-investigate/SKILL.md`：把 root-cause debugging 与影响分析编排起来；仓库内置 `references/investigation-core.md` 作为可移植精华版，因此不硬依赖本机是否另有全局 `investigate` skill。如果用户已经安装了更完整的 `investigate`，可以选择加载它，但这只是可选增强，不是前提。
+
+`node scripts/sync.mjs` 除了同步插件运行时三件套，也会把 `skills/` 同步到 `$DSH_HOME/skills`。DSH 的 skill filesystem watcher 会发现新增/修改的 skill；插件运行时改动仍需重启 profile。这样做的目的不是省几个文件，而是避免**插件 prompt、README、SKILL 三者各说各话**：cbm 工具名、`code_index`、验鲜规则一旦变，改仓库即可同步到本地 skill。
+
+如果想把 skill 做成“随包发现”而不是复制到用户根目录，可以把 `@deepseek-ai/dsh-skill-filesystem` 的 `bundledSkillDir` 指向已安装插件的 `skills/` 目录；当前默认开发流仍是复制到 `$DSH_HOME/skills`，因为 watcher 能热发现，不需要重启。
 
 ## DSH 怎么找到它，模型又怎么开始用它
 

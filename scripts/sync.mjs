@@ -17,9 +17,9 @@
  * 用 node 而不是 PowerShell：仓库里凡带中文的 .ps1 在 PowerShell 5.1 下会被按
  * ANSI 读取（无 BOM 时），中文字符串直接解析失败。
  */
-import { copyFileSync, existsSync, readFileSync, readdirSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { join } from 'node:path'
+import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const dshHome = process.env.DSH_HOME || join(process.env.USERPROFILE, '.dsh')
@@ -43,6 +43,37 @@ if (targets.length === 0) {
 
 const digest = (path) => createHash('sha256').update(readFileSync(path)).digest('hex')
 
+/** 仓库内目录 bundle 的扁平文件清单；用于把 skills/ 同步到用户 skill 根。 */
+function listFiles(dir, base = dir) {
+  const out = []
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const p = join(dir, entry.name)
+    if (entry.isDirectory()) out.push(...listFiles(p, base))
+    else if (entry.isFile()) out.push({ src: p, rel: relative(base, p) })
+  }
+  return out
+}
+
+function syncSkills() {
+  const skillsRepo = join(repo, 'skills')
+  if (!existsSync(skillsRepo)) return 0
+  const skillsUser = join(dshHome, 'skills')
+  mkdirSync(skillsUser, { recursive: true })
+
+  let changed = 0
+  for (const { src, rel } of listFiles(skillsRepo, skillsRepo)) {
+    const dst = join(skillsUser, rel)
+    mkdirSync(dirname(dst), { recursive: true })
+    if (existsSync(dst) && statSync(dst).isFile() && digest(src) === digest(dst)) continue
+    copyFileSync(src, dst)
+    if (digest(src) !== digest(dst)) throw new Error(`同步 skill 后哈希不一致：${rel}`)
+    console.log(`skill copied  ${rel}`)
+    changed++
+  }
+  if (changed === 0) console.log('\nskills unchanged')
+  return changed
+}
+
 let changedTotal = 0
 for (const profile of targets) {
   const dest = installedIn(profile)
@@ -65,5 +96,8 @@ for (const profile of targets) {
   }
 }
 
-console.log(`\nsynced ${changedTotal} file(s) across ${targets.length} profile(s)`)
-console.log('重启对应 profile 后生效。')
+const skillChangedTotal = syncSkills()
+
+console.log(`\nsynced ${changedTotal} plugin file(s) across ${targets.length} profile(s)`)
+console.log(`synced ${skillChangedTotal} skill file(s) to ${join(dshHome, 'skills')}`)
+console.log('插件运行时改动需重启对应 profile；skill 目录由 filesystem watcher 自动发现。')

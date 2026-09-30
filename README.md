@@ -9,7 +9,7 @@ A [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) host
 - [How the chain is composed](#how-the-chain-is-composed)
 - [Why this plugin exists](#why-this-plugin-exists)
 - [Install](#install)
-- [Usage](#usage) — including [prompting recipes](#3-prompting-recipes-what-actually-triggers-it) and an [AGENTS.md template](#4-encoding-it-in-agentsmd-make-it-permanent)
+- [Usage](#usage) — including [prompting recipes](#3-prompting-recipes-what-actually-triggers-it), an [AGENTS.md template](#4-encoding-it-in-agentsmd-make-it-permanent), and [versioned skills](#5-skills-live-in-this-repo)
 - [How DSH finds it, and how the model starts using it](#how-dsh-finds-it-and-how-the-model-starts-using-it)
 - [Engine compatibility (what happens when codebase-memory-mcp changes)](#engine-compatibility-what-happens-when-codebase-memory-mcp-changes)
 - [Configuration](#configuration-optional)
@@ -184,6 +184,15 @@ Three rules of thumb for writing this kind of instruction:
 1. **Write rules, not manuals** — "before reading code, follow this path" beats "you may use the index". The model defaults to grep not because it doesn't know better, but because nobody said otherwise.
 2. **Leave an exit** — "grep only for literals" is more correct than "never grep". Literal-string search genuinely belongs to grep.
 3. **Hard-code the two biggest traps** — how to obtain the project name, and how to scope a multi-repo workspace. Omit these and the model falls back to grep after one failed attempt.
+
+### 5. Skills live in this repo
+
+The repo also carries the companion skills under `skills/`, versioned with the plugin:
+
+- `skills/dsh-codebase-impact-analysis/SKILL.md`: impact analysis, safe renames, caller/callee traces, business-flow analysis; deep rules are loaded from `references/deep-rules.md` only when needed.
+- `skills/dsh-cbm-investigate/SKILL.md`: orchestration between root-cause debugging and impact analysis. It includes a portable `references/investigation-core.md` distilled from the classic investigate flow, so it does not hard-depend on a global `investigate` skill. If a richer `investigate` skill is installed, it can be used as an optional extension.
+
+`node scripts/sync.mjs` now copies `skills/` to `$DSH_HOME/skills` as well as syncing the runtime plugin files. DSH's filesystem skill provider watches the user skills root, so skill changes are discoverable without restarting the host; plugin runtime changes still require a profile restart. The point is to keep the plugin prompt, README, and skills from drifting into three different truths.
 
 ## How DSH finds it, and how the model starts using it
 

@@ -1,6 +1,6 @@
 {
   "name": "dsh-codebase-memory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "DSH host bundle: index the session workspace with codebase-memory-mcp and expose it through @njuptlzf/mcp-adapter (one ~250-token MCP proxy tool instead of 17 tool schemas).",
   "type": "module",
@@ -8,11 +8,14 @@
   "exports": {
     ".": "./index.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./skills": "./skills",
+    "./skills/*": "./skills/*"
   },
   "files": [
     "index.js",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "skills"
   ],
   "license": "MIT",
   "author": "njuptlzf",
