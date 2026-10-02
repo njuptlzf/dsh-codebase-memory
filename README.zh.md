@@ -84,7 +84,7 @@ dsh plugin --profile <你的profile> add file:<clone 出来的绝对路径>
 跑一下 code_setup，把结果原样贴给我
 ```
 
-看到 `status: OK`、`清单(⑤): ...cbm.json`（不是"(未写)"）即链路全通。压缩层②会在首次 boot 时自动 `npm install` 进 `$DSH_HOME/vendor/mcp-adapter`，无需干预。
+看到 `status: OK`、`清单: ...cbm.json`（不是"(未写)"）即链路全通。压缩层②会在首次 boot 时自动 `npm install` 进 `$DSH_HOME/vendor/mcp-adapter`，无需干预。
 
 ## 怎么用
 
@@ -115,28 +115,43 @@ Get-ChildItem ~/.cache/codebase-memory-mcp -Filter *.db
 
 ### 2. 标准动线
 
-按**任务顺序**记，四步就够（与注入 prompt 的文案同构，两处改了要一起改）：
+高频的两个动作已经包成原生工具，**project 由插件从会话工作区填**，模型不用传路由键：
 
 ```
-code_index（建索引 / 改完代码后刷新）→ 拿到 project
-→ 定位   cbm_search_graph   → qualified_name 与 file+行号
-→ 取原文 cbm_get_code_snippet（带 format:"json"，才是逐字节原文）
-→ 验鲜   cbm_check_index_coverage（freshness=metadata_changed ⇒ 先 code_index 再动手）
-→ 需要关系时 cbm_trace_path
+code_index（建索引 / 改完代码后刷新）
+→ code_find("符号名")            → qualified_name + 文件 + 行区间 + 源码
+→ code_callers("<qualified_name>") → 调用者（inbound，默认）/ 被调方（outbound），逐跳
+→ 长尾走代理：cbm_check_index_coverage（验鲜）、cbm_query_graph（多跳）、
+  cbm_get_architecture、cbm_detect_changes…
 ```
 
-检索一律走代理工具 `mcp__cbm__mcp`，`args` **直接传对象**：
+长尾仍走代理工具 `mcp__cbm__mcp`，`args` **直接传对象**：
 
 ```jsonc
-{"tool": "cbm_search_graph", "args": {"project": "<project>", "query": "符号名", "limit": 10}}
-{"tool": "cbm_get_code_snippet", "args": {"project": "<project>", "qualified_name": "<qn>", "format": "json"}}
 {"tool": "cbm_check_index_coverage", "args": {"project": "<project>", "paths": ["apps/server/src/x.ts"]}}
-{"tool": "cbm_trace_path", "args": {"project": "<project>", "function_name": "X", "direction": "callers"}}
+{"tool": "cbm_get_code_snippet", "args": {"project": "<project>", "qualified_name": "<qn>", "format": "json"}}
+{"tool": "cbm_query_graph", "args": {"project": "<project>", "cypher": "…"}}
 ```
 
 > `format` 不带就是 `tree`——那是排版信封，会给每行贴固定前导空格，照抄当锚点必不匹配（详见[已知限制](#已知限制与不做)）。
 
 多步查询用 `mcp__cbm__mcpScript` 一次跑完（实测两次 `search_graph` 合计 73ms），别拆成多次往返。
+
+#### 触发层（该由插件负责的事，不该靠你话术）
+
+"让模型用索引"是软约束，下面几层是**干预**。每层独立开关，钩子一律 `try/catch` + **fail-open**（证明不了索引可信就放行 grep）：
+
+| 层 | 挂点 | 默认 | 做什么 |
+|---|---|---|---|
+| ① 封装工具 | `ctx.tools.register` | 开 | `code_find` / `code_callers`。schema 成本实测 **1651 字节 ≈ 每请求 413 tokens**，换来的是代理省下的 ~3200 tokens 不必被话术消耗 |
+| ② 拦截 | `tools/pre-execute` | `advise`（不拦） | `enforce: deny-once`/`deny` 时：pattern 像**符号**的 grep，**同会话同符号只拦一次**，且 deny 的 `reason` 里已经带上 `search_graph` 命中——模型这一轮就拿到答案 |
+| ④ 软提示 | `tools/post-execute` → `additionalContexts` | 开（就是 `advise`） | 给下一个请求附一条模型可见的提示；不阻断、不改结果、每符号一次 |
+| ⑤ 写后记账 | `tools/post-execute` + 查询前 `check_index_coverage` | 开 | 按会话记 `write`/`edit` 的路径（不逐文件建索引），回答前只验这些路径；坐标过期时**改为放行**并调度带冷却的后台补刷，而不是把邻居代码当定义交出去 |
+| ③ 条件注入 | `systemPrompt.context`（order 130） | 开 | 只在上一条用户消息像"谁调用 / 定义在哪 / 重命名 / 影响范围"时注入一行：project + 新鲜度 + 用 code_find。其余轮次一个字符都不占 |
+
+①②⑤ 走宿主**已连接**的代理链路（热了实测 29–64ms），刻意不 spawn `codebase-memory-mcp cli`——同一台机器上它单次 5.5–8.3s。
+
+与宿主自带的 `dsh-repeat-tool-reminder` 分工不同：那个只看**参数完全相同的连续重复**（默认阈值 3/5/8），不评价该用哪个工具；②④ 看的是 **pattern 形态**，不管重复。两者可叠加（都写 `additionalContexts`），别把 `grep`/`glob` 加进它的 `exclude`，那会连环保护一起删掉。
 
 ### 3. 话术清单（实测有效）
 
@@ -165,10 +180,10 @@ code_index（建索引 / 改完代码后刷新）→ 拿到 project
 
 本工作区已建代码索引（dsh-codebase-memory）。分析代码前先按此路径走：
 
-- 路由键是 `project`：值 = 本工作区对应的项目名（拿不准先跑 `code_index`，返回值即 project 名）。
-- 定位符号：`mcp__cbm__mcp` → `cbm_search_graph`（args 直接传对象）。
+- 路由键是 `project`：`code_find` / `code_callers` 会由插件自动填，其余调用先跑 `code_index`，返回值即 project 名。
+- 定位符号：`code_find("X")` 一次给 qualified_name + 文件 + 行区间 + 源码；长尾再走 `mcp__cbm__mcp` → `cbm_search_graph`（args 直接传对象）。
 - 读实现：`cbm_get_code_snippet` 只取那一段，别整文件 Read。
-- 追关系：`cbm_trace_path`（谁调用/被调用）、`cbm_detect_changes`（改动影响面）。
+- 追关系：`code_callers("<qualified_name>")`（默认 inbound=调用者）；分页与改动影响面用 `cbm_trace_path` / `cbm_detect_changes`。
 - 多仓库工作区必须收窄：`file_pattern="**/<仓库>/**"`；同名符号用返回的 `qualified_name` 消歧。
 - 多步查询用 `mcp__cbm__mcpScript` 一次跑完，别多次往返。
 - 只有查字面量（字符串/配置值/日志文案）或索引明确没覆盖时，才用 grep/Read。
@@ -178,7 +193,7 @@ code_index（建索引 / 改完代码后刷新）→ 拿到 project
 
 写 AGENTS.md 的三条经验：
 
-1. **写规则，不写说明书**——「分析代码前先按此路径走」比「可以用索引」有效得多；模型默认走 grep 不是因为不知道，是因为没人禁止。
+1. **写规则，不写说明书**——「分析代码前先按此路径走」比「可以用索引」有效得多；模型默认走 grep 不是因为不知道，是因为没人禁止。（v0.3 起"没人禁止"这一条可以由插件自己执行：`enforce=deny-once`；默认仍是 `advise`，只提示不禁止——先让 telemetry 证明误拦率再说。）
 2. **给出口**——"只有 X 才用 grep"比"永远别 grep"更对，字面量检索确实是 grep 的活。
 3. **把最大的坑写死**——project 名怎么拿、多仓库怎么收窄，这两条不写，模型试错一次就退回 grep。
 
@@ -206,11 +221,13 @@ code_index（建索引 / 改完代码后刷新）→ 拿到 project
 
 `dsh plugin --profile <p> add file:<repo>` 一次写全这两处。之后开发循环是 `node scripts/sync.mjs` → **重启 host**（`cordis.yml` 在加载时按 bundle 列表组合；而 pnpm 把 `file:` 依赖当不可变对象——`sync.mjs` 就是为此存在）。**`code_setup` 会替你把漂移报出来**：拷贝与仓库一致时显示 `同步状态: 一致`，不一致时给一行 ⚠ 并点名三个运行时文件（`index.js` / `cordis.patch.yml` / `package.json`）里到底哪个不同。它覆盖"改了仓库忘了 sync"；**测不出**"sync 了但没重启"——运行中的代码没有对自己加载字节的哈希。
 
-**采纳（让模型真的用 cbm 搜代码）**是另一个更弱的问题，三档杠杆，越靠后越硬：
+**采纳（让模型真的用 cbm 搜代码）**以前是个更弱的问题，因为手里只有"劝"这一件工具。v0.3 起本插件自己就有"干涉"能力，而且走**原生订阅**——不装桥接包、不写 `hooks.json`、不改 profile 的 bundle 列表，只改这个 bundle 的 config 行：
 
-1. **prompt 段（已接线）**：`inject: ['systemPrompt']` → `ctx.systemPrompt.section({ name: 'codebase-memory', order: 850, text: usageSection(state) })`，内容就是那 4 步动线（定位 → 取原文 `format:"json"` → 验鲜）＋"比逐文件 grep/read 省一个数量级 token"的论证。
+1. **prompt 段（仍在）**：`inject: ['systemPrompt']` → `ctx.systemPrompt.section({ name: 'codebase-memory', order: 850, text: usageSection(state) })`。内容只留常驻不变的部分（长尾动线与两个坑），并且**有预算**：断言 ≤1150 字符，实测 863。
 2. **仓库自己的 `AGENTS.md`（推荐，零安装）**：按项目生效、可版本化、更贴近"这个仓库该怎么干活"。§4 有可复制模板，`ruankao-ai/AGENTS.md` 就是实际用例。
-3. **`PreToolUse` 钩子（强制档，需额外装包）**：DSH 钩子匹配的是**模型看到的工具名**（`ctx.on("tools/pre-execute", … runPoint("PreToolUse", exec.name, …))`），所以能匹配 `grep|glob|read`，命中后可以"附加上下文"或"拦下并给理由"。这是唯一能**干涉**而不只是说服的一档，代价是环境改动：本机**两个 profile 都没装** `dsh-hooks-claude-code`（它的模块只在 DSH 安装树里，`.dsh-module-fallback` 又没有 `@deepseek-ai/*`），所以挂它 = 往 profile 装这个包 + 加进 `dsh.profile.bundles` + 给它一个 `configPath` 指向 `hooks.json` + 重启。只有在模型持续无视索引时才值得付。
+3. **触发层**（[docs/design-v2.md](docs/design-v2.md)）：封装工具 ①、拦截 ②、条件注入 ③、软提示 ④、写后验鲜 ⑤——见[触发层](#触发层该由插件负责的事不该靠你话术)。
+
+为什么用原生订阅而不是官方桥接包：`dsh-hooks-claude-code` 在本机**任何 profile 都没装**（模块只在 DSH 安装树里，`.dsh-module-fallback` 不带 `@deepseek-ai/*`），挂它 = 装包 + 加 bundle 行 + 写 `hooks.json` + 重启；而外部 shell 钩子按生态自己的说法"能观察、能否决，但没法把文本交回模型"。在插件内部我们既能 deny，又能把**答案本身**写进 deny 的 reason，还能读到 project、索引新鲜度与本会话脏路径——这些正是钩子成立的前提。
 
 ## 引擎兼容性（codebase-memory-mcp 变了会怎样）
 
@@ -241,6 +258,16 @@ code_index（建索引 / 改完代码后刷新）→ 拿到 project
 | `cbmPath` | 自动探测 | 留空则按 官方安装位 → vendor → PATH 探测 |
 | `autoIndex` | `true` | 自举时把引擎的 `auto_index` 对齐到该值（先读后写，值相同不重复写）。**作用域警告**：它落在机器级共享的 `~/.cache/codebase-memory-mcp/_config.db`，同机所有 MCP client 共用——不想让本插件替你决定就设成 `false`。实测语义：只给**尚无索引**的项目在会话启动时补一次全量，**不刷新陈旧坐标**，所以它不是防漂移手段（防漂移仍是 `code_index` + `check_index_coverage`） |
 | `sessionRefresh` | `true` | 会话启动（`agent/session-start`）时后台刷新**会话工作区**的索引，闸门为（git 状态变了）∧（该项目已索引过）∧（5 分钟冷却）。用来补引擎 watcher 在多工作区宿主下覆盖不到的洞——见[已知限制](#已知限制与不做)。设 `false` 关闭 |
+| `wrapperTools` | `true` | 层 ①：注册 `code_find` / `code_callers`。设 `false` 只剩代理工具 |
+| `enforce` | `advise` | 层 ②/④：`off` / `advise`（只在 post-execute 追加提示，不阻断）/ `deny-once`（符号类 grep 每会话每符号拦一次）/ `deny`（每次都拦）。遥测证明误拦率可接受后再从 `advise` 升 `deny-once` |
+| `interceptTools` | `grep,glob` | 逗号分隔的内置工具名（裸名小写；`glob` 的 pattern 基本不会被判成符号） |
+| `interceptBudgetMs` | `2500` | 钩子里 cbm 查询的时间预算。实测热链路 29–34ms，这个数是为冷连接留余量；**超预算就放行 grep** |
+| `contextHint` | `true` | 层 ③：按 query 条件注入一行 `systemPrompt.context`。极简 agent 预设会整块压制 runtime-context，那时它不送达（①②⑤ 不受影响） |
+| `dirtyTracking` | `true` | 层 ⑤：按会话记 `write`/`edit` 路径，回答前只验这些路径 |
+| `dirtyRefreshCooldownSec` | `120` | 脏路径触发的后台补刷冷却（复用 `sessionRefresh` 那条带闸门的链路，同回合多次写入自然并成一次） |
+| `telemetry` | `true` | 每次拦截 / 放行 / 提示 / 记账 / 补刷写一行 JSON 到 `$DSH_HOME/vendor/mcp-adapter/telemetry.log`，并在 `code_setup` 里给出计数。要不要升 `deny-once`，靠这个数据拍 |
+
+回滚按杠杆来：`{"enforce":"off","contextHint":false,"dirtyTracking":false,"wrapperTools":false}` 就退回 v0.2 的行为，新开会话即生效。
 
 ## 验收
 
@@ -251,19 +278,21 @@ npm run check   # = check:patch + check:plugin + check:chain + check:tokens
 | 检查 | 证明什么 |
 |---|---|
 | `check-patch.mjs` | `cordis.patch.yml` 里 3 个 `!!js` 表达式按 Loader 原语义能求值，且指向真实文件；`DSH_HOME` 缺失时的回退同值 |
-| `check-plugin.mjs` | 假 ctx 真实调用 `apply`/`code_index`/`code_setup`：链路就绪、工作区来自会话 cwd、不同工作区→不同 project、cbm 缺失时 throw 并给出安装命令 |
-| `check-chain.mjs` | 真拉起 adapter → cbm 做 MCP 握手：代理工具就位、懒连接被唤醒、`search_graph` 返回真实行 |
+| `check-plugin.mjs` | 假 ctx（镜像真实服务的前提校验，含 `tools.execute` 与 `systemPrompt.section/context`）真实跑 `apply` 与**每一条触发层**：链路就绪、工作区来自会话 cwd、不同工作区→不同 project、cbm 缺失时 throw 并给出安装命令；`classifyPattern` 用 12 个符号类 + 21 个字面量类正反例证伪（**误拦必须为 0**）；`deny-once` 拦一次后放行；超预算 / 未索引 / 坐标过期一律 **fail-open**；advise 每符号只追加一条 `additionalContexts`；脏路径惰性记账且工作区外不入集合；条件注入命中给一行、不命中给 `""` |
+| `check-chain.mjs` | 真拉起 adapter → cbm 做 MCP 握手：代理工具就位、懒连接被唤醒、`search_graph` 返回真实行、**阶段 3.5 实测钩子的时间预算**，最后 `describe` 出 prompt 承诺的参数形状 |
 | `check-tokens.mjs` | **消融臂**：直连 cbm vs 经代理的 `tools/list` 实际体积；代理不比直连小就 throw |
 
 本机实测：
 
 ```
 PATCH OK
-20/20 臂通过（tauri + web 两个 profile）   PLUGIN OK
-CHAIN OK（代理工具 mcp，cbm 15 工具被发现）
+122/122 臂通过（tauri + web 两个 profile）   PLUGIN OK
+CHAIN OK — 阶段3.5 代理链路延迟 ms: min=29 中位=33 max=34；check_index_coverage(单路径)=29
 臂A 直连 cbm            : 17 工具, 17308 B ≈ 4327 tokens
 臂B 代理·冷缓存         :  2 工具,  4278 B ≈ 1070 tokens  （省 4.0x）
 臂C 代理·缓存含resources:  3 工具,  4871 B ≈ 1218 tokens  （省 3.6x）
+封装工具 schema（code_find + code_callers）: 1651 B ≈ 413 tokens  ← 层 ① 的代价
+cbm CLI 同一台机器单次 search_graph        : 5491 / 6526 / 8280 ms  ← 钩子里绝不 spawn 它的原因
 ```
 
 > `check-plugin.mjs` 会对本仓库真建一次索引（project 落在 `~/.cache`，不在仓库里）。想只验某个 profile：`node checks/check-plugin.mjs <profile>`。
@@ -272,9 +301,11 @@ CHAIN OK（代理工具 mcp，cbm 15 工具被发现）
 
 | 症状 | 原因与处置 |
 |---|---|
+| 某次 grep 返回 `Error: dsh-codebase-memory：…` | 这是层 ② 的**拦截**，不是故障：默认 `enforce=advise` 根本不拦，只有你显式设成 `deny-once`/`deny` 才会出现；`deny-once` 对同一会话同一符号**只拦一次**，reason 里已带 `search_graph` 命中。想彻底关掉：`{"enforce":"off"}` |
+| `code_find` 提示"坐标很可能已过期" | 层 ⑤ 的自检生效了：返回的源码里没有那个符号名（上游 issue #1750 的静默错位）。跑一次 `code_index`；插件已经在后台补刷，但**别在补刷完成前信这些行号** |
 | 当前会话工具清单里没有 `code_index`/`code_setup`，但 `code_setup` 能调通 | 工具清单是**会话级快照**：新开的对话才看得到。"没列出"≠"没注册" |
 | `code_setup` 报 `status: NOT READY` | 看它给的缺失项与安装命令，照做后再调一次（它会重试自举，不用重启） |
-| `清单(⑤): (未写)` | bootstrap 在写 `cbm.json` 前抛错了——把 `error:` 行原样报给维护者 |
+| `清单: (未写)` | bootstrap 在写 `cbm.json` 前抛错了——把 `error:` 行原样报给维护者 |
 | 检索报 `ambiguous` + 候选列表 | 工作区里多个仓库有同名符号。用候选里的 `qualified_name`，或加 `file_pattern` 收窄 |
 | 明明改了代码检索结果还是旧的 | **先查工作区选择**（§1）：若会话工作区是非 git 的父目录，则**根本没有任何 watch**，等多久都没用。否则，先说好消息——**会话活着时引擎确实会自愈**——会话会拉起 `session-managed` daemon（`codebase-memory-mcp daemon status` 可查），它的 **git watcher 会自己重索引**；在临时仓库实测，**未提交**的改动 **约 30 秒**就被感知。但要三个前提同时成立，而 DSH 里通常缺两个：① watcher 只认**服务进程 cwd 对应的那个 project**——`auto_watch` 是 *git* watcher，而我们的清单**没有设 `cwd`**，于是它盯的是宿主 cwd 而非会话工作区；② 那个根目录得真是 git 仓库（像 `C:\Users\kingdee\work` 就不是）；③ `lifecycle: "lazy"` 会让服务在 adapter 默认 **10 分钟**空闲后被回收（`idleTimeout` 默认 10，只有 `eager`/`lazy-keep-alive` 会归零），daemon 与 watcher 一起没——这就是索引能旧好几天的原因。所以：`check_index_coverage --paths` 负责发现，`code_index` 负责保证。`auto_index` 只管"从没索引过的项目" |
 | 从片段里复制的锚点，`edit` 死活匹配不上 | 默认的 `tree` 渲染给每行贴了固定前导空格（`get_code_snippet` +2、`search_code --mode full` +8），照抄的文本不是文件字节。**调用时传 `format: "json"`**——它的 `source` 逐字节等于文件；或者锚点走 `read` |
@@ -286,7 +317,16 @@ CHAIN OK（代理工具 mcp，cbm 15 工具被发现）
 
 ## 工程备注（给要改它的人）
 
-- **boot 绝不 throw**：依赖缺失只记进状态（`code_setup` 报），boot 抛错会炸掉整个 profile，爆炸半径太大。前提检查全部落在工具调用点——"前提不成立即 throw"。
+- **boot 绝不 throw**：依赖缺失只记进状态（`code_setup` 报），boot 抛错会炸掉整个 profile，爆炸半径太大。前提检查全部落在工具调用点——"前提不成立即 throw"。钩子里同理：每个 listener 都 `try/catch` 且任何可疑情况 `return next()`，因为 pre-execute 里抛错等于把那次工具调用打成失败。
+- **同一工作区一次只跑一个索引任务，被中止就重试一次。** 同一仓库并发跑两次 `index_repository` 不会都活：引擎杀掉一个，退出码 1 + `status:"aborted_previous_preserved"`（它自己的 hint 就写着 "Retry"）。正常用法就能撞上——层 ⑤ 的后台补刷、`code_index`、引擎 watcher 都可能同时要动同一个工作区。所以两条路都过"按 cwd 排队"的在飞锁，被中止的那次重试一次并**记账**（遥测 `index-retry-contention`）。`check-plugin.mjs` 臂 G9 在假 subprocess 层复刻这条中止——只在生产环境才触发的修复，等于没人验证的修复。
+- **触发层依赖的宿主契约**（对着本机装的 `0.1.5-rc.2` dist 逐条核过：`dsh-tool-cordis` 带完整事件/服务目录，`dsh-tools`、`dsh-system-prompt` 是实现；假 ctx 也照抄了这些形状）：
+  - `tools/pre-execute`：waterfall `(exec, next) → PreToolDecision`。`deny` 短路所有 guard，其 `reason` 是模型唯一看到的输出（`Error: <reason>` + `isError`）；**被拒的调用仍会走 post-execute**，所以 advise 分支必须跳过 `result.isError`。
+  - `tools/post-execute`：`(exec, result, next) → accept | block`；`additionalContexts: UserMessage[]` 是官方"给下一个请求附上下文"的通道——要 spread `next()` 的决策，不能替换它。
+  - **`ctx.tools.execute(input)` 是公开方法**（`tools` 服务方法表里有）。①② 能用起来的前提就是它：走 keep-alive 长连接（实测 29–64ms），不 spawn CLI（5.5–8.3s）。入参 `{callId, name, arguments, agent?, signal}`。
+  - `systemPrompt.context({name, order, text})`：`text` 必须是**字符串或同步函数**（异步/`undefined` 触发装配不变量），返回 `""` 才是"本轮不注入"；contexts 不进提示词，而是投影成一条 user 角色的 runtime-context 快照，`suppressRuntimeContext()`（极简预设）会**全量**丢掉它。
+  - 提示词文本走严格的 `{{variable}}` 插值，任何引擎/用户来源文本都不能凑成合法的未注册变量（`noVars` 兜一层）。
+  - 插件写的消息要带自有 `source.kind`：`{kind:"plugin", plugin:"dsh-codebase-memory", form:"notice", summary}`——与官方 `dsh-hooks-claude-code` 同形；这里手写而非 import `createUserMessage`，少一个 boot 期硬依赖。
+  - 本宿主**同时**有 `agent/created` 与 `agent/session-start`（后者由 `dsh-agent-loop` 在首个回合前 emit，带 `source`），且 `agent.inject(message)` 才是会话开始时喂模型可见上下文的正路——方案里"会话开始事件不可注入"只对 emit 的返回值成立。
 - **Windows 三连坑**（都已绕开）：PATH 上的 `npm.cmd` 不能无 shell spawn → 探测 `npm-cli.js` 直跑；cbm 的 `.cmd` shim 同理 → 清单里写绝对 `.exe`；PowerShell 5.1 按 ANSI 读无 BOM 的中文 `.ps1` → 仓库脚本一律 `.mjs` 用 node 跑。
 - **`ctx.subprocess.spawn` 的两条真实契约**（本版插件曾各栽一次，验收的假 ctx 现在照抄了它们）：
   1. `cwd` 必填——真实实现对 `spec.cwd.includes('\0')` 求值，`undefined` 直接 TypeError；

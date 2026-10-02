@@ -51,9 +51,9 @@ When this skill is active:
 Use when the user starts with a bug but the fix should not land without blast-radius awareness.
 
 1. Run root-cause investigation using `references/investigation-core.md` Phase 1 to Phase 3, but delegate all structured code queries to `dsh-codebase-impact-analysis`:
-   - Definition lookup: `cbm_search_graph`, not raw grep.
+   - Definition lookup: `code_find`, or `cbm_search_graph` when you need label/name/file filters — not raw grep.
    - Source reading: `cbm_get_code_snippet(format:"json")`, not full-file `read` unless context beyond the symbol is needed.
-   - Caller/callee lookup: `cbm_trace_path`, not grep for function names.
+   - Caller/callee lookup: `code_callers`, or `cbm_trace_path` for depth/mode control — not grep for function names.
    - Text/config/dynamic references: `cbm_search_code`, with at least one search not restricted to a single file type when hunting configuration values.
 
 2. **Anti-anchoring check.** Before committing to a single potential cause, ask whether the value was already wrong before it reached that point. Trace the value lifecycle with three questions:
@@ -70,8 +70,8 @@ Use when the user starts with a bug but the fix should not land without blast-ra
    - If any consumer lacks the guard, the gap is real.
 
 4. Before implementation, run `dsh-codebase-impact-analysis` Workflow 1 on the functions the fix will touch:
-   - `cbm_search_graph` resolves the target.
-   - `cbm_trace_path(direction: "inbound", depth: 3)` at minimum.
+   - `code_find` resolves the target (use `cbm_search_graph` for filtered resolution).
+   - `code_callers("<qualified_name>")`, or `cbm_trace_path(direction: "inbound", depth: 3)` at minimum.
    - Widen to depth 5 or add `direction: "outbound"` when contracts or fan-out change.
    - Add architecture/route/cross-service checks when an HTTP, gRPC, queue, workflow, or CloudEvent boundary is involved.
 
@@ -105,8 +105,8 @@ Use when impact analysis or flow tracing unexpectedly reveals an actual defect.
 Use when the user wants code-graph understanding before deciding whether to change anything.
 
 1. Run `dsh-codebase-impact-analysis`:
-   - locate symbols with `cbm_search_graph`,
-   - map relationships with `cbm_trace_path`,
+   - locate symbols with `code_find` (or `cbm_search_graph` for filtered searches),
+   - map relationships with `code_callers` / `cbm_trace_path`,
    - summarize entry points or modules with `cbm_get_architecture`,
    - pull key source with `cbm_get_code_snippet(format:"json")`.
 

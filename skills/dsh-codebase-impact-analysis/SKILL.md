@@ -19,7 +19,9 @@ The model-facing tool surface is:
 | Need | Tool | Why |
 |---|---|---|
 | Build or refresh the current workspace graph | `code_index` | Binds indexing to the current session workspace and returns the authoritative `project` name. |
-| Repair or inspect plugin chain | `code_setup` | Reports adapter, cbm binary, manifest, and sync status. |
+| Resolve a symbol → qualified name, file, line range, source | `code_find` | Wrapped high-frequency path; the plugin fills `project` from the session workspace. Prefer it over grep-for-definitions. |
+| Trace callers / callees of one symbol | `code_callers` | Wraps `cbm_trace_path` (default `inbound`). |
+| Repair or inspect plugin chain | `code_setup` | Reports adapter, cbm binary, manifest, sync status, and trigger-layer counters. |
 | Run cbm graph queries | `mcp__cbm__mcp` | The plugin compresses cbm MCP tools into a proxy tool. |
 | Batch multi-step cbm queries | `mcp__cbm__mcpScript` | Use when a workflow needs repeated graph calls and you want to avoid round trips. |
 
@@ -40,7 +42,7 @@ Raw cbm tools are still available conceptually, but their names are prefixed and
 
 2. **All graph queries go through `mcp__cbm__mcp`.** Use `tool: "cbm_*"` and object `args`. If a tool shape is unclear, ask the proxy with `{"describe": "cbm_search_graph"}` or `{"server": "cbm"}` rather than guessing.
 
-3. **Always pass `project` where accepted.** Cross-project indexes share the graph store. A missing `project` can silently query the wrong project.
+3. **Always pass `project` where accepted.** Cross-project indexes share the graph store. A missing `project` can silently query the wrong project. (`code_find` / `code_callers` deliberately take no `project` — the plugin resolves it from the session workspace.)
 
 4. **Use JSON for source snippets.** Always include `format: "json"` in `cbm_get_code_snippet`. The default tree format is a layout envelope and can change line whitespace.
 
@@ -58,9 +60,9 @@ Raw cbm tools are still available conceptually, but their names are prefixed and
 
 | Task | Prefer |
 |---|---|
-| Resolve symbol, qualified name, file, line | `cbm_search_graph` with `project`, `query`, optionally `label`, `name_pattern`, `file_pattern`. |
+| Resolve symbol, qualified name, file, line | `code_find` (no `project` needed); for filters (`label`, `name_pattern`, `file_pattern`, paging) use `cbm_search_graph` with `project` + `query`. |
 | Read function source | `cbm_get_code_snippet` with `qualified_name` and `format: "json"`. |
-| Find callers or callees | `cbm_trace_path` with `function_name`, `project`, `direction: "inbound"` for callers and `"outbound"` for callees. |
+| Find callers or callees | `code_callers` (default `inbound`); for `depth`/`mode`/paging use `cbm_trace_path` with `function_name`, `project`. |
 | Find text references, configs, strings, generated API names | `cbm_search_code` with `project`, `pattern`, usually no narrow `file_pattern` for config fields. |
 | Map uncommitted diff | `cbm_detect_changes` with `project`, `scope: "impact"` when needed. |
 | High-level flow start points | `cbm_get_architecture` with aspects such as `entry_points`, `routes`, `packages`, `clusters`. |

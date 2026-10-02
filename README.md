@@ -9,7 +9,7 @@ A [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) host
 - [How the chain is composed](#how-the-chain-is-composed)
 - [Why this plugin exists](#why-this-plugin-exists)
 - [Install](#install)
-- [Usage](#usage) — including [prompting recipes](#3-prompting-recipes-what-actually-triggers-it), an [AGENTS.md template](#4-encoding-it-in-agentsmd-make-it-permanent), and [versioned skills](#5-skills-live-in-this-repo)
+- [Usage](#usage) — including [trigger layers](#trigger-layers-why-you-should-not-have-to-prompt-for-this), [prompting recipes](#3-prompting-recipes-what-actually-triggers-it), an [AGENTS.md template](#4-encoding-it-in-agentsmd-make-it-permanent), and [versioned skills](#5-skills-live-in-this-repo)
 - [How DSH finds it, and how the model starts using it](#how-dsh-finds-it-and-how-the-model-starts-using-it)
 - [Engine compatibility (what happens when codebase-memory-mcp changes)](#engine-compatibility-what-happens-when-codebase-memory-mcp-changes)
 - [Configuration](#configuration-optional)
@@ -118,30 +118,47 @@ Measured on this machine: a first build of a mid-size repo (1,946 nodes) took **
 
 ### 2. The standard flow
 
-Learn it as **four task-ordered steps** (this mirrors the text injected into the system prompt — change both or neither):
+Two verbs cover the high-frequency path and need **no routing key from you** — `project` is filled by the plugin from the session workspace:
 
 ```
-code_index (build / refresh after edits) → you have the project name
-→ locate:  cbm_search_graph        → qualified_name + file + line range
-→ read:    cbm_get_code_snippet     (pass format:"json" — that's the byte-exact source)
-→ verify:  cbm_check_index_coverage (freshness=metadata_changed ⇒ re-run code_index first)
-→ for relationships: cbm_trace_path
+code_index (build / refresh after edits)
+→ code_find("symbolName")            → qualified_name + file + line range + the source
+→ code_callers("<qualified_name>")   → callers (inbound) / callees (outbound), hop by hop
+→ long tail via the proxy: cbm_check_index_coverage (freshness), cbm_query_graph (multi-hop),
+  cbm_get_architecture, cbm_detect_changes, …
 ```
 
-All retrieval goes through the proxy tool `mcp__cbm__mcp`; pass `args` **as a plain object** (no JSON-string double encoding):
+The rest of the graph stays reachable through `mcp__cbm__mcp`; pass `args` **as a plain object** (no JSON-string double encoding):
 
 ```jsonc
-{"tool": "cbm_search_graph",         "args": {"project": "<project>", "query": "symbolName", "limit": 10}}
-{"tool": "cbm_get_code_snippet",     "args": {"project": "<project>", "qualified_name": "<qn from search_graph>", "format": "json"}}
 {"tool": "cbm_check_index_coverage", "args": {"project": "<project>", "paths": ["apps/server/src/x.ts"]}}
-{"tool": "cbm_trace_path",           "args": {"project": "<project>", "function_name": "X", "direction": "callers"}}
+{"tool": "cbm_get_code_snippet",     "args": {"project": "<project>", "qualified_name": "<qn>", "format": "json"}}
+{"tool": "cbm_query_graph",          "args": {"project": "<project>", "cypher": "…"}}
 ```
 
 > Omitting `format` gives you `tree` — a typesetting envelope that rewrites leading whitespace on every line, so copied text never matches the file. See [known limitations](#known-limitations--non-goals).
 
 For multi-step lookups, run them in one `mcp__cbm__mcpScript` call instead of round-tripping (measured: two `search_graph` calls in 73 ms total).
 
+#### Trigger layers (why you should not have to prompt for this)
+
+Telling the model "use the index" is a soft constraint; these layers intervene instead. Each one is an independent switch, every hook is `try/catch` + **fail-open** (a hook that cannot prove the index is trustworthy lets `grep` run), and nothing at boot ever throws:
+
+| Layer | Mount point | Default | What it does |
+|---|---|---|---|
+| ① wrapped verbs | `ctx.tools.register` | on | `code_find` / `code_callers` — schema cost measured: **1651 B ≈ 413 tokens per request**, against ~3200 tokens saved by the proxy |
+| ② intercept | `tools/pre-execute` | `advise` (no interception) | with `enforce: deny-once`/`deny`: a grep whose pattern looks like a **symbol** is denied **once per symbol per session**, and the deny `reason` already contains the `search_graph` hits, so the model gets an answer in the same round |
+| ④ soft hint | `tools/post-execute` → `additionalContexts` | on (that is `advise`) | appends one model-facing note to the next request; never blocks, never rewrites the result, once per symbol |
+| ⑤ dirty tracking | `tools/post-execute` + pre-query `check_index_coverage` | on | records `write`/`edit` paths per session (no per-file indexing), then verifies those exact paths before answering; when coordinates are stale it **lets grep through** and triggers a cooled background refresh instead of returning a neighbour's code |
+| ③ conditional context | `systemPrompt.context` (order 130) | on | when the last user message looks like "who calls / where is X defined / rename / impact", inject one line: project + freshness + "use code_find". Nothing else is injected — the standing section stays constant |
+
+①②⑤ go through the host's **live** proxy connection (measured 29–34 ms per query warm); they deliberately never spawn `codebase-memory-mcp cli`, which measures **5.5–8.3 s per call** on the same machine.
+
+Note the difference from the host's own `dsh-repeat-tool-reminder`: that plugin fires on *byte-identical consecutive calls* (default thresholds 3/5/8) and says nothing about which tool to use; layers ②④ fire on the **shape of the pattern** and say nothing about repetition. They compose (both attach `additionalContexts`), so do not add `grep`/`glob` to the reminder's `exclude`.
+
 ### 3. Prompting recipes (what actually triggers it)
+
+Since v0.3 the plugin stops relying on your phrasing for the common case (see [trigger layers](#trigger-layers-why-you-should-not-have-to-prompt-for-this)); these recipes are what's left for the long tail — naming the step still beats hoping.
 
 Whether the model uses the graph depends on whether your question is a **graph-shaped question**. These phrasings were observed to work:
 
@@ -168,10 +185,10 @@ The prompt section is only a signpost; **an AGENTS.md that travels with the repo
 
 This workspace is code-indexed (dsh-codebase-memory). Before reading code:
 
-- The routing key is `project`; run `code_index` once when unsure — its return value *is* the project name.
-- Locate symbols: `mcp__cbm__mcp` → `cbm_search_graph` (pass `args` as a plain object).
+- The routing key is `project`; the plugin fills it for `code_find` / `code_callers`, and `code_index`'s return value *is* the project name for everything else.
+- Locate symbols: `code_find("X")` — qualified name, file, line range, source in one call. Long tail: `mcp__cbm__mcp` → `cbm_search_graph` (pass `args` as a plain object).
 - Read implementations: `cbm_get_code_snippet` for that exact range — no whole-file Reads.
-- Trace relationships: `cbm_trace_path` (callers/callees), `cbm_detect_changes` (impact of a diff).
+- Trace relationships: `code_callers("<qualified_name>")`, or `cbm_trace_path` / `cbm_detect_changes` for paging and diff impact.
 - Multi-repo workspaces must scope: `file_pattern="**/<repo>/**"`; resolve duplicate names via `qualified_name`.
 - Batch multi-step lookups with `mcp__cbm__mcpScript` instead of many round trips.
 - Use grep/Read only for literals (strings / config values / log text) or where the index clearly misses the path.
@@ -207,11 +224,13 @@ Recognition is two-sided, and neither side is `systemPrompt`:
 
 `dsh plugin --profile <p> add file:<repo>` writes both. Then the dev loop is `node scripts/sync.mjs` → **restart the host** (`cordis.yml` is composed from the bundle list at load; `file:` deps are immutable to pnpm, which is exactly why `sync.mjs` exists). **`code_setup` reports the drift for you**: `同步状态: 一致` when the loaded copy matches the repo, or a ⚠ line naming the differing files of the three runtime files (`index.js` / `cordis.patch.yml` / `package.json`). That covers "edited the repo, forgot to sync" — it cannot detect "synced but did not restart", because running code has no hash of its own loaded bytes.
 
-**Adoption — getting the model to actually search with cbm** — is a separate, weaker problem. Three levers, strongest last:
+**Adoption — getting the model to actually search with cbm** — used to be a separate, weaker problem, because persuasion was the only tool available. Since v0.3 the plugin also has *interference*, mounted natively (no extra package, no `hooks.json`, no profile edit beyond this bundle's config row):
 
-1. **Prompt section (already wired).** `inject: ['systemPrompt']` → `ctx.systemPrompt.section({ name: 'codebase-memory', order: 850, text: usageSection(state) })`. That text is the 4-step flow (locate → read with `format:"json"` → verify freshness) plus the token argument for preferring the graph over file-by-file Reads.
-2. **The repo's own `AGENTS.md` (recommended, zero install).** Per-project, versionable, and closer to "how this repo wants to be worked on". §4 has a copy-paste template. `ruankao-ai/AGENTS.md` is a real example of this in use.
-3. **A `PreToolUse` hook (enforcement, needs an extra package).** DSH hooks are matched on **the tool name the model sees** (`ctx.on("tools/pre-execute", … runPoint("PreToolUse", exec.name, …))`), so a hook can match `grep|glob|read` and either append context or block with a reason. This is the only lever that can *interfere* rather than persuade — and it costs an environment change: `dsh-hooks-claude-code` is **not installed in any profile here** (its module is only in the DSH install tree, and `.dsh-module-fallback` carries no `@deepseek-ai/*`), so mounting it means installing that package into the profile, adding it to `dsh.profile.bundles`, pointing its `configPath` at a `hooks.json`, and restarting. Only worth it if the model keeps ignoring the index.
+1. **Prompt section (still there).** `inject: ['systemPrompt']` → `ctx.systemPrompt.section({ name: 'codebase-memory', order: 850, text: usageSection(state) })`: the standing flow, kept constant within a session so the prefix cache stays warm. Budgeted and asserted (`≤ 1150` chars; measured 863).
+2. **The repo's own `AGENTS.md` (recommended, zero install).** Per-project, versionable, closer to "how this repo wants to be worked on". §4 has a copy-paste template.
+3. **The trigger layers** ([docs/design-v2.md](docs/design-v2.md)): wrapped verbs ①, intercept ②, conditional context ③, soft hint ④, staleness tracking ⑤ — see [trigger layers](#trigger-layers-why-you-should-not-have-to-prompt-for-this).
+
+Why native subscription instead of the bridge package: `dsh-hooks-claude-code` is **not installed in any profile here** (its module only exists in the DSH install tree, and `.dsh-module-fallback` carries no `@deepseek-ai/*`), so mounting it would mean installing a package into every profile, adding a bundle row, writing a `hooks.json`, and restarting — for a shell hook that, per the hook ecosystem, "can observe and veto but cannot hand text back to the model". Inside the plugin we can deny *and* put the answer in the denial reason, and we already know the project, the index freshness and the session's dirty paths.
 
 ## Engine compatibility (what happens when codebase-memory-mcp changes)
 
@@ -242,6 +261,16 @@ Add `config:` to the `codebase-memory` row in the composition:
 | `cbmPath` | auto-probe | leave empty to probe official → vendor → PATH |
 | `autoIndex` | `true` | Aligns the engine's `auto_index` at bootstrap (read-first, write only if it differs). **Scope warning:** this lands in the machine-wide `~/.cache/codebase-memory-mcp/_config.db`, shared with every other MCP client on this box — set it to `false` if you don't want this plugin deciding that. Measured semantics: it indexes projects that have **no** index yet when a session starts; it does **not** refresh stale coordinates, so it is not drift protection (`code_index` + `check_index_coverage` still are) |
 | `sessionRefresh` | `true` | On `agent/session-start`, refresh the **session workspace's** index in the background, gated on (git state changed) ∧ (project already indexed) ∧ (5-min cooldown). Compensates for the engine's watcher, which cannot cover a multi-workspace host — see [known limitations](#known-limitations--non-goals). `false` opts out |
+| `wrapperTools` | `true` | Layer ①: register `code_find` / `code_callers`. `false` leaves only the proxy tool |
+| `enforce` | `advise` | Layer ②/④: `off` / `advise` (post-execute note, never blocks) / `deny-once` (block a symbol-shaped grep **once per session per symbol**) / `deny` (block every time). Move `advise → deny-once` only when telemetry says the false-positive rate is acceptable |
+| `interceptTools` | `grep,glob` | Comma-separated built-in tool names to consider (bare lowercase names; `glob` patterns almost never classify as symbols) |
+| `interceptBudgetMs` | `2500` | Time budget for the in-hook `search_graph`/coverage queries. Measured warm cost is 29–34 ms, so this is head-room for a cold connection; **exceeding it lets the grep run** |
+| `contextHint` | `true` | Layer ③: conditional one-line `systemPrompt.context`. Not delivered under minimal agent presets (they suppress the whole runtime-context snapshot) — ①②⑤ are not affected |
+| `dirtyTracking` | `true` | Layer ⑤: record `write`/`edit` paths per session and check them before answering |
+| `dirtyRefreshCooldownSec` | `120` | Cooldown for the background refresh that a stale check schedules (same gated `sessionRefresh` path, so several edits in one turn collapse into one refresh) |
+| `telemetry` | `true` | Append one JSON line per intercept / advise / dirty-record / refresh event to `$DSH_HOME/vendor/mcp-adapter/telemetry.log`, and show counters in `code_setup`. This is the only way to decide whether `deny-once` is safe |
+
+Rollback is per lever: `{"enforce":"off","contextHint":false,"dirtyTracking":false,"wrapperTools":false}` restores exactly the pre-v0.3 behaviour, no restart needed for a new session.
 
 ## Verification
 
@@ -252,19 +281,21 @@ npm run check   # = check:patch + check:plugin + check:chain + check:tokens
 | Check | What it proves |
 |---|---|
 | `check-patch.mjs` | the three `!!js` expressions in `cordis.patch.yml` evaluate under the Loader's exact semantics and point at real files; the `DSH_HOME`-missing fallback yields identical values |
-| `check-plugin.mjs` | a fake ctx — mirroring the real service's preconditions — actually runs `apply`/`code_index`/`code_setup`: chain ready, workspace bound to session cwd, different workspaces → different projects, missing engine throws with a copy-pasteable install command |
-| `check-chain.mjs` | really spawns adapter → engine over MCP stdio: proxy tool present, lazy connection woken up, `search_graph` returns real rows |
+| `check-plugin.mjs` | a fake ctx — mirroring the real service's preconditions (`subprocess` validation, `tools.execute`, `systemPrompt.section/context`) — actually runs `apply`/`code_index`/`code_setup` **and every trigger-layer hook**: chain ready, workspace bound to session cwd, different workspaces → different projects, missing engine throws with a copy-pasteable install command, `classifyPattern` falsified against 12 symbol + 21 literal cases (**0 false positives**), `deny-once` denies once then allows, budget overrun / unindexed workspace / stale coordinates all **fail open**, advise attaches one `additionalContexts` note per symbol, dirty writes recorded lazily and out-of-workspace paths ignored, conditional context renders or returns `""` |
+| `check-chain.mjs` | really spawns adapter → engine over MCP stdio: proxy tool present, lazy connection woken up, `search_graph` returns real rows, **stage 3.5 measures the in-hook latency budget**, then `describe`s the exact tool shapes the prompt promises |
 | `check-tokens.mjs` | **ablation arm**: direct engine vs proxied `tools/list` byte size; throws if the proxy is not smaller — the main claim must have a falsifiable premise |
 
 Measured on the author's machine:
 
 ```
 PATCH OK
-20/20 arms passed (two profiles)   PLUGIN OK
-CHAIN OK (proxy tool `mcp`, 15 engine tools discovered)
+122/122 arms passed (two profiles)   PLUGIN OK
+CHAIN OK — 阶段3.5 代理链路延迟 ms: min=29 中位=33 max=34; check_index_coverage(单路径)=29
 arm A direct engine            : 17 tools, 17308 B ≈ 4327 tokens
 arm B proxied, cold cache      :  2 tools,  4278 B ≈ 1070 tokens  (4.0x)
 arm C proxied, cache w/ resour.:  3 tools,  4871 B ≈ 1218 tokens  (3.6x)
+wrapper schemas (code_find + code_callers): 1651 B ≈ 413 tokens  ← the price of layer ①
+cbm CLI, same machine, one search_graph   : 5491 / 6526 / 8280 ms  ← why no hook ever spawns it
 ```
 
 > `check-plugin.mjs` really indexes *this* repo once (the project lands in `~/.cache`, never in the repo). To verify a single profile: `node checks/check-plugin.mjs <profile>`.
@@ -274,6 +305,8 @@ arm C proxied, cache w/ resour.:  3 tools,  4871 B ≈ 1218 tokens  (3.6x)
 | Symptom | Cause & action |
 |---|---|
 | `code_index`/`code_setup` missing from the current session's tool list, yet calling them works | The tool list is a **per-session snapshot**: only newly opened conversations see it. "not listed" ≠ "not registered" |
+| A `grep` returned `Error: dsh-codebase-memory: …` | That is layer ② **intercepting**, not a fault: the default `enforce=advise` never blocks, so this only appears if you set `deny-once`/`deny`. `deny-once` blocks a given symbol at most once per session and the reason already carries the `search_graph` hits. To turn it off: `{"enforce":"off"}` |
+| `code_find` warns "coordinates are probably stale" | Layer ⑤'s self-check fired: the returned source does not contain the symbol name (upstream issue #1750, the silent neighbour read). Run `code_index`; the plugin already scheduled a background refresh, but **do not trust those line ranges until it finished** |
 | `code_setup` says `status: NOT READY` | Follow the missing-piece hints it prints, then call it again (it re-bootstraps; no restart needed) |
 | Manifest line shows `(not written)` | bootstrap threw before writing `cbm.json` — hand the `error:` line to a maintainer verbatim |
 | Search returns `ambiguous` + candidates | Multiple repos in the workspace define the same symbol name. Use one candidate's `qualified_name`, or scope with `file_pattern` |
@@ -287,10 +320,19 @@ arm C proxied, cache w/ resour.:  3 tools,  4871 B ≈ 1218 tokens  (3.6x)
 
 ## Engineering notes (for whoever modifies it)
 
-- **Never throw at boot**: missing dependencies only update the reported state (`code_setup`), because a boot throw kills the whole profile. All precondition checks live at the tool-call site — "precondition unmet ⇒ throw" applies to calls, not startup.
+- **Never throw at boot**: missing dependencies only update the reported state (`code_setup`), because a boot throw kills the whole profile. All precondition checks live at the tool-call site — "precondition unmet ⇒ throw" applies to calls, not startup. The same rule applies inside hooks: every listener is `try/catch` and returns `next()` on any doubt, because a hook exception on `tools/pre-execute` becomes a failed tool call for the model.
+- **Host contracts the trigger layer leans on** — each verified against the installed `0.1.5-rc.2` dist (`@deepseek-ai/dsh-tool-cordis` carries the whole event/service catalogue; `dsh-tools/lib/index.js` and `dsh-system-prompt/lib/index.js` are the implementations), and each mirrored by the fake ctx in `check-plugin.mjs`:
+  - `tools/pre-execute`: waterfall `(exec, next) → PreToolDecision`. `deny` short-circuits guards, and its `reason` becomes the *only* thing the model sees (`Error: <reason>`, `isError`). Denied calls **still reach post-execute** — which is why advise skips `result.isError`.
+  - `tools/post-execute`: waterfall `(exec, result, next) → accept | block`; `additionalContexts: UserMessage[]` is the official "attach context for the next request" channel, so a soft hint must spread `next()`'s decision rather than replace it.
+  - **`ctx.tools.execute(input)` is public** (it is in the `tools` service's documented method list). That is what makes layers ①② usable: they reuse the keep-alive MCP connection (29–64 ms measured) instead of spawning `codebase-memory-mcp cli` (5.5–8.3 s measured). Input shape: `{callId, name, arguments, agent?, signal}`.
+  - `systemPrompt.context({name, order, text})`: `text` must be a **string or a synchronous function** (async or `undefined` violates the assembly invariant) and `""` means "skip this turn". Contexts are not in the prompt text — they are projected as a user-role *runtime context snapshot* per model step, so `suppressRuntimeContext()` (minimal agent preset) drops them all; the standing `section()` is unaffected.
+  - Text rendered into the prompt goes through strict `{{variable}}` interpolation, so anything user/engine-derived must not form a valid unregistered variable (`noVars`).
+  - Plugin-written messages must carry their own `source.kind`: `{kind:"plugin", plugin:"dsh-codebase-memory", form:"notice", summary}` — the same shape the official `dsh-hooks-claude-code` bridge uses.
+  - This host emits **both** `agent/created` and `agent/session-start`; the latter is what `sessionRefresh` listens on, and `agent.inject(message)` is the documented way to seed context from it (the emit's return value is indeed not consumed by the host).
 - **Two real contracts of `ctx.subprocess.spawn`** (this plugin shipped a bug past each of them once; the acceptance fake ctx now mirrors both):
   1. `cwd` is required — the implementation evaluates `spec.cwd.includes('\0')`, so `undefined` throws TypeError;
   2. `collected.stdout.readFrom(n)` returns `{ text, nextOffset, lossy }`, not a string — `String()` of it is `"[object Object]"`.
+- **One index job per workspace, and one retry when the engine aborts.** Two concurrent `index_repository` runs on the same repo do not both succeed: the engine kills one with exit code 1 and `status: "aborted_previous_preserved"` (its own hint says "Retry"). This is reachable in normal operation — layer ⑤'s background refresh, `code_index`, and the engine's own watcher can all want the same workspace at once. So both paths go through a per-cwd in-flight lock, and an aborted run is retried once and *counted* (`index-retry-contention` in telemetry). `check-plugin.mjs` arm G9 reproduces the abort in the fake subprocess layer, because a fix that only ever triggers in production is a fix nobody verifies.
 - **Windows trio**, all worked around explicitly in code: PATH's `npm.cmd` cannot be spawned without a shell → probe `npm-cli.js` and run it under node; the engine's `.cmd` shim, same story → the manifest always points at the absolute `.exe`; PowerShell 5.1 reads BOM-less Chinese `.ps1` as ANSI → every script here is `.mjs` run by node.
 - **After edits: sync, then restart.** pnpm treats `file:` dependencies as immutable by lockfile — content changes are never re-copied. `node scripts/sync.mjs` copies straight into each installed profile and re-hashes to verify. `link:` (junction) is *not* an option: Node resolves realpath, and bare `@deepseek-ai/*` imports fail from the repo path. A running host locks the composition, so sync only touches files that differ.
 - **Checks must be falsifiable**: after hardening a check, run it against the *old, unsynced* code first — only reproducing the exact production error (FAIL, exit 1) proves it has teeth; then fix, then go green.
