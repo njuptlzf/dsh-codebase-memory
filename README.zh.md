@@ -144,7 +144,7 @@ code_index（建索引 / 改完代码后刷新）
 | 层 | 挂点 | 默认 | 做什么 |
 |---|---|---|---|
 | ① 封装工具 | `ctx.tools.register` | 开 | `code_find` / `code_callers`。schema 成本实测 **1651 字节 ≈ 每请求 413 tokens**，换来的是代理省下的 ~3200 tokens 不必被话术消耗 |
-| ② 拦截 | `tools/pre-execute` | `advise`（不拦） | `enforce: deny-once`/`deny` 时：pattern 像**符号**的 grep，**同会话同符号只拦一次**，且 deny 的 `reason` 里已经带上 `search_graph` 命中——模型这一轮就拿到答案 |
+| ② 拦截 | `tools/pre-execute` | `advise`（不拦） | `enforce: deny-once`/`deny` 时：pattern 像**符号**的 grep，**同会话同符号只拦一次**，且 deny 的 `reason` 里已经带上 `search_graph` 命中——模型这一轮就拿到答案。代码图对这个符号**无命中时直接放行**：拦一条索引本来就没答案的搜索纯粹是挡路 |
 | ④ 软提示 | `tools/post-execute` → `additionalContexts` | 开（就是 `advise`） | 给下一个请求附一条模型可见的提示；不阻断、不改结果、每符号一次 |
 | ⑤ 写后记账 | `tools/post-execute` + 查询前 `check_index_coverage` | 开 | 按会话记 `write`/`edit` 的路径（不逐文件建索引），回答前只验这些路径；坐标过期时**改为放行**并调度带冷却的后台补刷，而不是把邻居代码当定义交出去 |
 | ③ 条件注入 | `systemPrompt.context`（order 130） | 开 | 只在上一条用户消息像"谁调用 / 定义在哪 / 重命名 / 影响范围"时注入一行：project + 新鲜度 + 用 code_find。其余轮次一个字符都不占 |
@@ -286,7 +286,7 @@ npm run check   # = check:patch + check:plugin + check:chain + check:tokens
 
 ```
 PATCH OK
-122/122 臂通过（tauri + web 两个 profile）   PLUGIN OK
+126/126 臂通过（tauri + web 两个 profile）   PLUGIN OK
 CHAIN OK — 阶段3.5 代理链路延迟 ms: min=29 中位=33 max=34；check_index_coverage(单路径)=29
 臂A 直连 cbm            : 17 工具, 17308 B ≈ 4327 tokens
 臂B 代理·冷缓存         :  2 工具,  4278 B ≈ 1070 tokens  （省 4.0x）

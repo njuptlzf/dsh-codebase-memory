@@ -402,10 +402,11 @@ API（已核实，官方源码 `packages/core/agent/src/runtime-types.ts` + `pac
 
 - `dsh.profile.bundles` 这种**全小写点分链**是配置键形态 ⇒ 判 literal（放行）。限定名里至少要有一段带大写或带下划线，才认为是在找符号（`svc.doThing` ⇒ `doThing`）。
 - 被 deny 的调用**仍会走 post-execute**（宿主调度器的 `post-result` 分支），所以 advise 分支必须跳过 `result.isError`，否则拦截和软提示会一起打在模型身上。
+- **图里没有这个符号就必须放行**（4.3 的前提清单漏了这条）。reason 里嵌命中是这层的全部价值；命中为空还拦，等于把模型唯一走得通的路挡了、只剩一句说教。实现按两种返回形状判空（json 的 `rows: []`、tree 的 `total: 0`），遥测记 `intercept-pass-no-hit`。
 
 落地时才暴露的一条（方案没写、必须写回来）：**同一工作区的索引任务不能并发**。`code_index`、层 ⑤ 的后台补刷、引擎自带 watcher 都可能同时要跑 `index_repository`，引擎的处理是让其中一个**退出码 1 + `status:"aborted_previous_preserved"`**（hint 原文 "Retry; if it repeats, check the run log"），前一份索引保持可用。这就是 4.6"refresh 进行期间的查询，等待有限时间后放行"那一行的具体形态，只是等待对象不是查询而是索引任务本身。处置：① 插件内按 cwd 排队（在飞锁），② 被中止的一次自动重试一次并记遥测 `index-retry-contention`，③ `check-plugin.mjs` 臂 G9 在假 subprocess 层复刻这条中止。
 
-落地位次（对照 4.9）：① + ⑤ + ② 的 `advise` 分支 + ③ 已实现并纳入 `npm run check`（臂 G，整套 122/122）；② 的 `deny-once` / `deny` 已实现但**默认不启用**，等 telemetry 说话；④ 与架构摘要未做。
+落地位次（对照 4.9）：① + ⑤ + ② 的 `advise` 分支 + ③ 已实现并纳入 `npm run check`（臂 G，整套 126/126）；② 的 `deny-once` / `deny` 已实现但**默认不启用**，等 telemetry 说话；④ 与架构摘要未做。
 
 ---
 

@@ -147,7 +147,7 @@ Telling the model "use the index" is a soft constraint; these layers intervene i
 | Layer | Mount point | Default | What it does |
 |---|---|---|---|
 | ① wrapped verbs | `ctx.tools.register` | on | `code_find` / `code_callers` — schema cost measured: **1651 B ≈ 413 tokens per request**, against ~3200 tokens saved by the proxy |
-| ② intercept | `tools/pre-execute` | `advise` (no interception) | with `enforce: deny-once`/`deny`: a grep whose pattern looks like a **symbol** is denied **once per symbol per session**, and the deny `reason` already contains the `search_graph` hits, so the model gets an answer in the same round |
+| ② intercept | `tools/pre-execute` | `advise` (no interception) | with `enforce: deny-once`/`deny`: a grep whose pattern looks like a **symbol** is denied **once per symbol per session**, and the deny `reason` already contains the `search_graph` hits, so the model gets an answer in the same round. It also **passes** whenever the graph has nothing for that symbol — intercepting a search the index cannot answer is just obstruction |
 | ④ soft hint | `tools/post-execute` → `additionalContexts` | on (that is `advise`) | appends one model-facing note to the next request; never blocks, never rewrites the result, once per symbol |
 | ⑤ dirty tracking | `tools/post-execute` + pre-query `check_index_coverage` | on | records `write`/`edit` paths per session (no per-file indexing), then verifies those exact paths before answering; when coordinates are stale it **lets grep through** and triggers a cooled background refresh instead of returning a neighbour's code |
 | ③ conditional context | `systemPrompt.context` (order 130) | on | when the last user message looks like "who calls / where is X defined / rename / impact", inject one line: project + freshness + "use code_find". Nothing else is injected — the standing section stays constant |
@@ -289,7 +289,7 @@ Measured on the author's machine:
 
 ```
 PATCH OK
-122/122 arms passed (two profiles)   PLUGIN OK
+126/126 arms passed (two profiles)   PLUGIN OK
 CHAIN OK — 阶段3.5 代理链路延迟 ms: min=29 中位=33 max=34; check_index_coverage(单路径)=29
 arm A direct engine            : 17 tools, 17308 B ≈ 4327 tokens
 arm B proxied, cold cache      :  2 tools,  4278 B ≈ 1070 tokens  (4.0x)

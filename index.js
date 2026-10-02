@@ -782,6 +782,17 @@ function parseRows(text) {
   return j.rows.map((row) => Object.fromEntries(j.cols.map((c, i) => [c, row[i]])))
 }
 
+/**
+ * search_graph 到底有没有命中。钩子里拿的是默认 tree 文本（reason 要给人读），
+ * 所以两种形状都认：JSON 的 `rows: []`，tree 的 `total: 0` / 空输出。
+ */
+function noHits(text) {
+  const rows = parseRows(text)
+  if (rows !== null) return rows.length === 0
+  const s = String(text ?? '').trim()
+  return s === '' || /(?:^|\n)(?:results|total):\s*0\b/.test(s)
+}
+
 const formatRows = (rows) => rows
   .map((r, i) => `${i + 1}. ${r.qn ?? r.qualified_name ?? '?'}  [${r.label ?? '?'}]  ${r.file ?? ''} ${r.lines ?? ''}`.trimEnd())
   .join('\n')
@@ -1163,6 +1174,12 @@ export async function apply(ctx, config) {
         const hits = await cbmCall(ctx, exec, 'search_graph', { project, query: q.symbol, limit: 5 }, cfg.interceptBudgetMs)
         if (!hits.ok) {
           telemetry(cfg, state, 'intercept-pass-query-failed', { session: key, symbol: q.symbol, timeout: !!hits.timeout })
+          return next()
+        }
+        // 图里没有这个符号 ⇒ grep 才是对的工具。拦一条"索引本来就没答案"的搜索，
+        // 既没教育到东西，还把模型唯一能走通的路挡了——所以命中为空就放行。
+        if (noHits(hits.text)) {
+          telemetry(cfg, state, 'intercept-pass-no-hit', { session: key, symbol: q.symbol })
           return next()
         }
         sess.blocked.add(q.symbol)

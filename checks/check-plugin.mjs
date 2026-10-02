@@ -76,7 +76,9 @@ function makeStubProxy(calls, opts = {}) {
         case 'cbm_list_projects':
           return { content: [{ type: 'text', text: `projects: 1  (cols: name root_path branch)\n  ${project} ${root.replace(/\\/g, '/')} main` }] }
         case 'cbm_search_graph':
-          return { content: [{ type: 'text', text: JSON.stringify({ cols: ['qn', 'label', 'file', 'lines', 'rank'], rows: [[`${project}.stubSymbol`, 'Function', 'index.js', '42-44', -1.2]], total: 1, returned: 1, has_more: false }) }] }
+          return { content: [{ type: 'text', text: JSON.stringify(opts.emptySearch
+            ? { cols: ['qn', 'label', 'file', 'lines', 'rank'], rows: [], total: 0, returned: 0, has_more: false }
+            : { cols: ['qn', 'label', 'file', 'lines', 'rank'], rows: [[`${project}.stubSymbol`, 'Function', 'index.js', '42-44', -1.2]], total: 1, returned: 1, has_more: false }) }] }
         case 'cbm_get_code_snippet':
           return { content: [{ type: 'text', text: JSON.stringify({ name: 'stubSymbol', qualified_name: `${project}.stubSymbol`, file_path: 'x/index.js', start_line: 42, end_line: 44, source: 'function stubSymbol() {\n  return 1;\n}\n' }) }] }
         case 'cbm_check_index_coverage':
@@ -432,6 +434,16 @@ async function verify(profile) {
   await b.tools.get('code_setup').execute({}, withSignal(REPO))
   const budgetOut = await (b.events['tools/pre-execute'] ?? [])[0](grepExec(fakeAgent(`sess-${process.pid}-b`, REPO), 'usageSection'), next)
   record('G 查询超预算时放行', budgetOut?.kind === 'allow', JSON.stringify(budgetOut))
+
+  // G5.5 图里没有这个符号 ⇒ 放行：拦一条"索引本来就没答案"的搜索，等于把模型
+  // 唯一走得通的路也挡掉，而 reason 里除了"(无命中)"什么也没给。
+  const nCalls = []
+  const n = await mount({ enforce: 'deny', telemetry: false }, makeStubProxy(nCalls, { project: `stub-${process.pid}-nohit`, emptySearch: true }))
+  await n.tools.get('code_setup').execute({}, withSignal(REPO))
+  const noHitPass = await (n.events['tools/pre-execute'] ?? [])[0](grepExec(fakeAgent(`sess-${process.pid}-nohit`, REPO), 'usageSection'), next)
+  record('G 代码图无命中时放行 grep（不是每次都拦）', noHitPass?.kind === 'allow', JSON.stringify(noHitPass))
+  const noHitFind = await n.tools.get('code_find').execute({ query: 'ghostSymbol' }, { agent: fakeAgent(`sess-${process.pid}-nohit`, REPO), signal: sig() })
+  record('G code_find 无命中时给明确 status 而不是假装有结果', noHitFind?.status === 'empty' && /没有匹配/.test(noHitFind?.text ?? ''), JSON.stringify(noHitFind).slice(0, 140))
 
   // G6 杠杆 ⑤：写入记账 → 脏路径让拦截改走放行 + 后台补刷。
   const tRepo = join(tmpdir(), `cbm-check-dirty-${process.pid}`)
