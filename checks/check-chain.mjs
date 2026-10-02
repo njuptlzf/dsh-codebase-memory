@@ -118,6 +118,22 @@ try {
     console.log('PASS 阶段3 search_graph 返回真实结果')
     console.log('      ' + out.replace(/\s+/g, ' ').slice(0, 300))
 
+    // 阶段 3.5：时间预算实测（design-v2 §6 待核实 #3）。拦截钩子在工具调用的
+    // 关键路径上，`interceptBudgetMs` 的默认值必须有数可依，所以这里量给你看：
+    // 同一个 project 连打 6 次 search_graph，报 min / 中位 / max。
+    // 对照：同一台机器上 `cbm cli search_graph` 单次实测 5.5–8.3s（冷启动），
+    // 所以钩子里绝不能用 CLI 子进程，必须复用这条 keep-alive 长连接。
+    const lat = []
+    for (let i = 0; i < 6; i++) {
+      const t0 = Date.now()
+      await call('tools/call', { name: proxy, arguments: { tool: 'cbm_search_graph', args: { project, query: 'index', limit: 3 } } }, 300000)
+      lat.push(Date.now() - t0)
+    }
+    lat.sort((a, b) => a - b)
+    console.log(`PASS 阶段3.5 代理链路延迟 ms: min=${lat[0]} 中位=${lat[3]} max=${lat[5]}（6 次 search_graph，进程内已热）`)
+    const cov0 = Date.now()
+    await call('tools/call', { name: proxy, arguments: { tool: 'cbm_check_index_coverage', args: { project, paths: ['index.js'] } } }, 300000)
+    console.log(`      check_index_coverage（单路径）ms=${Date.now() - cov0}`)
     // 阶段 4：把要写进 prompt 段的工具参数名核实下来（不靠猜）
     for (const t of ['cbm_search_graph', 'cbm_get_code_snippet', 'cbm_trace_path']) {
       const desc = textOf(await call('tools/call', { name: proxy, arguments: { describe: t } }, 120000))

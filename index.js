@@ -21,8 +21,8 @@
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
-import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -37,6 +37,16 @@ const CBM_EXE = 'codebase-memory-mcp.exe'
 const BOOTSTRAP_MODES = ['blocking', 'background', 'manual']
 const INDEX_MODES = ['full', 'moderate', 'fast', 'cross-repo-intelligence']
 const PROXY_TOOL = 'mcp__cbm__mcp'
+
+/** 触发层（docs/design-v2.md）的常量。跨平台：内置工具是裸名小写（官方 tool-fs-search README 与实装一致）。 */
+const ENFORCE_MODES = ['off', 'advise', 'deny-once', 'deny']
+/** 会写文件的内置工具（官方 tool-fs README：路径字段统一 snake_case `file_path`）。 */
+const WRITE_TOOLS = ['write', 'edit']
+const CODE_FILE = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|c|h|cc|cpp|hpp|cs|rb|php|swift|scala|vue|svelte|sql|sh|bash|ps1)$/i
+const NON_CODE_PATH = /\.(json|ya?ml|toml|ini|env|lock|md|txt|csv|log|svg|png|pdf)$/i
+/** 注入文本里片段的上限：按码点截断，绝不按 UTF-16 单元（dsh-mneme #334 的教训：切进代理对 ⇒ 每个请求 400）。 */
+const HINT_MAX_CODEPOINTS = 900
+const SNIPPET_MAX_CODEPOINTS = 2000
 
 /**
  * 从 adapter 的工具面里摘掉两个：
@@ -54,9 +64,43 @@ export const Config = z.object({
   cbmPath: z.string().default(''),
   autoIndex: z.boolean().default(true),
   sessionRefresh: z.boolean().default(true),
+  // ── 触发层（docs/design-v2.md 4.8）：每个杠杆独立开关，全部可回滚 ──────────
+  wrapperTools: z.boolean().default(true),
+  enforce: z.string().default('advise'),
+  interceptTools: z.string().default('grep,glob'),
+  interceptBudgetMs: z.number().default(2500),
+  contextHint: z.boolean().default(true),
+  telemetry: z.boolean().default(true),
+  dirtyTracking: z.boolean().default(true),
+  dirtyRefreshCooldownSec: z.number().default(120),
 })
 
 const dshHome = () => process.env.DSH_HOME || join(homedir(), '.dsh')
+
+/** 逗号分隔的名单（配置写字符串最省事，也避免 profile YAML 里数组的解析歧义）。 */
+const csv = (s) => String(s ?? '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean)
+
+/** 正整数配置（含 0 = 关闭）；非法值降级为默认并记 note，绝不 throw。 */
+function positiveInt(config, key, fallback, notes) {
+  const raw = config[key]
+  const n = typeof raw === 'number' ? Math.floor(raw) : Number.parseInt(String(raw ?? ''), 10)
+  if (!Number.isFinite(n) || n < 0) {
+    notes.push(`${key}="${raw}" 非法，已按 ${fallback} 处理`)
+    return fallback
+  }
+  return n
+}
+
+/** 布尔配置：字符串 'true'/'false' 也接受（profile YAML 里写成一行的情况）。 */
+function boolOf(value, fallback, notes, key) {
+  if (value === undefined || value === null || value === '') return fallback
+  if (typeof value === 'boolean') return value
+  const s = String(value).toLowerCase()
+  if (s === 'true' || s === '1' || s === 'yes' || s === 'on') return true
+  if (s === 'false' || s === '0' || s === 'no' || s === 'off') return false
+  notes.push(`${key}="${value}" 非法，已按 ${fallback} 处理`)
+  return fallback
+}
 
 /** 归一化配置；非法值不 throw（boot 不许抛），只降级并记进 cfg.notes。 */
 function normalize(config = {}) {
@@ -73,6 +117,18 @@ function normalize(config = {}) {
     cfg.notes.push(`bootstrap="${cfg.bootstrap}" 非法，已按 background 处理（可选：${BOOTSTRAP_MODES.join('|')}）`)
     cfg.bootstrap = 'background'
   }
+  // 触发层
+  cfg.wrapperTools = boolOf(config.wrapperTools, true, cfg.notes, 'wrapperTools')
+  cfg.enforce = ENFORCE_MODES.includes(config.enforce) ? config.enforce : 'advise'
+  if (config.enforce !== undefined && !ENFORCE_MODES.includes(config.enforce)) {
+    cfg.notes.push(`enforce="${config.enforce}" 非法，已按 advise 处理（可选：${ENFORCE_MODES.join('|')}）`)
+  }
+  cfg.interceptTools = csv(config.interceptTools || 'grep,glob')
+  cfg.interceptBudgetMs = positiveInt(config, 'interceptBudgetMs', 2500, cfg.notes)
+  cfg.contextHint = boolOf(config.contextHint, true, cfg.notes, 'contextHint')
+  cfg.telemetry = boolOf(config.telemetry, true, cfg.notes, 'telemetry')
+  cfg.dirtyTracking = boolOf(config.dirtyTracking, true, cfg.notes, 'dirtyTracking')
+  cfg.dirtyRefreshCooldownSec = positiveInt(config, 'dirtyRefreshCooldownSec', 120, cfg.notes)
   cfg.adapterMjs = join(cfg.adapterDir, 'node_modules', '@njuptlzf', 'mcp-adapter', 'mcp-server.mjs')
   cfg.adapterConfig = join(cfg.adapterDir, 'cbm.json')
   return cfg
@@ -251,6 +307,26 @@ async function bootstrap(ctx, cfg, state, signal, { force = false } = {}) {
   return state
 }
 
+/**
+ * 同一工作区的索引任务串行化。实测并发跑两次 `index_repository`（我们的后台补刷
+ * 与引擎 watcher 自己那一次撞上）会被引擎中止其一：退出码 1 +
+ * `status:"aborted_previous_preserved"`，hint 原文就是 "Retry"。所以：
+ * ① 插件内部先排队（后台补刷与 code_index 互不踩），② 仍被外部撞掉时重试一次。
+ */
+async function withIndexLock(state, cwd, work) {
+  const pending = state.indexJobs.get(cwd)
+  if (pending) { try { await pending } catch { /* 前一次失败不阻塞这一次 */ } }
+  const job = Promise.resolve().then(work)
+  state.indexJobs.set(cwd, job)
+  try {
+    return await job
+  } finally {
+    if (state.indexJobs.get(cwd) === job) state.indexJobs.delete(cwd)
+  }
+}
+
+const abortedByContention = (r) => /aborted_previous_preserved/i.test(`${r?.stdout ?? ''}${r?.stderr ?? ''}`)
+
 /** 缺 cbm 时给人的可复制补救步骤（也是断言失败时的证据）。 */
 function cbmInstallHint(state) {
   return [
@@ -346,8 +422,10 @@ function report(cfg, state) {
     `压缩层(②): ${state.adapter}  ${cfg.adapterMjs}`,
     `索引引擎(①): ${state.cbm}  ${state.cbmPath || '(未找到)'}${state.cbmVersion ? '  ' + state.cbmVersion : ''}`,
     `引擎实测: 实测通过 ${testedEngine() || '(未声明)'}；当前 ${state.cbmVersion || '(未探测)'}${engineVerdict(state.cbmVersion) === 'untested' ? '  ⚠ 超出实测范围——工具面可能已变，跑 npm run check' : ''}`,
-    `清单(⑤): ${state.configPath ?? '(未写)'}  exclude=${JSON.stringify(EXCLUDE_TOOLS)}`,
+    `清单: ${state.configPath ?? '(未写)'}  exclude=${JSON.stringify(EXCLUDE_TOOLS)}`,
     `代理工具: ${PROXY_TOOL}  bootstrap=${cfg.bootstrap}  adapterVersion=${cfg.adapterVersion}`,
+    `触发层: wrapper=${cfg.wrapperTools ? 'on' : 'off'}  enforce=${cfg.enforce}  intercept=${cfg.interceptTools.join('+') || '(无)'}  budget=${cfg.interceptBudgetMs}ms  dirty=${cfg.dirtyTracking ? 'on' : 'off'}(冷却 ${cfg.dirtyRefreshCooldownSec}s)  context=${cfg.contextHint ? 'on' : 'off'}`,
+    `遥测计数: ${Object.entries(state.counts).map(([k, v]) => `${k}=${v}`).join(' ') || '(无事件)'}`,
     `auto_index: ${state.autoIndex || '(未设置)'}（期望 ${cfg.autoIndex ? 'true' : 'false'}；机器级共享配置，只补"无索引的新项目"，不刷新陈旧坐标）`,
     syncStatusLine(),
   ]
@@ -369,21 +447,21 @@ function usageSection(state) {
   return [
     '本工作区已接入 codebase-memory 代码索引（经 mcp-adapter 压成单个代理工具）。',
     '',
-    '索引：`code_index`——repo_path 已绑本会话工作区，不要自传；返回的 `project` 供下面所有调用。',
-    '不要用 cbm_index_repository（已从工具面移除）。',
+    '**首选封装动词**（project 与参数形状由插件填，你只管说要找什么）：',
+    '- `code_find("符号")` → qualified_name + 文件 + 行范围 + 源码，代替"用 grep 猜定义在哪"。',
+    '- `code_callers("qualified_name", direction?)` → 调用者/被调方，代替手工数调用点。',
+    '字符串、日志、配置值、正则文本仍然用 grep——图索引对它们没用。',
     '',
-    `检索都走代理工具 \`${PROXY_TOOL}\`，args 直接传对象；按动线（多步用 mcpScript 一趟跑完，别逐个往返）：`,
-    '- 定位 {"tool":"cbm_search_graph","args":{"project":"<p>","query":"关键词"}} → 得 qualified_name 与 file+行号',
-    '- 取原文 {"tool":"cbm_get_code_snippet","args":{"project":"<p>","qualified_name":"<qn>","format":"json"}}',
+    '索引：`code_index`——repo_path 已绑本会话工作区，不要自传；返回的 `project` 供长尾调用。',
+    `长尾都走代理工具 \`${PROXY_TOOL}\`，args 直接传对象；多步用 mcpScript 一趟跑完：`,
     '- 验鲜 {"tool":"cbm_check_index_coverage","args":{"project":"<p>","paths":["<相对路径>"]}}',
-    '- 调用链 {"tool":"cbm_trace_path","args":{"project":"<p>","function_name":"<qn>"}}',
-    '- 摸面 {"server":"cbm"} 列工具；{"search":"关键词"} 搜；{"describe":"cbm_search_graph"} 看参数',
+    '- 取原文 {"tool":"cbm_get_code_snippet","args":{"project":"<p>","qualified_name":"<qn>","format":"json"}}',
+    '- 多跳 {"tool":"cbm_query_graph",...}；{"server":"cbm"} 列工具，{"describe":"..."} 看参数',
     '',
-    '两个坑性质相反，所以处置不同：',
-    '- **取原文务必带 format:"json"**。默认 tree 是排版信封、会改写每行空白，照抄当锚点必不匹配——',
-    '  但它**当场报错**，只费一轮，改不坏文件。',
-    '- **行号来自索引**。代码改过而没重新 code_index，片段会**静默**返回邻居内容，name 与 source_mode',
-    '  照旧、index_status 也仍报 ready。所以动手前看验鲜：freshness=metadata_changed ⇒ 先 code_index。',
+    '两个坑性质相反，处置不同：',
+    '- **取原文务必带 format:"json"**：默认 tree 是排版信封，照抄当锚点必不匹配，但会当场报错。',
+    '- **行号来自索引**：代码改过没重建，片段会**静默**返回邻居内容且不报错。所以动手前验鲜：',
+    '  freshness=metadata_changed ⇒ 先 code_index。',
     '',
     '偏移量、实测样本与上游 issue 见本仓库 README 的「已知限制」。',
   ].join('\n')
@@ -452,9 +530,14 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
   state.refreshing.add(cwd)
   refreshLog(cfg, `refresh ${cwd}（git 状态变了）`)
   try {
-    const r = await run(ctx, [state.cbmPath, 'cli', '--quiet', 'index_repository', '--repo-path', cwd], {
+    const runIndex = () => run(ctx, [state.cbmPath, 'cli', '--quiet', 'index_repository', '--repo-path', cwd], {
       cwd, maxBytes: 1024 * 1024, graceMs: 60000, signal,
     })
+    let r = await withIndexLock(state, cwd, runIndex)
+    if (r.exitCode !== 0 && abortedByContention(r)) {
+      refreshLog(cfg, `retry ${cwd}（被并发中止）`)
+      r = await withIndexLock(state, cwd, runIndex)
+    }
     refreshLog(cfg, `done ${cwd} exit=${r.exitCode}`)
     if (r.exitCode === 0) {
       writeFileSync(stampPath, JSON.stringify({ ...stamps, [cwd]: { at: Date.now(), digest } }, null, 2), 'utf8')
@@ -467,14 +550,347 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
 }
 
 /**
- * @param ctx - host 上下文（tools + subprocess + systemPrompt）。
- * @param config - 见 Config。
+ * ── 触发层（docs/design-v2.md 杠杆 ①②③⑤）────────────────────────────────────
+ *
+ * 一句话：把"该用代码图"从**劝**变成**给结果**——高频动线包成原生工具（①）、
+ * 符号类 grep 可拦截（②）、按 query 注入 1–2 行状态（③）、写后记账保证前两者
+ * 的结果可信（⑤）。每一条都可关，且全部 fail-open：hook 里出错一律放行。
+ *
+ * 三个经源码核实的宿主契约（宿主 0.1.5-rc.2 实装，见 docs/design-v2.md 4.3）：
+ *   - `tools/pre-execute` 是 waterfall：`(exec, next) => PreToolDecision`，只能
+ *     allow/deny/cancel/ask，**放行时不能附带上下文**；deny 的 `reason` 会被原样
+ *     物化成 `Error: <reason>` 给模型看，且 denied 调用仍会走 post-execute。
+ *   - `tools/post-execute` 是 waterfall：`(exec, result, next) => PostToolDecision`，
+ *     `additionalContexts` 是官方追加上下文的形态（挂到下一个请求）。
+ *   - `ctx.tools.execute(input)` 是**公开方法**（宿主工具目录：presentAs/register/
+ *     restrict/guard/get/schemas/executionMode/execute），所以封装工具直接复用
+ *     keep-alive 的代理链路，不必 spawn CLI —— 实测 `cli` 单次 5.5–8.3s，而
+ *     pre-execute 在每次工具调用的关键路径上，那个数字根本不能出现在钩子里。
  */
+
+/**
+ * 纯函数：这条 grep/glob 查询像"找符号"还是像"找字面量"？
+ *
+ * 判据一律**保守**：误拦一次字面量搜索的代价是模型白白多一个往返、并对插件失去
+ * 信任，所以默认归 literal（=放行），只有明确像标识符的才算 symbol。可单测。
+ *
+ * 与宿主自带的 `repeat-tool-reminder` 不重叠：那个只看"参数完全相同的连续重复"，
+ * 换一个 pattern 就归零；这里看的是**语义**（标识符形态）。
+ */
+export function classifyPattern(pattern, path = '') {
+  const p = String(pattern ?? '').trim()
+  if (!p) return { kind: 'literal', symbol: '' }
+  // 明确限定到非代码文件/目录：那是字面量与配置的领域，一律放行。
+  if (path && NON_CODE_PATH.test(String(path))) return { kind: 'literal', symbol: '' }
+  const def = /^(?:@\s*)?(?:export\s+(?:default\s+)?)?(?:class|def|fn|func|function|interface|type|enum|struct|trait|impl|const|let|var)\s+([A-Za-z_$][\w$]*)/.exec(p)
+  if (def) return { kind: 'symbol', symbol: def[1] }
+  // 纯标识符（可含限定符 . : #）；任何正则元字符、空格、引号、URL 都直接落回 literal。
+  if (!/^[A-Za-z_$][\w$.:#]*$/.test(p)) return { kind: 'literal', symbol: '' }
+  if (/^[A-Z][A-Z0-9_]{2,}$/.test(p)) return { kind: 'literal', symbol: '' } // 配置键风格 MAX_RETRIES
+  // 限定名：`svc.doThing` 找的是 doThing；但 `dsh.profile.bundles` 这种**全小写点分链**
+  // 是配置键的形态，不是符号——误拦一次配置搜索比漏拦一次符号搜索贵得多。
+  if (/[.:#]/.test(p) && !p.split(/[.:#]/).some((s) => /[A-Z]/.test(s) || (s.includes('_') && s.length >= 4))) {
+    return { kind: 'literal', symbol: '' }
+  }
+  // 限定名取**最后一段**做本体：`svc.doThing` 找的是 doThing，`a.b` 太短就没意义。
+  const bare = p.split(/[.:#]/).pop() ?? p
+  if (bare.length < 4) return { kind: 'literal', symbol: '' } // foo / api / id 这类太通用
+  if (bare.length < 6 && !/[A-Z_]/.test(bare)) return { kind: 'literal', symbol: '' } // name / mode
+  return { kind: 'symbol', symbol: bare }
+}
+
+/** 内置搜索工具是裸名小写（`grep` / `glob`），MCP 工具才带 `mcp__` 前缀。 */
+export function isGrepLike(name, tools = []) {
+  return tools.includes(String(name ?? '').toLowerCase())
+}
+
+/** 按码点截断（UTF-16 单元截断会切出孤立代理对，宿主对每个请求返回 400）。 */
+export function truncateCodepoints(text, max) {
+  const chars = Array.from(String(text ?? ''))
+  return chars.length <= max ? String(text ?? '') : `${chars.slice(0, max).join('')}…`
+}
+
+/** Windows 大小写不敏感 + 斜杠混用：脏路径集合必须归一，否则同一文件记两次。 */
+export function normPath(p, cwd = '') {
+  let s = String(p ?? '').replace(/\\/g, '/').replace(/\/+$/, '')
+  if (cwd) {
+    const base = String(cwd).replace(/\\/g, '/').replace(/\/+$/, '')
+    if (s.toLowerCase().startsWith(`${base.toLowerCase()}/`)) s = s.slice(base.length + 1)
+  }
+  return /^[a-z]:\//.test(s) ? s[0].toLowerCase() + s.slice(1) : s
+}
+
+/** 会话键：优先 session id（resume/多标签下 cwd 可能相同），退回 cwd。 */
+const sessionKey = (agent) => agent?.session?.header?.id ?? agent?.session?.header?.cwd ?? ''
+
+/** 每会话状态：project 缓存、脏路径、已拦过的符号（同符号只拦一次）。 */
+function sessionOf(state, key) {
+  let s = state.sessions.get(key)
+  if (!s) {
+    s = { project: '', dirty: new Set(), blocked: new Set(), advised: new Set(), lastRefreshAt: 0 }
+    state.sessions.set(key, s)
+  }
+  return s
+}
+
+/** 时间预算：超时返回 null，钩子里绝不因为查询把工具调用卡死。 */
+async function withBudget(ms, work) {
+  let timer
+  try {
+    return await Promise.race([
+      Promise.resolve().then(work),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), ms) }),
+    ])
+  } catch {
+    return null
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+/** 代理工具的返回是 text 块；两种形状（value / content）都接住。 */
+function resultText(res) {
+  if (!res) return ''
+  const blocks = (res.content ?? []).filter((b) => b?.type === 'text').map((b) => b.text)
+  if (blocks.length) return blocks.join('\n')
+  const v = res.value
+  if (typeof v === 'string') return v
+  return v === undefined ? '' : JSON.stringify(v)
+}
+
+/**
+ * 经宿主工具管线调一次 cbm（`mcp__cbm__mcp` 是 keep-alive 的那条长连接）。
+ * 返回 `{ ok, text }`；链路不健康 / 被隐藏 / 超时都 `ok:false`，由调用方决定放行。
+ */
+async function cbmCall(ctx, exec, tool, args, budgetMs) {
+  if (typeof ctx?.tools?.execute !== 'function') return { ok: false, text: '' }
+  const signal = exec?.signal ?? new AbortController().signal
+  const input = {
+    callId: randomUUID(),
+    name: PROXY_TOOL,
+    arguments: { tool: `cbm_${tool}`, args },
+    signal,
+    ...(exec?.agent ? { agent: exec.agent } : {}),
+  }
+  const outcome = await withBudget(budgetMs, () => ctx.tools.execute(input))
+  if (!outcome) return { ok: false, text: '', timeout: true }
+  if (outcome.isError) return { ok: false, text: resultText(outcome) }
+  return { ok: true, text: resultText(outcome) }
+}
+
+/** 从 list_projects 的文本表里按 root_path 找 project 名（不自己重算引擎的命名规则）。 */
+export function projectFromListing(text, cwd) {
+  const norm = (p) => String(p).replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase()
+  for (const line of String(text ?? '').split('\n')) {
+    const parts = line.trim().split(/\s+/)
+    if (parts.length >= 2 && norm(parts[1]) === norm(cwd)) return parts[0]
+  }
+  return ''
+}
+
+/** project 名：会话缓存 → code_index 落过的记录 → 现查 list_projects。查不到返回 ''。 */
+async function projectFor(ctx, exec, cfg, state, session, cwd, budgetMs = cfg.interceptBudgetMs) {
+  if (session.project) return session.project
+  const cached = state.projectsByCwd.get(cwd)
+  if (cached) { session.project = cached; return cached }
+  const r = await cbmCall(ctx, exec, 'list_projects', {}, budgetMs)
+  const found = r.ok ? projectFromListing(r.text, cwd) : ''
+  if (found) { session.project = found; state.projectsByCwd.set(cwd, found) }
+  return found
+}
+
+/**
+ * 写后失效检查（杠杆 ⑤）：只对本会话记账的脏路径问一次 `check_index_coverage`。
+ * 返回 'fresh' / 'stale' / 'unknown'（unknown = 查询失败或超时；调用方一律 fail-open）。
+ */
+async function freshness(ctx, exec, cfg, state, session, budgetMs = cfg.interceptBudgetMs) {
+  if (!cfg.dirtyTracking || session.dirty.size === 0) return 'fresh'
+  const paths = [...session.dirty].slice(0, 20)
+  const r = await cbmCall(ctx, exec, 'check_index_coverage', { project: session.project, paths }, budgetMs)
+  if (!r.ok) return 'unknown'
+  // 引擎用 freshness/status 列表达"这条路径要重索"。任何非 fresh 字样都当 stale（保守）。
+  return /(metadata_changed|stale|missing|not_recorded|needs_reindex|generation_mismatch)/i.test(r.text) ? 'stale' : 'fresh'
+}
+
+/** 遥测：一行 JSON。写失败绝不影响会话（与 refreshLog 同一原则）。 */
+const TELEMETRY_MAX_BYTES = 512 * 1024
+function telemetry(cfg, state, event, fields = {}) {
+  if (!cfg.telemetry) return
+  try {
+    mkdirSync(cfg.adapterDir, { recursive: true })
+    const path = join(cfg.adapterDir, 'telemetry.log')
+    // ponytail: 追加式 JSONL，唯一的保鲜手段是"超上限就整份重来"（计数还在内存里，
+    // 报表不依赖文件）。要长期分析就换成按天分文件 + 定期清理。
+    try { if (statSync(path).size > TELEMETRY_MAX_BYTES) rmSync(path, { force: true }) } catch { /* 还不存在最好 */ }
+    writeFileSync(path, `${JSON.stringify({ ts: new Date().toISOString(), event, ...fields })}\n`, { flag: 'a' })
+  } catch { /* 忽略 */ }
+  state.counts[event] = (state.counts[event] ?? 0) + 1
+}
+
+/** deny 的 reason：模型这一轮就要拿到可用结果，而不是一句说教。 */
+function renderInterceptHint(symbol, project, hits) {
+  return truncateCodepoints([
+    `dsh-codebase-memory：grep 找符号 "${symbol}" 已被拦下（同一会话同一符号只拦一次）。代码图里有现成答案，别再用正则猜定义在哪。`,
+    `project=${project} 的 search_graph 命中：`,
+    (hits || '(无命中)').trim(),
+    `下一步：code_find("${symbol}") 拿源码，或 code_callers("<qualified_name>") 拿调用者。`,
+  ].join('\n'), HINT_MAX_CODEPOINTS)
+}
+
+/** advise 的软提示（post-execute 追加上下文，不阻断）。 */
+function renderAdvise(symbol, project) {
+  return truncateCodepoints(
+    `dsh-codebase-memory：刚才那条 grep 的 pattern "${symbol}" 像找符号。字符串/日志/配置值用 grep 是对的，但找定义与调用关系时优先 code_find / code_callers（project=${project}），一次到位且带 qualified_name。`,
+    HINT_MAX_CODEPOINTS,
+  )
+}
+
+/** 像"查代码结构"的用户问题（杠杆 ③ 的触发词，中英各一批）。 */
+const CODE_QUESTION = /(谁调用|调用链|引用了|被谁用|定义在哪|在哪定义|哪些地方|哪几处|影响(范围|面|哪些|什么)|重命名|rename|call\s?graph|callers?|callees?|where is .{0,24}defined|what (calls|uses)|impact of)/i
+
+/** 最近一条人类消息（同步、从已物化的会话事件里取；宿主对 context 的渲染不支持异步）。 */
+function lastUserQuery(agent) {
+  try {
+    const session = agent?.session
+    const events = session?.snapshotEvents?.() ?? session?.events
+    if (!Array.isArray(events)) return ''
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i]
+      if (e?.type !== 'user/message') continue
+      const kind = e.data?.source?.kind
+      if (kind !== undefined && kind !== 'user') continue
+      const parts = e.data?.content
+      if (!Array.isArray(parts) || parts.length === 0) continue
+      return truncateCodepoints(parts.map((p) => (typeof p === 'string' ? p : p?.text ?? '')).filter(Boolean).join('\n'), 400)
+    }
+  } catch { /* 会话内部结构拿不到：退化成"没有 query"，不注入 */ }
+  return ''
+}
+
+/** 注入文本里不能出现宿主认识的 `{{name}}`：插值器对未注册变量会抛。 */
+const noVars = (s) => String(s).replace(/\{\{/g, '{ {')
+
+/** 封装工具走的是模型主动等待的路径，预算给到 20s（实测代理查询 ~30–60ms，冷路径更高）。 */
+const WRAPPER_BUDGET_MS = 20000
+
+const tryJson = (text) => { try { return JSON.parse(String(text ?? '')) } catch { return null } }
+
+/** `format:"json"` 的表形状是 {cols, rows}；形状一变就退回原文，绝不静默丢结果。 */
+function parseRows(text) {
+  const j = tryJson(text)
+  if (!j || !Array.isArray(j.rows) || !Array.isArray(j.cols)) return null
+  return j.rows.map((row) => Object.fromEntries(j.cols.map((c, i) => [c, row[i]])))
+}
+
+const formatRows = (rows) => rows
+  .map((r, i) => `${i + 1}. ${r.qn ?? r.qualified_name ?? '?'}  [${r.label ?? '?'}]  ${r.file ?? ''} ${r.lines ?? ''}`.trimEnd())
+  .join('\n')
+
+/** 宿主 V4 要求插件写的消息带自有的 source.kind；这里显式声明生产者。 */
+const PLUGIN_MSG_SOURCE = { kind: 'plugin', plugin: 'dsh-codebase-memory' }
+
+/**
+ * 手写消息而不是 import `createUserMessage`：不给插件加 boot 期硬依赖，
+ * 形状与 dsh-llm 的实现一致（role / id / content / source）。
+ */
+function pluginMessage(text, summary) {
+  return {
+    role: 'user',
+    id: randomUUID(),
+    content: [{ type: 'text', text }],
+    source: { ...PLUGIN_MSG_SOURCE, form: 'notice', summary: String(summary ?? '').slice(0, 120) },
+  }
+}
+
+/**
+ * 封装工具的公共前提：会话工作区 → 链路就绪 → project 解析。
+ * 与 code_index 同样的纪律：**前提不成立即 throw**，不静默降级成 grep。
+ */
+async function runCbmFlow(ctx, cfg, state, exec, work) {
+  const cwd = exec?.agent?.session?.header?.cwd
+  if (!cwd) throw new Error('封装工具需要会话工作区：exec.agent.session.header.cwd 为空')
+  await bootstrap(ctx, cfg, state, exec.signal).catch((error) => {
+    state.lastError = String(error?.message ?? error)
+    state.ok = false
+  })
+  if (state.adapter !== 'ready') throw new Error('压缩层(②)未就绪，检索无法工作：\n' + report(cfg, state))
+  if (state.cbm !== 'ready') throw new Error(cbmInstallHint(state))
+  const sess = sessionOf(state, sessionKey(exec.agent))
+  const project = await projectFor(ctx, exec, cfg, state, sess, cwd, WRAPPER_BUDGET_MS)
+  if (!project) throw new Error(`本工作区还没进代码图（project 表里没有 cwd=${cwd}）。第一步：code_index，然后再来用封装工具。`)
+  return work({ project, sess, cwd })
+}
+
+/**
+ * 脏路径触发的后台补刷：冷却期内合并（同回合的多次写入自然并成一次）。
+ * 复用 H2 那条带闸门的 refreshSessionWorkspace——它自己会验 git 状态是否真变了。
+ */
+function scheduleDirtyRefresh(ctx, cfg, state, sess, exec) {
+  const now = Date.now()
+  if (now - sess.lastRefreshAt < cfg.dirtyRefreshCooldownSec * 1000) return
+  sess.lastRefreshAt = now
+  const paths = [...sess.dirty]
+  telemetry(cfg, state, 'dirty-refresh-scheduled', { paths: paths.length })
+  void refreshSessionWorkspace(ctx, cfg, state, exec?.agent, state.abortSignal)
+    .then(() => {
+      sess.dirty.clear()
+      telemetry(cfg, state, 'dirty-refresh-done', { paths: paths.length })
+    })
+    .catch((error) => telemetry(cfg, state, 'dirty-refresh-fail', { message: String(error?.message ?? error).slice(0, 200) }))
+}
+
+/**
+ * post-execute 的观察：① 写入类工具记进会话脏集合（不触发 refresh，纯记账）；
+ * ② advise 模式下对"像找符号"的 grep 追加一条上下文（不阻断、不改结果）。
+ * 返回要追加的消息，或 null。
+ */
+function observeCall(ctx, cfg, state, exec, result) {
+  const key = sessionKey(exec?.agent)
+  const cwd = exec?.agent?.session?.header?.cwd
+  if (!key || !cwd) return null
+  const sess = sessionOf(state, key)
+  const name = String(exec?.name ?? '').toLowerCase()
+  if (cfg.dirtyTracking && WRITE_TOOLS.includes(name) && !result?.isError) {
+    const raw = exec?.arguments?.file_path
+    if (typeof raw === 'string' && raw) {
+      const rel = normPath(raw, cwd)
+      // 只记工作区内的代码文件：绝对路径没被前缀吃掉 = 在工作区外；非代码扩展名图里没有。
+      const inside = !rel.startsWith('/') && !/^[a-z]:\//i.test(rel)
+      if (inside && CODE_FILE.test(rel)) {
+        sess.dirty.add(rel)
+        telemetry(cfg, state, 'dirty-record', { session: key, path: rel, total: sess.dirty.size })
+      }
+    }
+  }
+  if (cfg.enforce !== 'advise' || !state.ok) return Promise.resolve(null)
+  if (!isGrepLike(name, cfg.interceptTools)) return Promise.resolve(null)
+  if (result?.isError) return Promise.resolve(null) // 失败/被拒的调用不再补提示
+  const q = classifyPattern(exec?.arguments?.pattern, exec?.arguments?.path)
+  if (q.kind !== 'symbol') return Promise.resolve(null)
+  if (sess.advised.has(q.symbol)) return Promise.resolve(null) // 每符号一次，不刷屏
+  // advise 要有具体内容，就得知道 project：会话没解析过就现查一次（实测 ~30ms，
+  // post-execute 不在关键路径上，多这一次换来"第一次 grep 就被提示"）。
+  return projectFor(ctx, exec, cfg, state, sess, cwd).then((project) => {
+    if (!project) return null
+    sess.advised.add(q.symbol)
+    telemetry(cfg, state, 'advise', { session: key, symbol: q.symbol })
+    return pluginMessage(renderAdvise(q.symbol, project), `cbm-advise ${q.symbol}`)
+  }).catch(() => null)
+}
+
+/**
+ * ── 触发层结束，以下原有骨架不变 ────────────────────────────────────────────
+ */
+
 export async function apply(ctx, config) {
   const cfg = normalize(config)
-  const state = { adapter: 'unknown', cbm: 'unknown', ok: false, autoIndex: '', refreshing: new Set(), notes: [], lastError: '' }
+  const state = {
+    adapter: 'unknown', cbm: 'unknown', ok: false, autoIndex: '', refreshing: new Set(), notes: [], lastError: '',
+    sessions: new Map(), projectsByCwd: new Map(), counts: {}, indexJobs: new Map(),
+  }
 
   const ac = new AbortController()
+  state.abortSignal = ac.signal
   ctx.effect(() => () => ac.abort(), 'dsh-codebase-memory.abort')
 
   // 后台自举：绝不 await 成 boot 失败；失败只落在 state.lastError。
@@ -575,12 +991,13 @@ export async function apply(ctx, config) {
       const argv = [state.cbmPath, 'cli', 'index_repository', '--repo-path', cwd]
       if (args.mode) argv.push('--mode', args.mode)
       // index_repository 不支持 --format：它的 stdout 本来就是 JSON。
-      const r = await run(ctx, argv, {
-        cwd,
-        maxBytes: 1024 * 1024,
-        graceMs: 20000,
-        signal: exec.signal,
-      })
+      const spec = { cwd, maxBytes: 1024 * 1024, graceMs: 20000, signal: exec.signal }
+      let r = await withIndexLock(state, cwd, () => run(ctx, argv, spec))
+      if (r.exitCode !== 0 && abortedByContention(r)) {
+        // 引擎自己的 hint：并发或瞬态 ⇒ Retry。后台补刷 / 引擎 watcher 都可能撞上来。
+        telemetry(cfg, state, 'index-retry-contention', { cwd })
+        r = await withIndexLock(state, cwd, () => run(ctx, argv, spec))
+      }
       if (r.exitCode !== 0) {
         throw new Error(`index_repository 退出码 ${r.exitCode}：${(r.stderr || r.stdout).trim().slice(-600)}`)
       }
@@ -590,6 +1007,12 @@ export async function apply(ctx, config) {
       } catch {
         throw new Error(`index_repository 输出不是 JSON：${r.stdout.slice(0, 400)}`)
       }
+      // 记进会话状态：封装工具与拦截都要 project，不能每次都去问 list_projects。
+      // 刚重建完索引 ⇒ 本会话记账的脏路径已经反映在图里，清空集合。
+      state.projectsByCwd.set(cwd, info.project)
+      const sess = sessionOf(state, sessionKey(exec.agent))
+      sess.project = info.project
+      sess.dirty.clear()
       return {
         project: info.project,
         status: info.status ?? 'unknown',
@@ -599,4 +1022,207 @@ export async function apply(ctx, config) {
       }
     },
   }))
+
+  // ── 杠杆 ①：原生封装工具 ────────────────────────────────────────────────────
+  // 存在的理由只有一个：把"路由键"从模型手里拿走。project、args 形状、四步动线
+  // 都由插件填，模型只管说要找什么。长尾能力仍然走 `mcp__cbm__mcp`，不重复造。
+  if (cfg.wrapperTools) {
+    ctx.tools.register(defineTool({
+      name: 'code_find',
+      description: 'Locate a SYMBOL (function / class / method / route) in this workspace by name: returns the qualified name, file, line range and the source itself from the code graph. Use it INSTEAD of grep when the question is "where is X defined / what does X look like". NOT for string literals, log messages, config values, URLs or regex over text — keep using grep for those. Returns "not indexed" when the workspace has no graph yet: run code_index first.',
+      parameters: {
+        query: { type: 'string', required: true, description: 'Symbol name or a short keyword phrase (BM25 over the graph). Prefer the exact identifier.' },
+        limit: { type: 'integer', description: 'Max candidate symbols (default 3, cap 10).' },
+        with_source: { type: 'boolean', description: 'Also read the source of the top candidate (default true).' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            text: { type: 'string', required: true },
+            project: { type: 'string', required: true },
+            status: { type: 'string', required: true },
+          },
+        },
+        render: (_args, value) => [{ type: 'text', text: value.text }],
+      },
+      async execute(args, exec) {
+        const out = await runCbmFlow(ctx, cfg, state, exec, async ({ project, sess }) => {
+          const limit = Math.min(Math.max(Number.isInteger(args.limit) ? args.limit : 3, 1), 10)
+          const search = await cbmCall(ctx, exec, 'search_graph', { project, query: String(args.query ?? ''), limit, format: 'json' }, WRAPPER_BUDGET_MS)
+          if (!search.ok) throw new Error(`search_graph 调用失败（链路或引擎异常）：${(search.text || '超时').slice(0, 300)}`)
+          const rows = parseRows(search.text)
+          if (rows === null) return { status: 'ok', text: truncateCodepoints(search.text, SNIPPET_MAX_CODEPOINTS), project } // 形状变了也不吞结果
+          if (rows.length === 0) return { status: 'empty', text: `代码图（project=${project}）里没有匹配 "${args.query}" 的符号。\n字符串 / 日志 / 配置值本来就该用 grep；确实是符号的话，换个关键词或先 code_index。` }
+          const lines = [`code_find project=${project}  命中 ${rows.length} 个候选：`]
+          lines.push(formatRows(rows, project))
+          let staleNote = ''
+          if (args.with_source !== false) {
+            const top = rows[0]
+            const qn = top.qualified_name ?? top.qn ?? ''
+            if (qn) {
+              const snip = await cbmCall(ctx, exec, 'get_code_snippet', { project, qualified_name: qn, format: 'json' }, WRAPPER_BUDGET_MS)
+              const parsed = snip.ok ? tryJson(snip.text) : null
+              if (parsed?.source) {
+                // 便宜的自检：坐标过期时引擎会**静默**返回邻居代码（上游 issue #1750）。
+                // 名字对不上就是邻居，别当定义交出去。
+                const name = String(parsed.name ?? qn.split('.').pop() ?? '')
+                const holds = parsed.source.includes(name)
+                lines.push(`\n—— ${qn}（${parsed.file_path ?? ''} ${parsed.start_line ?? '?'}-${parsed.end_line ?? '?'}）${holds ? '' : ' ⚠ 返回的源码里没有这个符号名，坐标很可能已过期'}`)
+                lines.push(truncateCodepoints(parsed.source, SNIPPET_MAX_CODEPOINTS))
+                if (!holds) staleNote = '\n⚠ 索引坐标与本会话的编辑不一致：先跑 code_index 再采信上面的行号。'
+              } else {
+                lines.push(`\n—— ${qn}\n${truncateCodepoints(snip.text || '(取源码失败)', SNIPPET_MAX_CODEPOINTS)}`)
+              }
+            }
+          }
+          const fresh = await freshness(ctx, exec, cfg, state, sess, WRAPPER_BUDGET_MS)
+          const warn = fresh === 'stale'
+            ? `\n⚠ 本会话改过 ${sess.dirty.size} 个文件，check_index_coverage 报坐标已变化：行号与片段可能落到邻居代码上。建议先 code_index（已在后台补刷）。`
+            : ''
+          if (fresh === 'stale') scheduleDirtyRefresh(ctx, cfg, state, sess, exec)
+          return { status: fresh === 'stale' ? 'stale' : 'ok', text: truncateCodepoints(lines.join('\n') + warn + staleNote, 6000), project }
+        })
+        return out
+      },
+    }))
+
+    ctx.tools.register(defineTool({
+      name: 'code_callers',
+      description: 'Who calls a symbol (direction=inbound, the default) or what it calls (outbound), hop by hop, from the code graph. Use it INSTEAD of grepping the identifier to eyeball call sites: it follows the CALLS/USAGE edges and gives qualified names. Argument is the qualified_name from code_find (or a bare symbol name that exists in the graph).',
+      parameters: {
+        name: { type: 'string', required: true, description: 'Qualified name (preferred) or symbol name to trace.' },
+        direction: { type: 'string', description: 'inbound (callers, default) | outbound (callees) | both.' },
+        depth: { type: 'integer', description: 'Hops to expand (default 1).' },
+        limit: { type: 'integer', description: 'Max rows (default 20).' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            text: { type: 'string', required: true },
+            project: { type: 'string', required: true },
+            status: { type: 'string', required: true },
+          },
+        },
+        render: (_args, value) => [{ type: 'text', text: value.text }],
+      },
+      async execute(args, exec) {
+        const dir = ['inbound', 'outbound', 'both'].includes(args.direction) ? args.direction : 'inbound'
+        return runCbmFlow(ctx, cfg, state, exec, async ({ project, sess }) => {
+          const trace = await cbmCall(ctx, exec, 'trace_path', {
+            project,
+            function_name: String(args.name ?? ''),
+            direction: dir,
+            ...(Number.isInteger(args.depth) ? { depth: Math.min(Math.max(args.depth, 1), 6) } : {}),
+            ...(Number.isInteger(args.limit) ? { limit: Math.min(Math.max(args.limit, 1), 100) } : {}),
+          }, WRAPPER_BUDGET_MS)
+          if (!trace.ok) throw new Error(`trace_path 调用失败：${(trace.text || '超时').slice(0, 300)}`)
+          const fresh = await freshness(ctx, exec, cfg, state, sess, WRAPPER_BUDGET_MS)
+          if (fresh === 'stale') scheduleDirtyRefresh(ctx, cfg, state, sess, exec)
+          return {
+            status: fresh === 'stale' ? 'stale' : 'ok',
+            text: truncateCodepoints(trace.text + (fresh === 'stale' ? `\n⚠ 本会话改过 ${sess.dirty.size} 个文件，调用边可能滞后，必要时先 code_index。` : ''), 6000),
+            project,
+          }
+        })
+      },
+    }))
+  }
+
+  // ── 杠杆 ②：tools/pre-execute 拦截符号类 grep/glob（仅 deny-once / deny）──────
+  // 关键路径上的同步钩子：只做纯本地判断，必要才查（实测代理查询 ~30–60ms，
+  // 而 cbm CLI 冷启动实测 5.5–8.3s —— 绝不能在钩子里 spawn CLI）。任何不满足
+  // 前提 / 超时 / 出错的情形一律放行。
+  const denyActive = cfg.enforce === 'deny-once' || cfg.enforce === 'deny'
+  if (denyActive && typeof ctx.on === 'function') {
+    ctx.on('tools/pre-execute', async (exec, next) => {
+      try {
+        if (!isGrepLike(exec.name, cfg.interceptTools)) return next()
+        const q = classifyPattern(exec.arguments?.pattern, exec.arguments?.path)
+        if (q.kind !== 'symbol') return next()
+        const key = sessionKey(exec.agent)
+        const cwd = exec.agent?.session?.header?.cwd
+        if (!key || !cwd || !state.ok) return next()
+        const sess = sessionOf(state, key)
+        if (cfg.enforce === 'deny-once' && sess.blocked.has(q.symbol)) {
+          telemetry(cfg, state, 'intercept-skip-seen', { session: key, symbol: q.symbol })
+          return next()
+        }
+        const project = await projectFor(ctx, exec, cfg, state, sess, cwd)
+        if (!project) return next()
+        const fresh = await freshness(ctx, exec, cfg, state, sess)
+        if (fresh !== 'fresh') {
+          // 索引不可信时拦截就是在骗人：放行 + 后台补刷。
+          telemetry(cfg, state, 'intercept-pass-unfresh', { session: key, symbol: q.symbol, fresh })
+          scheduleDirtyRefresh(ctx, cfg, state, sess, exec)
+          return next()
+        }
+        const hits = await cbmCall(ctx, exec, 'search_graph', { project, query: q.symbol, limit: 5 }, cfg.interceptBudgetMs)
+        if (!hits.ok) {
+          telemetry(cfg, state, 'intercept-pass-query-failed', { session: key, symbol: q.symbol, timeout: !!hits.timeout })
+          return next()
+        }
+        sess.blocked.add(q.symbol)
+        telemetry(cfg, state, 'intercept-deny', { session: key, symbol: q.symbol, enforce: cfg.enforce })
+        // reason 是模型唯一看得到的部分；info 只进结构化错误元数据（宿主契约：info.reason 不进模型内容）。
+        return {
+          kind: 'deny',
+          reason: renderInterceptHint(q.symbol, project, hits.text),
+          info: { name: 'SymbolSearchIntercept', code: 'cbm-symbol-intercept' },
+        }
+      } catch (error) {
+        telemetry(cfg, state, 'intercept-error', { message: String(error?.message ?? error).slice(0, 200) })
+        return next() // fail-open
+      }
+    })
+  }
+
+  // ── 杠杆 ④（advise 分支）+ ⑤（写后记账）：tools/post-execute ─────────────────
+  if ((cfg.enforce === 'advise' || cfg.dirtyTracking) && typeof ctx.on === 'function') {
+    ctx.on('tools/post-execute', async (exec, result, next) => {
+      let extra = null
+      try {
+        extra = await observeCall(ctx, cfg, state, exec, result)
+      } catch (error) {
+        telemetry(cfg, state, 'post-execute-error', { message: String(error?.message ?? error).slice(0, 200) })
+      }
+      const downstream = await next()
+      if (!extra) return downstream
+      // additionalContexts 是宿主认可的"给下一个请求附上下文"形态；不阻断、不改结果。
+      return { ...downstream, additionalContexts: [extra, ...(downstream.additionalContexts ?? [])] }
+    })
+  }
+
+  // ── 杠杆 ③：按 query 条件注入（易变状态进 context，绝不进常驻段）──────────────
+  if (cfg.contextHint && ctx.systemPrompt?.context) {
+    ctx.effect(() => ctx.systemPrompt.context({
+      name: 'codebase-memory:hint',
+      order: 130, // 宿主已占的槽位是 110/115/120（sandbox/approval/delegation）
+      text: (assembly) => {
+        try {
+          if (!state.ok) return '' // 链路没就绪就别推荐
+          const agent = assembly?.agent
+          const cwd = agent?.session?.header?.cwd
+          const key = sessionKey(agent)
+          if (!key || !cwd) return ''
+          const query = lastUserQuery(agent)
+          if (!query || !CODE_QUESTION.test(query)) return '' // 不像在查代码结构：不注入
+          const sess = sessionOf(state, key)
+          // 渲染是同步的，所以只能用**已缓存**的 project（同 cwd 解析过就有）。
+          const project = sess.project || state.projectsByCwd.get(cwd) || ''
+          const dirty = sess.dirty.size
+          const head = `codebase-memory: project=${project || '(未索引：先 code_index)'}, ${dirty ? `本会话改了 ${dirty} 个文件（坐标可能过期）` : '索引新鲜'}.`
+          const tail = project
+            ? '找定义/调用关系用 code_find / code_callers；字符串、日志、配置值仍用 grep。'
+            : '第一步：code_index。'
+          return noVars(`${head} ${tail}`)
+        } catch {
+          return ''
+        }
+      },
+    }), 'dsh-codebase-memory.context-hint')
+  }
 }
