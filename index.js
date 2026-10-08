@@ -39,7 +39,7 @@ const INDEX_MODES = ['full', 'moderate', 'fast', 'cross-repo-intelligence']
 const PROXY_TOOL = 'mcp__cbm__mcp'
 
 /** 触发层（docs/design-v2.md）的常量。跨平台：内置工具是裸名小写（官方 tool-fs-search README 与实装一致）。 */
-const ENFORCE_MODES = ['off', 'advise', 'deny-once', 'deny']
+const ENFORCE_MODES = ['off', 'deny-once', 'deny']
 /** 会写文件的内置工具（官方 tool-fs README：路径字段统一 snake_case `file_path`）。 */
 const WRITE_TOOLS = ['write', 'edit']
 const CODE_FILE = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|c|h|cc|cpp|hpp|cs|rb|php|swift|scala|vue|svelte|sql|sh|bash|ps1)$/i
@@ -66,7 +66,7 @@ export const Config = z.object({
   sessionRefresh: z.boolean().default(true),
   // ── 触发层（docs/design-v2.md 4.8）：每个杠杆独立开关，全部可回滚 ──────────
   wrapperTools: z.boolean().default(true),
-  enforce: z.string().default('advise'),
+  enforce: z.string().default('off'),
   interceptTools: z.string().default('grep,glob'),
   interceptBudgetMs: z.number().default(2500),
   contextHint: z.boolean().default(true),
@@ -119,9 +119,9 @@ function normalize(config = {}) {
   }
   // 触发层
   cfg.wrapperTools = boolOf(config.wrapperTools, true, cfg.notes, 'wrapperTools')
-  cfg.enforce = ENFORCE_MODES.includes(config.enforce) ? config.enforce : 'advise'
+  cfg.enforce = ENFORCE_MODES.includes(config.enforce) ? config.enforce : 'off'
   if (config.enforce !== undefined && !ENFORCE_MODES.includes(config.enforce)) {
-    cfg.notes.push(`enforce="${config.enforce}" 非法，已按 advise 处理（可选：${ENFORCE_MODES.join('|')}）`)
+    cfg.notes.push(`enforce="${config.enforce}" 非法，已按 off 处理（可选：${ENFORCE_MODES.join('|')}；advise 的事件注入已于 2026-10-08 撤回）`)
   }
   cfg.interceptTools = csv(config.interceptTools || 'grep,glob')
   cfg.interceptBudgetMs = positiveInt(config, 'interceptBudgetMs', 2500, cfg.notes)
@@ -567,8 +567,9 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
  *   - `tools/pre-execute` 是 waterfall：`(exec, next) => PreToolDecision`，只能
  *     allow/deny/cancel/ask，**放行时不能附带上下文**；deny 的 `reason` 会被原样
  *     物化成 `Error: <reason>` 给模型看，且 denied 调用仍会走 post-execute。
- *   - `tools/post-execute` 是 waterfall：`(exec, result, next) => PostToolDecision`，
- *     `additionalContexts` 是官方追加上下文的形态（挂到下一个请求）。
+ *   - `tools/post-execute` 是 waterfall：`(exec, result, next) => PostToolDecision`。
+ *     本插件只用它做写入记账（⑤），不回 `additionalContexts`——advise 事件注入
+ *     （④）已于 2026-10-08 验收撤回。
  *   - `ctx.tools.execute(input)` 是**公开方法**（宿主工具目录：presentAs/register/
  *     restrict/guard/get/schemas/executionMode/execute），所以封装工具直接复用
  *     keep-alive 的代理链路，不必 spawn CLI —— 实测 `cli` 单次 5.5–8.3s，而
@@ -634,7 +635,7 @@ const sessionKey = (agent) => agent?.session?.header?.id ?? agent?.session?.head
 function sessionOf(state, key) {
   let s = state.sessions.get(key)
   if (!s) {
-    s = { project: '', dirty: new Set(), blocked: new Set(), advised: new Set(), lastRefreshAt: 0 }
+    s = { project: '', dirty: new Set(), blocked: new Set(), lastRefreshAt: 0 }
     state.sessions.set(key, s)
   }
   return s
@@ -747,14 +748,6 @@ function renderInterceptHint(symbol, project, hits) {
   ].join('\n'), HINT_MAX_CODEPOINTS)
 }
 
-/** advise 的软提示（post-execute 追加上下文，不阻断）。 */
-function renderAdvise(symbol, project) {
-  return truncateCodepoints(
-    `dsh-codebase-memory：刚才那条 grep 的 pattern "${symbol}" 像找符号。字符串/日志/配置值用 grep 是对的，但找定义与调用关系时优先 code_find / code_callers（project=${project}），一次到位且带 qualified_name。`,
-    HINT_MAX_CODEPOINTS,
-  )
-}
-
 /** 像"查代码结构"的用户问题（杠杆 ③ 的触发词，中英各一批）。 */
 const CODE_QUESTION = /(谁调用|调用链|引用了|被谁用|定义在哪|在哪定义|哪些地方|哪几处|影响(范围|面|哪些|什么)|重命名|rename|call\s?graph|callers?|callees?|where is .{0,24}defined|what (calls|uses)|impact of)/i
 
@@ -807,22 +800,6 @@ const formatRows = (rows) => rows
   .map((r, i) => `${i + 1}. ${r.qn ?? r.qualified_name ?? '?'}  [${r.label ?? '?'}]  ${r.file ?? ''} ${r.lines ?? ''}`.trimEnd())
   .join('\n')
 
-/** 宿主 V4 要求插件写的消息带自有的 source.kind；这里显式声明生产者。 */
-const PLUGIN_MSG_SOURCE = { kind: 'plugin', plugin: 'dsh-codebase-memory' }
-
-/**
- * 手写消息而不是 import `createUserMessage`：不给插件加 boot 期硬依赖，
- * 形状与 dsh-llm 的实现一致（role / id / content / source）。
- */
-function pluginMessage(text, summary) {
-  return {
-    role: 'user',
-    id: randomUUID(),
-    content: [{ type: 'text', text }],
-    source: { ...PLUGIN_MSG_SOURCE, form: 'notice', summary: String(summary ?? '').slice(0, 120) },
-  }
-}
-
 /**
  * 封装工具的公共前提：会话工作区 → 链路就绪 → project 解析。
  * 与 code_index 同样的纪律：**前提不成立即 throw**，不静默降级成 grep。
@@ -867,14 +844,13 @@ function scheduleDirtyRefresh(ctx, cfg, state, sess, exec) {
 }
 
 /**
- * post-execute 的观察：① 写入类工具记进会话脏集合（不触发 refresh，纯记账）；
- * ② advise 模式下对"像找符号"的 grep 追加一条上下文（不阻断、不改结果）。
- * 返回要追加的消息，或 null。
+ * post-execute 的观察：写入类工具记进会话脏集合（不触发 refresh，纯记账）。
+ * advise 事件注入（原杠杆 ④）已于 2026-10-08 验收撤回：不返回任何消息。
  */
 function observeCall(ctx, cfg, state, exec, result) {
   const key = sessionKey(exec?.agent)
   const cwd = exec?.agent?.session?.header?.cwd
-  if (!key || !cwd) return null
+  if (!key || !cwd) return
   const sess = sessionOf(state, key)
   const name = String(exec?.name ?? '').toLowerCase()
   if (cfg.dirtyTracking && WRITE_TOOLS.includes(name) && !result?.isError) {
@@ -889,20 +865,6 @@ function observeCall(ctx, cfg, state, exec, result) {
       }
     }
   }
-  if (cfg.enforce !== 'advise' || !state.ok) return Promise.resolve(null)
-  if (!isGrepLike(name, cfg.interceptTools)) return Promise.resolve(null)
-  if (result?.isError) return Promise.resolve(null) // 失败/被拒的调用不再补提示
-  const q = classifyPattern(exec?.arguments?.pattern, exec?.arguments?.path)
-  if (q.kind !== 'symbol') return Promise.resolve(null)
-  if (sess.advised.has(q.symbol)) return Promise.resolve(null) // 每符号一次，不刷屏
-  // advise 要有具体内容，就得知道 project：会话没解析过就现查一次（实测 ~30ms，
-  // post-execute 不在关键路径上，多这一次换来"第一次 grep 就被提示"）。
-  return projectFor(ctx, exec, cfg, state, sess, cwd).then((project) => {
-    if (!project) return null
-    sess.advised.add(q.symbol)
-    telemetry(cfg, state, 'advise', { session: key, symbol: q.symbol })
-    return pluginMessage(renderAdvise(q.symbol, project), `cbm-advise ${q.symbol}`)
-  }).catch(() => null)
 }
 
 /**
@@ -1213,19 +1175,16 @@ export async function apply(ctx, config) {
     })
   }
 
-  // ── 杠杆 ④（advise 分支）+ ⑤（写后记账）：tools/post-execute ─────────────────
-  if ((cfg.enforce === 'advise' || cfg.dirtyTracking) && typeof ctx.on === 'function') {
+  // ── 杠杆 ⑤：写后记账（tools/post-execute）。只记账，绝不回 additionalContexts
+  // ——④ advise 事件注入已于 2026-10-08 验收撤回。───────────────────────────────
+  if (cfg.dirtyTracking && typeof ctx.on === 'function') {
     ctx.on('tools/post-execute', async (exec, result, next) => {
-      let extra = null
       try {
-        extra = await observeCall(ctx, cfg, state, exec, result)
+        observeCall(ctx, cfg, state, exec, result)
       } catch (error) {
         telemetry(cfg, state, 'post-execute-error', { message: String(error?.message ?? error).slice(0, 200) })
       }
-      const downstream = await next()
-      if (!extra) return downstream
-      // additionalContexts 是宿主认可的"给下一个请求附上下文"形态；不阻断、不改结果。
-      return { ...downstream, additionalContexts: [extra, ...(downstream.additionalContexts ?? [])] }
+      return next()
     })
   }
 

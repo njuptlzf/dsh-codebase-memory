@@ -2,7 +2,7 @@
 
 > 目标：让模型在"查代码"时优先走 codebase-memory-mcp（cbm）的代码图索引，而不是默认 Grep。
 > 依据：DSH 的插件与工具执行机制，以及 dsh-mneme 的多层触发做法。
-> 状态：已落地为 v0.3.0（杠杆 ①③⑤ + ② 的 advise 分支；② 的 deny-once/deny 已实现但默认不启用）。标注「待核实」的接口全部按本机安装宿主 0.1.5-rc.2 复核过，**与原方案的差异见 6.1**——落地以 6.1 为准。
+> 状态：已落地为 v0.3.0（杠杆 ①③⑤；② 的 deny-once/deny 已实现但默认不启用）。**2026-10-08 验收：`advise` 事件注入（② 的 advise 分支，即 ④ 软提示）整体撤回**——`tools/post-execute` 不再向会话追加任何上下文，`enforce` 的合法值与默认都去掉了 `advise`（配置里写了会回落 `off` 并提示）。下文凡描述 advise/软提示的段落均为历史设计记录，不代表当前行为。标注「待核实」的接口全部按本机安装宿主 0.1.5-rc.2 复核过，**与原方案的差异见 6.1**——落地以 6.1 为准。
 > 资料范围：dsh-codebase-memory 与 dsh-mneme 的 README、PR / Issue 讨论，公开的 DSH 介绍文章，以及本机 `profiles/node_modules/@deepseek-ai` 的实装（含 `dsh-tool-cordis` 的事件/服务目录与 `dsh-hooks-claude-code` 这个官方参考实现）。
 
 ---
@@ -407,7 +407,7 @@ API（已核实，官方源码 `packages/core/agent/src/runtime-types.ts` + `pac
 
 落地时才暴露的一条（方案没写、必须写回来）：**同一工作区的索引任务不能并发**。`code_index`、层 ⑤ 的后台补刷、引擎自带 watcher 都可能同时要跑 `index_repository`，引擎的处理是让其中一个**退出码 1 + `status:"aborted_previous_preserved"`**（hint 原文 "Retry; if it repeats, check the run log"），前一份索引保持可用。这就是 4.6"refresh 进行期间的查询，等待有限时间后放行"那一行的具体形态，只是等待对象不是查询而是索引任务本身。处置：① 插件内按 cwd 排队（在飞锁），② 被中止的一次自动重试一次并记遥测 `index-retry-contention`，③ `check-plugin.mjs` 臂 G9 在假 subprocess 层复刻这条中止。
 
-落地位次（对照 4.9）：① + ⑤ + ② 的 `advise` 分支 + ③ 已实现并纳入 `npm run check`（臂 G，整套 132/132）；② 的 `deny-once` / `deny` 已实现但**默认不启用**，等 telemetry 说话；④ 与架构摘要未做。
+落地位次（对照 4.9）：① + ⑤ + ③ 已实现并纳入 `npm run check`（臂 G）；② 的 `deny-once` / `deny` 已实现但**默认不启用**，等 telemetry 说话；④ 与架构摘要未做。**补记（2026-10-08）：曾以"② 的 advise 分支"落地的 post-execute 事件注入经用户验收撤回**（注入的上下文噪声大于价值）；`additionalContexts` 通道不再使用，臂 G7 改为断言"默认 `enforce=off`、符号类 grep 不追加任何上下文、写后记账仍在"。
 
 ---
 

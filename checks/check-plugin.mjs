@@ -16,7 +16,7 @@
  *   D 前提自证伪      cbm 找不到时必须 throw 并给出安装命令，不静默降级
  *   E lifecycle + 会话启动补偿刷新的闸门
  *   G 触发层（docs/design-v2.md 杠杆 ①②③⑤）：分类器正反例、封装工具、
- *     deny-once 只拦一次、前提不满足/超预算一律 fail-open、advise 追加上下文、
+ *     deny-once 只拦一次、前提不满足/超预算一律 fail-open、
  *     写后记账与坐标过期改放行、按 query 条件注入。走假代理工具，不依赖真引擎。
  */
 import { execFileSync, spawn } from 'node:child_process'
@@ -55,7 +55,7 @@ const record = (label, ok, detail = '') => {
 
 /**
  * 假代理工具：把 `mcp__cbm__mcp` 的形状照抄下来（content[0].text = cbm 的返回），
- * 但不起真引擎——这样封装工具 / 拦截 / advise 的**决策逻辑**可证伪，而不用等
+ * 但不起真引擎——这样封装工具 / 拦截 / 记账的**决策逻辑**可证伪，而不用等
  * 一次真索引。真实链路（延迟、json 形状、坐标过期行为）由 check-chain.mjs 量。
  * 每个响应都进 `calls`，断言"钩子里到底查没查 cbm"就不靠猜。
  */
@@ -476,22 +476,21 @@ async function verify(profile) {
   const staleFind = await f.tools.get('code_find').execute({ query: 'probeSymbol' }, { agent: agentF, signal: sig() })
   record('G code_find 按台账给出过期警告', staleFind?.status === 'stale' && /probe\.ts/.test(staleFind?.text ?? ''), JSON.stringify(staleFind).slice(0, 150))
 
-  // G7 advise：不阻断，只在 post-execute 追加一条上下文（每符号一次）。
+  // G7 撤回验证：④ advise 事件注入已于 2026-10-08 验收撤回。默认 enforce=off 不注册
+  // 拦截；post-execute 只剩写入记账——既不追加上下文，也仍要把坐标标脏。
   const vCalls = []
   const v = await mount({ telemetry: false }, makeStubProxy(vCalls, { project: `stub-${process.pid}-adv` }))
   await v.tools.get('code_setup').execute({}, withSignal(REPO))
-  record('G 默认 enforce=advise 时不注册 pre-execute 拦截', (v.events['tools/pre-execute'] ?? []).length === 0, `handlers=${(v.events['tools/pre-execute'] ?? []).length}`)
+  record('G 默认 enforce=off 时不注册 pre-execute 拦截', (v.events['tools/pre-execute'] ?? []).length === 0, `handlers=${(v.events['tools/pre-execute'] ?? []).length}`)
+  const vReport = await v.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('G 报表默认 enforce=off（advise 模式已撤回）', /触发层:.*enforce=off/.test(vReport), /触发层:.*$/m.exec(vReport)?.[0]?.slice(0, 130) ?? '(缺行)')
   const postV = (v.events['tools/post-execute'] ?? [])[0]
   const agentV = fakeAgent(`sess-${process.pid}-adv`, REPO)
-  const adv1 = await postV(grepExec(agentV, 'usageSection'), { content: [{ type: 'text', text: 'grep 结果' }], isError: false }, nextPost)
-  const adv2 = await postV(grepExec(agentV, 'usageSection'), { content: [{ type: 'text', text: 'grep 结果' }], isError: false }, nextPost)
-  const advLiteral = await postV(grepExec(agentV, 'TODO: fix later'), { content: [], isError: false }, nextPost)
-  const msg = adv1?.additionalContexts?.[0]
-  record('G advise 追加上下文而不是阻断', adv1?.kind === 'accept' && Array.isArray(adv1?.additionalContexts) && /code_find/.test(msg?.content?.[0]?.text ?? ''), JSON.stringify(adv1).slice(0, 160))
-  record('G advise 消息带自有 source.kind（宿主 V4 准入）', msg?.source?.kind === 'plugin' && msg?.source?.plugin === 'dsh-codebase-memory', JSON.stringify(msg?.source))
-  record('G advise 同一符号只提一次，字面量不提', !adv2?.additionalContexts?.length && !advLiteral?.additionalContexts?.length, `第二次=${JSON.stringify(adv2).slice(0, 80)}`)
-  const advDenied = await postV(grepExec(agentV, 'otherSymbol'), { content: [{ type: 'text', text: 'Error: 被拦下了' }], isError: true }, nextPost)
-  record('G 已被拒绝的调用不再追加 advise（不重复教育）', !advDenied?.additionalContexts?.length, JSON.stringify(advDenied).slice(0, 100))
+  const symGrep = await postV(grepExec(agentV, 'usageSection'), { content: [{ type: 'text', text: 'grep 结果' }], isError: false }, nextPost)
+  record('G 符号类 grep 不再追加任何上下文（注入机制已删除）', symGrep?.kind === 'accept' && !symGrep?.additionalContexts?.length, JSON.stringify(symGrep).slice(0, 80))
+  await postV({ name: 'edit', arguments: { file_path: join(REPO, 'index.js') }, agent: agentV, signal: sig() }, { content: [], isError: false }, nextPost)
+  const dirtyFind = await v.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: agentV, signal: sig() })
+  record('G 默认 off 下写后记账照常工作（台账仍会把坐标标脏）', dirtyFind?.status === 'stale' && /index\.js/.test(dirtyFind?.text ?? ''), JSON.stringify(dirtyFind?.status))
 
   // G8 杠杆 ③：按 query 条件注入；不像在查代码结构就一个字符都不占。
   const hint = (v.contexts ?? []).find((c) => c.name === 'codebase-memory:hint')
