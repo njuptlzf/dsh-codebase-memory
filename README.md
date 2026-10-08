@@ -149,7 +149,7 @@ Telling the model "use the index" is a soft constraint; these layers intervene i
 | ① wrapped verbs | `ctx.tools.register` | on | `code_find` / `code_callers` — schema cost measured: **1651 B ≈ 413 tokens per request**, against ~3200 tokens saved by the proxy |
 | ② intercept | `tools/pre-execute` | `advise` (no interception) | with `enforce: deny-once`/`deny`: a grep whose pattern looks like a **symbol** is denied **once per symbol per session**, and the deny `reason` already contains the `search_graph` hits, so the model gets an answer in the same round. It also **passes** whenever the graph has nothing for that symbol — intercepting a search the index cannot answer is just obstruction |
 | ④ soft hint | `tools/post-execute` → `additionalContexts` | on (that is `advise`) | appends one model-facing note to the next request; never blocks, never rewrites the result, once per symbol |
-| ⑤ dirty tracking | `tools/post-execute` + pre-query `check_index_coverage` | on | records `write`/`edit` paths per session (no per-file indexing), then verifies those exact paths before answering; when coordinates are stale it **lets grep through** and triggers a cooled background refresh instead of returning a neighbour's code |
+| ⑤ dirty tracking | `tools/post-execute` + per-session write ledger | on | records `write`/`edit` paths per session (no per-file indexing) and treats **a session that has written code as stale**: interception lets the grep through, `code_find`/`code_callers` mark their answer `stale` and name the paths, and a cooled background refresh is scheduled. The ledger is cleared **only when that refresh actually rebuilt the index** — a gated skip means nothing was rebuilt, so clearing would be a lie. Why the ledger instead of the engine's per-path verdict: measured on engine 0.11.0, immediately after a *full reindex* an **untouched** file still reports `freshness=metadata_changed` / `read_source_and_reindex`, identical to an edited one — it is a project-generation signal, not per-path staleness. Gating on it would disable interception permanently while scheduling a ~20 s reindex for every intercepted grep. `check_index_coverage` stays in the prompt as manual evidence, just not as a hook gate |
 | ③ conditional context | `systemPrompt.context` (order 130) | on | when the last user message looks like "who calls / where is X defined / rename / impact", inject one line: project + freshness + "use code_find". Nothing else is injected — the standing section stays constant |
 
 ①②⑤ go through the host's **live** proxy connection (measured 29–34 ms per query warm); they deliberately never spawn `codebase-memory-mcp cli`, which measures **5.5–8.3 s per call** on the same machine.
@@ -264,9 +264,9 @@ Add `config:` to the `codebase-memory` row in the composition:
 | `wrapperTools` | `true` | Layer ①: register `code_find` / `code_callers`. `false` leaves only the proxy tool |
 | `enforce` | `advise` | Layer ②/④: `off` / `advise` (post-execute note, never blocks) / `deny-once` (block a symbol-shaped grep **once per session per symbol**) / `deny` (block every time). Move `advise → deny-once` only when telemetry says the false-positive rate is acceptable |
 | `interceptTools` | `grep,glob` | Comma-separated built-in tool names to consider (bare lowercase names; `glob` patterns almost never classify as symbols) |
-| `interceptBudgetMs` | `2500` | Time budget for the in-hook `search_graph`/coverage queries. Measured warm cost is 29–34 ms, so this is head-room for a cold connection; **exceeding it lets the grep run** |
+| `interceptBudgetMs` | `2500` | Time budget for the in-hook cbm queries (`list_projects`, `search_graph`). Measured warm cost is 29–34 ms, so this is head-room for a cold connection; **exceeding it lets the grep run** |
 | `contextHint` | `true` | Layer ③: conditional one-line `systemPrompt.context`. Not delivered under minimal agent presets (they suppress the whole runtime-context snapshot) — ①②⑤ are not affected |
-| `dirtyTracking` | `true` | Layer ⑤: record `write`/`edit` paths per session and check them before answering |
+| `dirtyTracking` | `true` | Layer ⑤: record `write`/`edit` paths per session. **The ledger is the staleness signal** (see trigger layers, ⑤ — the engine's own per-path verdict is not one); only `code_index`, or a background refresh that really rebuilt the index, clears it |
 | `dirtyRefreshCooldownSec` | `120` | Cooldown for the background refresh that a stale check schedules (same gated `sessionRefresh` path, so several edits in one turn collapse into one refresh) |
 | `telemetry` | `true` | Append one JSON line per intercept / advise / dirty-record / refresh event to `$DSH_HOME/vendor/mcp-adapter/telemetry.log`, and show counters in `code_setup`. This is the only way to decide whether `deny-once` is safe |
 
@@ -289,7 +289,7 @@ Measured on the author's machine:
 
 ```
 PATCH OK
-126/126 arms passed (two profiles)   PLUGIN OK
+132/132 arms passed (two profiles)   PLUGIN OK
 CHAIN OK — 阶段3.5 代理链路延迟 ms: min=29 中位=33 max=34; check_index_coverage(单路径)=29
 arm A direct engine            : 17 tools, 17308 B ≈ 4327 tokens
 arm B proxied, cold cache      :  2 tools,  4278 B ≈ 1070 tokens  (4.0x)

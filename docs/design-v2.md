@@ -378,7 +378,7 @@ API（已核实，官方源码 `packages/core/agent/src/runtime-types.ts` + `pac
 | # | 待核实项 | 状态 | 为什么重要 | 建议核实方式 |
 |---|---|---|---|---|
 | 1 | 封装工具引入后的真实 token 增量 | **已测** | 决定 ① 的取舍 | `check-plugin.mjs` 臂 G 断言 schema 体积 ≤2200 字节；实测 `code_find` + `code_callers` = **1651 字节 ≈ 413 tokens/请求**（代理省下的 ~3200 tokens 的 13%） |
-| 2 | `check_index_coverage --paths` 的耗时、并发与按路径调用的行为 | **已测** | 杠杆 ⑤ 与拦截前提 3 的开销 | 经代理单路径实测 **29–90 ms**；返回体里 `paths` 列含 `status` 与 `freshness`，实测本会话改过的 `index.js` 报 `no_recorded_issue / metadata_changed` ⇒ 判定按"任何非 fresh 字样即 stale"保守处理 |
+| 2 | `check_index_coverage --paths` 的耗时、并发与按路径调用的行为 | **已测，结论是"不能当门"** | 杠杆 ⑤ 与拦截前提 3 的开销 | 经代理单路径 **29–90 ms**。但 `freshness` **不是逐路径判定**：把当前状态全量重索引之后，立刻查一个没改过的文件，仍返回 `status=no_recorded_issue / freshness=metadata_changed / action=read_source_and_reindex`，与改过的文件一模一样（引擎 0.11.0，本机）。它是"项目元数据代际变了"的全局信号 ⇒ 拿它当门 = 拦截永久失效 + 每条被拦的 grep 调度一次约 20s 重索引。落地改用本会话写入台账（见 6.1） |
 | 3 | 拦截时间预算的合理阈值与冷启动延迟 | **已测** | 决定 `interceptBudgetMs` 默认值 | **代理链路（keep-alive）热了 29–64 ms**；`codebase-memory-mcp cli` 单次 `search_graph` 实测 **5491 / 6526 / 8280 ms**。默认 `interceptBudgetMs=2500` 是给冷连接留余量，超时放行 |
 
 ---
@@ -397,8 +397,9 @@ API（已核实，官方源码 `packages/core/agent/src/runtime-types.ts` + `pac
 | 消息要带 `source.kind`（V4） | 宿主自家桥接包用的形状是 `{kind:'plugin', plugin:'<生产者名>', form:'notice', summary:'…'}` | advise 消息照这个形状手写，不 import `createUserMessage`（少一个 boot 期硬依赖） |
 | 4.5 的 pre-step 提醒（杠杆 ④） | 可用，但宿主已另有 `dsh-repeat-tool-reminder`（默认阈值 3/5/8，只看**参数完全相同的连续重复**） | **未实现**：advise 已覆盖"不阻断地给提示"，而重复循环由宿主那个包负责。两者按语义/按重复分工，不冲突 |
 | 4.3 需要在钩子里跑 search_graph | 可行，且必须走代理链路 | 已实现，且 reason 里嵌的就是命中行（按码点截断 900） |
+| 4.6 做法第 2–3 步「每次 cbm 查询前对脏路径调用 `check_index_coverage`，非 fresh 就补刷」 | 这个信号在引擎 0.11.0 上**不是逐路径判定**：把当前状态全量重索引之后，立刻查一个没改过的文件，仍返回 `metadata_changed` / `read_source_and_reindex`（第 6 节 #2） | 落地改成**只用本会话写入台账**判过期（`ledgerStale`）：写过代码 ⇒ 拦截放行、结果标 `stale` 并点名路径、调度带冷却的补刷；覆盖查询退出钩子，仍作为人工证据留在 prompt 动线。另外 `refreshSessionWorkspace` 改为返回 `refreshed / skipped:* / failed`，**只有 `refreshed` 才清台账**——被闸门挡下等于什么都没重建，清账就是宣称"改动已进索引" |
 
-另外两条实现期学到的规则，写进了分类器与测试表：
+另外三条实现期学到的规则，写进了分类器与测试表：
 
 - `dsh.profile.bundles` 这种**全小写点分链**是配置键形态 ⇒ 判 literal（放行）。限定名里至少要有一段带大写或带下划线，才认为是在找符号（`svc.doThing` ⇒ `doThing`）。
 - 被 deny 的调用**仍会走 post-execute**（宿主调度器的 `post-result` 分支），所以 advise 分支必须跳过 `result.isError`，否则拦截和软提示会一起打在模型身上。
@@ -406,7 +407,7 @@ API（已核实，官方源码 `packages/core/agent/src/runtime-types.ts` + `pac
 
 落地时才暴露的一条（方案没写、必须写回来）：**同一工作区的索引任务不能并发**。`code_index`、层 ⑤ 的后台补刷、引擎自带 watcher 都可能同时要跑 `index_repository`，引擎的处理是让其中一个**退出码 1 + `status:"aborted_previous_preserved"`**（hint 原文 "Retry; if it repeats, check the run log"），前一份索引保持可用。这就是 4.6"refresh 进行期间的查询，等待有限时间后放行"那一行的具体形态，只是等待对象不是查询而是索引任务本身。处置：① 插件内按 cwd 排队（在飞锁），② 被中止的一次自动重试一次并记遥测 `index-retry-contention`，③ `check-plugin.mjs` 臂 G9 在假 subprocess 层复刻这条中止。
 
-落地位次（对照 4.9）：① + ⑤ + ② 的 `advise` 分支 + ③ 已实现并纳入 `npm run check`（臂 G，整套 126/126）；② 的 `deny-once` / `deny` 已实现但**默认不启用**，等 telemetry 说话；④ 与架构摘要未做。
+落地位次（对照 4.9）：① + ⑤ + ② 的 `advise` 分支 + ③ 已实现并纳入 `npm run check`（臂 G，整套 132/132）；② 的 `deny-once` / `deny` 已实现但**默认不启用**，等 telemetry 说话；④ 与架构摘要未做。
 
 ---
 

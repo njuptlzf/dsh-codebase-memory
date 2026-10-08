@@ -445,26 +445,36 @@ async function verify(profile) {
   const noHitFind = await n.tools.get('code_find').execute({ query: 'ghostSymbol' }, { agent: fakeAgent(`sess-${process.pid}-nohit`, REPO), signal: sig() })
   record('G code_find 无命中时给明确 status 而不是假装有结果', noHitFind?.status === 'empty' && /没有匹配/.test(noHitFind?.text ?? ''), JSON.stringify(noHitFind).slice(0, 140))
 
-  // G6 杠杆 ⑤：写入记账 → 脏路径让拦截改走放行 + 后台补刷。
+  // G6 杠杆 ⑤：写后记账 = **只用本会话自己的写入台账**判坐标可信度。
+  // 为什么不用引擎的 check_index_coverage 当门：实测（引擎 0.11.0）全量重索引之后，
+  // 一个**没改过**的文件照样报 freshness=metadata_changed / action=read_source_and_reindex，
+  // 和改过的文件一模一样——那是项目级的代际信号，不是逐路径的过期信号。拿它当门的结果
+  // 是拦截永久失效 + 每条被拦的 grep 都调度一次 20s 重索引。所以这里反过来断言：
+  // 热路径上**不该出现**覆盖查询。
   const tRepo = join(tmpdir(), `cbm-check-dirty-${process.pid}`)
   rmSync(tRepo, { recursive: true, force: true })
   mkdirSync(tRepo, { recursive: true })
   const fCalls = []
-  const f = await mount({ enforce: 'deny-once', telemetry: false }, makeStubProxy(fCalls, { project: `stub-${process.pid}-f`, root: tRepo, freshness: 'stale' }))
+  const f = await mount({ enforce: 'deny', telemetry: false }, makeStubProxy(fCalls, { project: `stub-${process.pid}-f`, root: tRepo }))
   await f.tools.get('code_setup').execute({}, withSignal(REPO))
   const postF = (f.events['tools/post-execute'] ?? [])[0]
+  const preF = (f.events['tools/pre-execute'] ?? [])[0]
   const agentF = fakeAgent(`sess-${process.pid}-f`, tRepo)
+  const agentClean = fakeAgent(`sess-${process.pid}-clean`, tRepo)
   await postF({ name: 'edit', arguments: { file_path: join(tRepo, 'probe.ts') }, agent: agentF, signal: sig() }, { content: [], isError: false }, nextPost)
-  const dirtyRecorded = fCalls.length // 记账本身不查 cbm：这里应仍为 0 次
-  const beforeIntercept = fCalls.filter((c) => c.tool === 'cbm_check_index_coverage').length
-  const stalePass = await (f.events['tools/pre-execute'] ?? [])[0](grepExec(agentF, 'probeSymbol'), next)
-  const coverageArgs = fCalls.find((c) => c.tool === 'cbm_check_index_coverage')?.args
-  record('G 脏路径记账不触发即时索引（惰性）', dirtyRecorded === 0 && beforeIntercept === 0, `记账后 cbm 调用数=${dirtyRecorded}`)
-  record('G 坐标过期时拦截改为放行 + 按路径验鲜', stalePass?.kind === 'allow' && Array.isArray(coverageArgs?.paths) && coverageArgs.paths.includes('probe.ts'), JSON.stringify(coverageArgs))
-  await postF({ name: 'edit', arguments: { file_path: join(tmpdir(), `cbm-check-dirty-${process.pid}-outside`, 'outside.ts') }, agent: agentF, signal: sig() }, { content: [], isError: false }, nextPost)
-  await (f.events['tools/pre-execute'] ?? [])[0](grepExec(agentF, 'probeSymbol2'), next)
-  const lastCoverage = fCalls.filter((c) => c.tool === 'cbm_check_index_coverage').at(-1)?.args?.paths ?? []
-  record('G 工作区外的写入不进脏集合', lastCoverage.length === 1 && lastCoverage[0] === 'probe.ts', JSON.stringify(lastCoverage))
+  const callsAfterRecord = fCalls.length // 记账本身不查 cbm（惰性：等查询来了再说）
+  const dirtyPass = await preF(grepExec(agentF, 'probeSymbol'), next)
+  record('G 脏路径记账不触发任何即时 cbm 调用（惰性）', callsAfterRecord === 0, `记账后 cbm 调用数=${callsAfterRecord}`)
+  record('G 本会话写过代码 ⇒ 拦截改为放行', dirtyPass?.kind === 'allow', JSON.stringify(dirtyPass))
+  record('G 热路径上不再发覆盖查询（0.11.0 的信号是项目级的，不能当门）',
+    !fCalls.some((x) => x.tool === 'cbm_check_index_coverage'), fCalls.map((x) => x.tool).join(','))
+  const cleanDeny = await preF(grepExec(agentClean, 'probeSymbol'), next)
+  record('G 没写过的会话照常拦截（台账是按会话的，不互相拖累）', cleanDeny?.kind === 'deny', JSON.stringify(cleanDeny).slice(0, 90))
+  await postF({ name: 'edit', arguments: { file_path: join(tmpdir(), `cbm-check-dirty-${process.pid}-outside`, 'outside.ts') }, agent: agentClean, signal: sig() }, { content: [], isError: false }, nextPost)
+  const outsideDeny = await preF(grepExec(agentClean, 'anotherSymbol'), next)
+  record('G 工作区外的写入不进脏集合（不该把拦截关掉）', outsideDeny?.kind === 'deny', JSON.stringify(outsideDeny).slice(0, 90))
+  const staleFind = await f.tools.get('code_find').execute({ query: 'probeSymbol' }, { agent: agentF, signal: sig() })
+  record('G code_find 按台账给出过期警告', staleFind?.status === 'stale' && /probe\.ts/.test(staleFind?.text ?? ''), JSON.stringify(staleFind).slice(0, 150))
 
   // G7 advise：不阻断，只在 post-execute 追加一条上下文（每符号一次）。
   const vCalls = []

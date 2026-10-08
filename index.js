@@ -513,20 +513,24 @@ const readStamps = (path) => { try { return JSON.parse(readFileSync(path, 'utf8'
 /**
  * 会话启动补偿刷新：闸门 → 后台跑。全程不抛、不 await（调用方是同步监听器）。
  * 只有"git 状态变了 且 该项目已索引过"才会真的付出那次 ~15–30s 的后台开销。
+ *
+ * 返回值是给杠杆 ⑤ 用的：`'refreshed'` 才允许清脏集合，`'skipped:*'` 必须留着——
+ * 被闸门挡下意味着**什么都没重建**，这时清账等于宣称"改动已进索引"，那正是我们要
+ * 防的静默错位。
  */
 async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
   const cwd = agent?.session?.header?.cwd
-  if (!cwd) { refreshLog(cfg, 'skip (无会话 cwd)'); return }
-  if (state.cbm !== 'ready') { refreshLog(cfg, `skip ${cwd}: 引擎未就绪`); return }
+  if (!cwd) { refreshLog(cfg, 'skip (无会话 cwd)'); return 'skipped:no-cwd' }
+  if (state.cbm !== 'ready') { refreshLog(cfg, `skip ${cwd}: 引擎未就绪`); return 'skipped:engine' }
   const stampPath = join(cfg.adapterDir, 'refresh-stamps.json')
   const stamps = readStamps(stampPath)
   const last = stamps[cwd]
-  if (last && Date.now() - (last.at ?? 0) < REFRESH_MIN_INTERVAL_MS) { refreshLog(cfg, `skip ${cwd}: 冷却中`); return }
-  if (state.refreshing.has(cwd)) { refreshLog(cfg, `skip ${cwd}: 已有一次刷新在跑`); return }
+  if (last && Date.now() - (last.at ?? 0) < REFRESH_MIN_INTERVAL_MS) { refreshLog(cfg, `skip ${cwd}: 冷却中`); return 'skipped:cooldown' }
+  if (state.refreshing.has(cwd)) { refreshLog(cfg, `skip ${cwd}: 已有一次刷新在跑`); return 'skipped:in-flight' }
   const digest = await workspaceDigest(ctx, cwd, signal)
-  if (digest === null) { refreshLog(cfg, `skip ${cwd}: 非 git 工作区（与引擎 auto_watch 一致）`); return }
-  if (last && last.digest === digest) { refreshLog(cfg, `skip ${cwd}: git 状态未变`); return }
-  if (!(await alreadyIndexed(ctx, state, cwd, signal))) { refreshLog(cfg, `skip ${cwd}: 尚未索引过（不替用户制造索引）`); return }
+  if (digest === null) { refreshLog(cfg, `skip ${cwd}: 非 git 工作区（与引擎 auto_watch 一致）`); return 'skipped:not-git' }
+  if (last && last.digest === digest) { refreshLog(cfg, `skip ${cwd}: git 状态未变`); return 'skipped:unchanged' }
+  if (!(await alreadyIndexed(ctx, state, cwd, signal))) { refreshLog(cfg, `skip ${cwd}: 尚未索引过（不替用户制造索引）`); return 'skipped:not-indexed' }
   state.refreshing.add(cwd)
   refreshLog(cfg, `refresh ${cwd}（git 状态变了）`)
   try {
@@ -541,9 +545,12 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
     refreshLog(cfg, `done ${cwd} exit=${r.exitCode}`)
     if (r.exitCode === 0) {
       writeFileSync(stampPath, JSON.stringify({ ...stamps, [cwd]: { at: Date.now(), digest } }, null, 2), 'utf8')
+      return 'refreshed'
     }
+    return 'failed'
   } catch (error) {
     refreshLog(cfg, `fail ${cwd}: ${String(error?.message ?? error).slice(0, 160)}`)
+    return 'failed'
   } finally {
     state.refreshing.delete(cwd)
   }
@@ -700,17 +707,20 @@ async function projectFor(ctx, exec, cfg, state, session, cwd, budgetMs = cfg.in
 }
 
 /**
- * 写后失效检查（杠杆 ⑤）：只对本会话记账的脏路径问一次 `check_index_coverage`。
- * 返回 'fresh' / 'stale' / 'unknown'（unknown = 查询失败或超时；调用方一律 fail-open）。
+ * 本会话的坐标可信度：**只按自己的写入台账判**，不信 `check_index_coverage`。
+ *
+ * 为什么不信（引擎 0.11.0 实测，本机）：把当前状态全量重索引之后，立刻对一个
+ * **改动都没改过**的文件验鲜，返回的仍是
+ * `status=no_recorded_issue / freshness=metadata_changed / action=read_source_and_reindex`
+ * ——和改动过的文件一模一样。也就是说这个信号在 0.11.0 上是"项目元数据代际变了"
+ * 的全局判定，不是逐路径的过期判定。拿它当拦截前提的后果：拦截永久失效（每次都
+ * 判 stale 而放行），并且每条被拦的 grep 都会调度一次 18–30s 的后台重索引。
+ *
+ * 我们确实知道的只有：本会话用 write/edit 动过哪些文件（`sess.dirty`）。所以
+ * ① 拦截与封装工具的警告都按台账判；② 逐路径验鲜留给模型自己按 prompt 里的
+ * 动线手动调用（那是给人/给模型看的证据，不是钩子里的门）。
  */
-async function freshness(ctx, exec, cfg, state, session, budgetMs = cfg.interceptBudgetMs) {
-  if (!cfg.dirtyTracking || session.dirty.size === 0) return 'fresh'
-  const paths = [...session.dirty].slice(0, 20)
-  const r = await cbmCall(ctx, exec, 'check_index_coverage', { project: session.project, paths }, budgetMs)
-  if (!r.ok) return 'unknown'
-  // 引擎用 freshness/status 列表达"这条路径要重索"。任何非 fresh 字样都当 stale（保守）。
-  return /(metadata_changed|stale|missing|not_recorded|needs_reindex|generation_mismatch)/i.test(r.text) ? 'stale' : 'fresh'
-}
+const ledgerStale = (sess) => (sess.dirty.size > 0 ? 'stale' : 'fresh')
 
 /** 遥测：一行 JSON。写失败绝不影响会话（与 refreshLog 同一原则）。 */
 const TELEMETRY_MAX_BYTES = 512 * 1024
@@ -843,9 +853,15 @@ function scheduleDirtyRefresh(ctx, cfg, state, sess, exec) {
   const paths = [...sess.dirty]
   telemetry(cfg, state, 'dirty-refresh-scheduled', { paths: paths.length })
   void refreshSessionWorkspace(ctx, cfg, state, exec?.agent, state.abortSignal)
-    .then(() => {
-      sess.dirty.clear()
-      telemetry(cfg, state, 'dirty-refresh-done', { paths: paths.length })
+    .then((outcome) => {
+      // 只有**真的重建过**才清账：被闸门挡下（非 git / 冷却 / 未索引）等于什么都没做，
+      // 这时清脏集合就是宣称"改动已进索引"——正是要防的静默错位。
+      if (outcome === 'refreshed') {
+        sess.dirty.clear()
+        telemetry(cfg, state, 'dirty-refresh-done', { paths: paths.length })
+      } else {
+        telemetry(cfg, state, `dirty-refresh-${outcome || 'failed'}`, { paths: paths.length })
+      }
     })
     .catch((error) => telemetry(cfg, state, 'dirty-refresh-fail', { message: String(error?.message ?? error).slice(0, 200) }))
 }
@@ -1088,9 +1104,9 @@ export async function apply(ctx, config) {
               }
             }
           }
-          const fresh = await freshness(ctx, exec, cfg, state, sess, WRAPPER_BUDGET_MS)
+          const fresh = ledgerStale(sess)
           const warn = fresh === 'stale'
-            ? `\n⚠ 本会话改过 ${sess.dirty.size} 个文件，check_index_coverage 报坐标已变化：行号与片段可能落到邻居代码上。建议先 code_index（已在后台补刷）。`
+            ? `\n⚠ 本会话用 write/edit 改过 ${sess.dirty.size} 个文件（${[...sess.dirty].slice(0, 5).join(', ')}${sess.dirty.size > 5 ? ' …' : ''}），而这些改动还没进索引：上面的行号与片段可能落到邻居代码。建议先 code_index（已在后台补刷）。逐路径证据可自己跑 cbm_check_index_coverage。`
             : ''
           if (fresh === 'stale') scheduleDirtyRefresh(ctx, cfg, state, sess, exec)
           return { status: fresh === 'stale' ? 'stale' : 'ok', text: truncateCodepoints(lines.join('\n') + warn + staleNote, 6000), project }
@@ -1131,11 +1147,11 @@ export async function apply(ctx, config) {
             ...(Number.isInteger(args.limit) ? { limit: Math.min(Math.max(args.limit, 1), 100) } : {}),
           }, WRAPPER_BUDGET_MS)
           if (!trace.ok) throw new Error(`trace_path 调用失败：${(trace.text || '超时').slice(0, 300)}`)
-          const fresh = await freshness(ctx, exec, cfg, state, sess, WRAPPER_BUDGET_MS)
+          const fresh = ledgerStale(sess)
           if (fresh === 'stale') scheduleDirtyRefresh(ctx, cfg, state, sess, exec)
           return {
             status: fresh === 'stale' ? 'stale' : 'ok',
-            text: truncateCodepoints(trace.text + (fresh === 'stale' ? `\n⚠ 本会话改过 ${sess.dirty.size} 个文件，调用边可能滞后，必要时先 code_index。` : ''), 6000),
+            text: truncateCodepoints(trace.text + (fresh === 'stale' ? `\n⚠ 本会话用 write/edit 改过 ${sess.dirty.size} 个文件，这些改动还没进索引，调用边可能滞后；先 code_index 再采信。` : ''), 6000),
             project,
           }
         })
@@ -1164,10 +1180,10 @@ export async function apply(ctx, config) {
         }
         const project = await projectFor(ctx, exec, cfg, state, sess, cwd)
         if (!project) return next()
-        const fresh = await freshness(ctx, exec, cfg, state, sess)
+        const fresh = ledgerStale(sess)
         if (fresh !== 'fresh') {
-          // 索引不可信时拦截就是在骗人：放行 + 后台补刷。
-          telemetry(cfg, state, 'intercept-pass-unfresh', { session: key, symbol: q.symbol, fresh })
+          // 本会话写过代码 ⇒ 图里的坐标不可信，这时拦截就是在骗人：放行 + 后台补刷。
+          telemetry(cfg, state, 'intercept-pass-dirty', { session: key, symbol: q.symbol, dirty: sess.dirty.size })
           scheduleDirtyRefresh(ctx, cfg, state, sess, exec)
           return next()
         }

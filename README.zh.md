@@ -146,7 +146,7 @@ code_index（建索引 / 改完代码后刷新）
 | ① 封装工具 | `ctx.tools.register` | 开 | `code_find` / `code_callers`。schema 成本实测 **1651 字节 ≈ 每请求 413 tokens**，换来的是代理省下的 ~3200 tokens 不必被话术消耗 |
 | ② 拦截 | `tools/pre-execute` | `advise`（不拦） | `enforce: deny-once`/`deny` 时：pattern 像**符号**的 grep，**同会话同符号只拦一次**，且 deny 的 `reason` 里已经带上 `search_graph` 命中——模型这一轮就拿到答案。代码图对这个符号**无命中时直接放行**：拦一条索引本来就没答案的搜索纯粹是挡路 |
 | ④ 软提示 | `tools/post-execute` → `additionalContexts` | 开（就是 `advise`） | 给下一个请求附一条模型可见的提示；不阻断、不改结果、每符号一次 |
-| ⑤ 写后记账 | `tools/post-execute` + 查询前 `check_index_coverage` | 开 | 按会话记 `write`/`edit` 的路径（不逐文件建索引），回答前只验这些路径；坐标过期时**改为放行**并调度带冷却的后台补刷，而不是把邻居代码当定义交出去 |
+| ⑤ 写后记账 | `tools/post-execute` + 会话写入台账 | 开 | 按会话记 `write`/`edit` 的路径（不逐文件建索引），并把**写过代码的会话当作过期**：拦截改为放行，`code_find`/`code_callers` 把结果标成 `stale` 且点名路径，同时调度带冷却的后台补刷。台账**只在补刷真的重建了索引之后**才清空——被闸门挡下等于什么都没做，这时清账就是撒谎。为什么用台账而不是引擎的逐路径结论：引擎 0.11.0 实测，**全量重索引之后**立刻查一个没改过的文件，仍返回 `freshness=metadata_changed` / `read_source_and_reindex`，与改过的完全一样——那是项目代际信号，不是逐路径过期信号。拿它当门的结果是拦截永久失效，外加每条被拦的 grep 调度一次约 20s 重索引。`check_index_coverage` 仍留在 prompt 里当人工证据，只是不再当钩子的门 |
 | ③ 条件注入 | `systemPrompt.context`（order 130） | 开 | 只在上一条用户消息像"谁调用 / 定义在哪 / 重命名 / 影响范围"时注入一行：project + 新鲜度 + 用 code_find。其余轮次一个字符都不占 |
 
 ①②⑤ 走宿主**已连接**的代理链路（热了实测 29–64ms），刻意不 spawn `codebase-memory-mcp cli`——同一台机器上它单次 5.5–8.3s。
@@ -263,7 +263,7 @@ code_index（建索引 / 改完代码后刷新）
 | `interceptTools` | `grep,glob` | 逗号分隔的内置工具名（裸名小写；`glob` 的 pattern 基本不会被判成符号） |
 | `interceptBudgetMs` | `2500` | 钩子里 cbm 查询的时间预算。实测热链路 29–34ms，这个数是为冷连接留余量；**超预算就放行 grep** |
 | `contextHint` | `true` | 层 ③：按 query 条件注入一行 `systemPrompt.context`。极简 agent 预设会整块压制 runtime-context，那时它不送达（①②⑤ 不受影响） |
-| `dirtyTracking` | `true` | 层 ⑤：按会话记 `write`/`edit` 路径，回答前只验这些路径 |
+| `dirtyTracking` | `true` | 层 ⑤：按会话记 `write`/`edit` 路径。**台账本身就是过期信号**（见触发层 ⑤——引擎那个逐路径结论并不是，理由见下表 ⑤ 行）；只有 `code_index`，或**真的跑完的**后台补刷，才会清空它 |
 | `dirtyRefreshCooldownSec` | `120` | 脏路径触发的后台补刷冷却（复用 `sessionRefresh` 那条带闸门的链路，同回合多次写入自然并成一次） |
 | `telemetry` | `true` | 每次拦截 / 放行 / 提示 / 记账 / 补刷写一行 JSON 到 `$DSH_HOME/vendor/mcp-adapter/telemetry.log`，并在 `code_setup` 里给出计数。要不要升 `deny-once`，靠这个数据拍 |
 
@@ -286,7 +286,7 @@ npm run check   # = check:patch + check:plugin + check:chain + check:tokens
 
 ```
 PATCH OK
-126/126 臂通过（tauri + web 两个 profile）   PLUGIN OK
+132/132 臂通过（tauri + web 两个 profile）   PLUGIN OK
 CHAIN OK — 阶段3.5 代理链路延迟 ms: min=29 中位=33 max=34；check_index_coverage(单路径)=29
 臂A 直连 cbm            : 17 工具, 17308 B ≈ 4327 tokens
 臂B 代理·冷缓存         :  2 工具,  4278 B ≈ 1070 tokens  （省 4.0x）
