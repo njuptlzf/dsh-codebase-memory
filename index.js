@@ -651,7 +651,8 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
  * ── 触发层（docs/design-v2.md 杠杆 ①②③⑤）────────────────────────────────────
  *
  * 一句话：把"该用代码图"从**劝**变成**给结果**——高频动线包成原生工具（①）、
- * 符号类 grep 可拦截（②，deny 系）或直接替换成索引命中（replace，见下）、
+ * 符号类 grep 可拦截（②，deny 系）或直接把输出换成两层检索的命中（replace，
+ * 见下：结构层=代码图谱先答，语义层=zvec-grep 补位——两层是并存能力，不是二选一）、
  * 按 query 注入 1–2 行状态（③）、写后记账保证前两者的结果可信（⑤）。
  * 每一条都可关，且全部 fail-open：hook 里出错一律放行。
  *
@@ -876,7 +877,9 @@ function renderInterceptHint(symbol, project, hits) {
 }
 
 /**
- * replace 档（enforce=replace）的模型可见内容：原始 grep 输出整体换成索引命中。
+ * replace 档（enforce=replace）的模型可见内容：原始 grep 输出整体换成两层检索的
+ * 命中（结构层优先、语义层补位是**单次替换内**的取数顺序，不代表两层能力二选一——
+ * code_find 与 zvec_grep_search 作为常规工具始终并存可用，本档只改 grep 的可见输出）。
  * 走的是宿主 post-execute 的 accept+content 替换通道（契约：dsh-tools
  * index.d.ts PostToolDecision——"accept keeps the call successful (replacing
  * content when given)"；pre-execute 不能改写参数，参数在执行前已被 deepFreeze）。
@@ -885,7 +888,7 @@ function renderInterceptHint(symbol, project, hits) {
  */
 function renderReplacement(symbol, source, project, hits) {
   return truncateCodepoints([
-    `dsh-codebase-memory（enforce=replace）：grep "${symbol}" 的原始输出已替换为${source === 'graph' ? '代码图谱' : '语义检索（zvec-grep）'}命中。要看原始 grep 结果，把 enforce 改回 off。`,
+    `dsh-codebase-memory（enforce=replace）：grep "${symbol}" 的原始输出已替换为${source === 'graph' ? '结构层（代码图谱）' : '语义层（zvec-grep）'}命中。要看原始 grep 结果，把 enforce 改回 off。`,
     `${source === 'graph' ? `project=${project} 的 search_graph` : 'zvec_grep_search'} 命中：`,
     (hits || '(无命中)').trim(),
     source === 'graph' ? `下一步：code_find("${symbol}") 拿源码，或 code_callers("<qualified_name>") 拿调用者。` : '下一步：code_find / code_callers 走图谱，或继续 zg 检索。',
@@ -1393,7 +1396,7 @@ export async function apply(ctx, config) {
     })
   }
 
-  // ── 杠杆 ②b：replace 档——符号类 grep 的**输出**整体换成索引命中（enforce=replace）
+  // ── 杠杆 ②b：replace 档——符号类 grep 的**输出**整体换成两层检索命中（enforce=replace）
   // 通道是 post-execute 的 accept+content 替换（宿主契约见触发层总注）：grep 照常
   // 执行、照常成功，模型拿到的内容已是图谱命中——不再依赖模型"自觉"，也不给
   // isError 假错误。常驻注册：enforce 是 volatile 字段，热切换不能靠重启；非

@@ -155,7 +155,9 @@ ok(!!dictEntry, '注册了 locale 字典')
 ok(!!dictEntry && dictEntry.ns === panel?.locale, 'locale 字典的 NS 与 register({locale}) 一致', `${dictEntry?.ns} vs ${panel?.locale}`)
 for (const lang of ['zh', 'en']) ok(!!dictEntry?.dict?.[lang], `字典有 ${lang}`)
 const keys = Object.keys(dictEntry?.dict?.zh || {})
-for (const key of ['title', 'summary', 'loading', 'unavailable', 'enforce.label', 'telemetry.label', 'reset', 'saveFailed', 'foot']) {
+for (const key of ['title', 'summary', 'loading', 'unavailable', 'enforce.label', 'telemetry.label', 'reset', 'saveFailed', 'foot',
+  'stats.label', 'stats.empty', 'stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index', 'stats.updated',
+  'stats.r.graph', 'stats.r.zg']) {
   ok(keys.includes(key), `字典有 key ${key}`)
 }
 for (const mode of modes) {
@@ -214,6 +216,29 @@ tree = panel.component({ ...props })
 ok(flatten(tree).some((n) => typeof n.props?.children === 'string' && n.props.children === 'unavailable'), 'unavailable 态有说明文案（宿主没 serve 时不白屏）')
 
 ok(panel.component({ ...props, view: 'summary' }) === 'summary', 'summary 态返回一行文案（RowDetail 用）')
+
+/* ---- 6. 读数卡片（stats 只读，样式参考 dsh-mneme 状态页）---- */
+const statsJson = JSON.stringify({
+  at: 1791531188925,
+  replace: { hit: 8, graph: 6, zg: 2, passDirty: 2, passNoHit: 0, error: 0 },
+  deny: { blocked: 3, passDirty: 1, passNoHit: 2, passQueryFailed: 0, skipSeen: 4, error: 0 },
+  dirty: { record: 9, refreshScheduled: 5, refreshDone: 4, refreshFail: 1 },
+  lever: { wrapperCalls: 12, hintInjected: 3 },
+  index: { retryContention: 1, zgIndexFail: 0 },
+})
+storeSnapshot = { status: 'ready', value: { enforce: 'replace', telemetry: true, stats: statsJson }, base: {}, user: {}, writable: true, revision: 11 }
+tree = panel.component({ ...props })
+const texts = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
+console.log('\n[读数]')
+ok(texts.includes('80%'), '命中率大数字 = hit/(hit+让路+无命中+出错)', texts.find((t) => t.endsWith('%')))
+ok(texts.includes('8/10'), '被替换行 = hit/den', texts.filter((t) => /^\d+\/\d+$/.test(t)).join('|'))
+ok(['stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index'].every((k) => texts.includes(k)), '五张卡片都在')
+ok(texts.includes('stats.r.graph') && texts.includes('stats.r.zg'), '占比条题注区分结构层/语义层（两层并存，不是二选一）')
+ok(flatten(tree).filter((n) => n.type === primitives.SegmentedControl).length === 1
+  && flatten(tree).filter((n) => n.props && typeof n.props.onClick === 'function').length === 0, '读数块不新增交互件（卡片全只读）')
+storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, stats: '{坏' }, base: {}, user: {}, writable: true, revision: 12 }
+tree = panel.component({ ...props })
+ok(flatten(tree).some((n) => n.props?.children === 'stats.empty'), '坏 JSON ⇒ 显示占位不抛错')
 
 console.log(`\n${failed === 0 ? 'check:client 全过' : `${failed} 项失败`}`)
 process.exit(failed === 0 ? 0 : 1)

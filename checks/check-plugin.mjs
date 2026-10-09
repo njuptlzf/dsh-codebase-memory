@@ -623,6 +623,9 @@ async function verify(profile) {
   record('R 符号类 grep 的成功输出被换成图谱命中（原输出不再出现）',
     swapped?.kind === 'accept' && /stubSymbol/.test(swapped?.content?.[0]?.text ?? '') && !/原始 grep 输出/.test(swapped?.content?.[0]?.text ?? '') && !swapped?.additionalContexts?.length,
     JSON.stringify(swapped).slice(0, 160))
+  record('R 替换文案标明结构层（两层并存措辞纪律，不再说"索引命中"）',
+    /结构层/.test(swapped?.content?.[0]?.text ?? '') && !/索引命中/.test(swapped?.content?.[0]?.text ?? ''),
+    (swapped?.content?.[0]?.text ?? '').slice(0, 80))
   record('R 替换确实查的是图谱（search_graph 走代理，没 spawn CLI）',
     rCalls.some((x) => x.tool === 'cbm_search_graph' && x.args.query === 'usageSection'), rCalls.map((x) => x.tool).join(','))
   const rLiteral = await postR(grepExec(agentR, 'TODO: fix later'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
