@@ -1087,6 +1087,9 @@ export async function apply(ctx, config) {
     if (typeof statsTimer.unref === 'function') statsTimer.unref()
   }
   ctx.effect(() => () => { if (statsTimer) clearTimeout(statsTimer) }, 'dsh-codebase-memory.stats-push')
+  // 开机先推一帧全零快照（仅遥测开时）：mneme 式读数是"卡片常驻"，刚重启还没
+  // 事件的宿主打开设置页也该看到零值卡片，而不是"暂无读数"空态。
+  if (cfg.telemetry) state.pushStats()
 
   // 后台自举：绝不 await 成 boot 失败；失败只落在 state.lastError。
   const work = Promise.resolve()

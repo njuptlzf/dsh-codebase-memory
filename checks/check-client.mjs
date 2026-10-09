@@ -238,7 +238,17 @@ ok(flatten(tree).filter((n) => n.type === primitives.SegmentedControl).length ==
   && flatten(tree).filter((n) => n.props && typeof n.props.onClick === 'function').length === 0, '读数块不新增交互件（卡片全只读）')
 storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, stats: '{坏' }, base: {}, user: {}, writable: true, revision: 12 }
 tree = panel.component({ ...props })
-ok(flatten(tree).some((n) => n.props?.children === 'stats.empty'), '坏 JSON ⇒ 显示占位不抛错')
+const textsBad = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
+ok(textsBad.includes('stats.replaced') && textsBad.includes('—') && !textsBad.includes('stats.empty'),
+  '坏 JSON + 遥测开 ⇒ 零值卡片常驻（大数字破折号），不进空态')
+storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, stats: '' }, base: {}, user: {}, writable: true, revision: 13 }
+tree = panel.component({ ...props })
+const textsZero = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
+ok(['stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index'].every((k) => textsZero.includes(k))
+  && textsZero.includes('0/0'), '遥测开但 host 没推过数 ⇒ 五张零值卡（0/0），mneme 式常驻')
+storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: false, stats: '' }, base: {}, user: {}, writable: true, revision: 14 }
+tree = panel.component({ ...props })
+ok(flatten(tree).some((n) => n.props?.children === 'stats.empty'), '空态只属于"关了遥测"')
 
 console.log(`\n${failed === 0 ? 'check:client 全过' : `${failed} 项失败`}`)
 process.exit(failed === 0 ? 0 : 1)

@@ -667,6 +667,10 @@ async function verify(profile) {
   const sRef = mkVolRef('')
   const sCalls = []
   const s = await mount({ enforce: 'replace', dirtyTracking: false, stats: sRef }, makeStubProxy(sCalls, { project: `stub-${process.pid}-stats` }))
+  let spBoot = null
+  try { spBoot = JSON.parse(String(sRef.get())) } catch { /* 下一条断言报出来 */ }
+  record('S 开机遥测开 ⇒ 先推一帧零值快照（刚重启的设置页也是卡片常驻，不是空态）',
+    !!spBoot && typeof spBoot.at === 'number' && (spBoot.replace?.hit ?? -1) === 0, String(sRef.get()).slice(0, 60))
   await s.tools.get('code_setup').execute({}, withSignal(REPO))
   const agentS = fakeAgent(`sess-${process.pid}-stats`, REPO)
   await (s.events['tools/post-execute'] ?? [])[0](grepExec(agentS, 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
