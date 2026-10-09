@@ -433,6 +433,25 @@ API（已核实，官方源码 `packages/core/agent/src/runtime-types.ts` + `pac
 
 ---
 
+## 6.3 替换档（replace）的核实结果（v0.6.0，宿主 0.1.5 实装）
+
+6.2 留的那个"待核实宿主问题"，这次照本机安装的宿主 dist（`@deepseek-ai/dsh-tools` 的 `lib/types/index.d.ts` 与 `lib/index.js`）核死了，答案决定架构：
+
+| 核实的点（原文证据） | 结论与落地 |
+|---|---|
+| pre-execute 能否改写参数？`PreToolDecision = allow \| deny{reason,info?} \| cancel \| ask`（index.d.ts:445-459），且文档注释逐字写着 **"Input rewriting is excluded because arguments are already logged and presented"**；实参在进钩子前被 `deepFreeze`（lib/index.js:3163-3167） | **透明改写不可能**，原方案的"pre-execute 换参数"直接放弃。钩子里改 `exec.arguments` 只会 throw（frozen）或静默失效 |
+| post-execute 的 `accept` 语义：`PostToolDecision = accept{content? \| value?} \| block{feedback}`（index.d.ts:465-479），文档逐字 **"accept keeps the call successful (replacing content when given)"**，且 "Policy replacements remain authoritative"（L130-133） | **替换走 post-execute**：grep 照常执行、照常成功，监听器返回 `accept + content:[TextBlock]` 把模型可见输出整体换成图谱/语义命中。**不产生 isError**——这正是 advise 撤回后剩下的唯一"硬"通道：软提示是往旁边加话，替换是把答案本身放进它必须看的位置 |
+| 监听器 throw 会被外层 catch 成 **isError**（postExecute 文档 L828-839） | 替换监听器全函数 try/catch，任何异常 `next()` 原样放行——替换失败绝不能把成功的 grep 变成失败 |
+| 脏台账规则（6.1）在替换下更危险：拿可能过期的坐标**冒充**搜索结果 | **台账脏 ⇒ 不换**，只调度补刷（遥测 `replace-pass-dirty`）。和 deny 路径同一条正确性规则，但代价更高：替换是"说谎"，拦截只是"晚一步" |
+| 命中来源优先级 | 图谱 `search_graph`（29–64ms 热链）→ 无命中且 `state.zg==='ready'` 才试 `zg_zvec_grep_search`（钩子用会话 cwd **预填 root**——6.2 预告的卖点落地）→ 两边都没有就保留原输出（`replace-pass-no-hit`）。**没答案就不换**，与 deny 的"图里没这符号必须放行"同源 |
+| zg 冷守护进程 3.3s > `interceptBudgetMs`（2500ms） | 接受：预算内起不来就本轮放行、后台把守护进程焐热，下一符好。注释标注了这个取舍（ponytail），升级路径=加大 budget 或 zg 改 keep-alive |
+| 换掉的原输出要不要留一份？ | **刻意不留**：两者都给，模型照样顺着原始 grep 的习惯走——"还是软限制"的根源就在这。行首一行写明"原始输出已替换 + 想看回去改 enforce off"，反悔成本是一次热开关 |
+| 设置页能不能直接开？ | 能。`enforce` 本就是 volatile 三件套之一，`replace` 进 `ENFORCE_MODES` 后设置页分段控件自动多出「换成索引」，**改完即时生效不用重启**；臂 R 专门断言 volatile 热翻立即开合替换通道 |
+
+顺带修正 6.2 排期里的一处纸面计划：验收目标曾写"check:chain 15→17 工具断言"——链门本来就是计数无关的（`tools/list` ≥5 行 + 阶段 2b 真实检索），替换档不新增 MCP 工具、不碰工具数；真正新增的可证伪性是 check-plugin **臂 R** 的 9 条（含"查询走代理不 spawn CLI"与四条合法放行），总数 156→174。
+
+---
+
 ## 7. 参考链接
 
 **DSH**

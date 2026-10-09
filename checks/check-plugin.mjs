@@ -598,6 +598,58 @@ async function verify(profile) {
   const retried = await c.tools.get('code_index').execute({}, withSignal(REPO))
   record('G 索引第一次被并发中止时自动重试并成功', typeof retried?.project === 'string' && retried.project.length > 0, `project=${retried?.project} status=${retried?.status}`)
   record('G 重试被记进遥测（不静默自愈）', retryCount() > beforeRetries, `index-retry-contention ${beforeRetries} → ${retryCount()}`)
+
+  // ── 臂 R：enforce=replace —— 成功 grep 的**输出**换成图谱命中 ─────────────────
+  // 通道是 post-execute 的 accept+content（宿主契约 dsh-tools index.d.ts:465-479
+  // "accept keeps the call successful (replacing content when given)"；pre-execute
+  // 不能改写参数——"Input rewriting is excluded", index.d.ts:442-443，实参
+  // deepFreeze）。语义：grep 照常跑、照常成功；换的只是模型看到的内容。前提不满足
+  // /失败结果/图谱无命中 ⇒ 保留原输出，且全程不出 isError。dirtyTracking:false 的
+  // 挂载里 post-execute 只有 replace 监听一个，索引 0 就是它；记账开着时它在 1。
+  const rCalls = []
+  const r = await mount({ enforce: 'replace', dirtyTracking: false }, makeStubProxy(rCalls, { project: `stub-${process.pid}-rep` }))
+  await r.tools.get('code_setup').execute({}, withSignal(REPO))
+  const preR = (r.events['tools/pre-execute'] ?? [])[0]
+  const postR = (r.events['tools/post-execute'] ?? [])[0]
+  const agentR = fakeAgent(`sess-${process.pid}-rep`, REPO)
+  const rAllow = await preR(grepExec(agentR, 'usageSection'), next)
+  record('R replace 档不拦截：grep 照常执行（替换是后置的）', rAllow?.kind === 'allow', JSON.stringify(rAllow))
+  const swapped = await postR(grepExec(agentR, 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  record('R 符号类 grep 的成功输出被换成图谱命中（原输出不再出现）',
+    swapped?.kind === 'accept' && /stubSymbol/.test(swapped?.content?.[0]?.text ?? '') && !/原始 grep 输出/.test(swapped?.content?.[0]?.text ?? '') && !swapped?.additionalContexts?.length,
+    JSON.stringify(swapped).slice(0, 160))
+  record('R 替换确实查的是图谱（search_graph 走代理，没 spawn CLI）',
+    rCalls.some((x) => x.tool === 'cbm_search_graph' && x.args.query === 'usageSection'), rCalls.map((x) => x.tool).join(','))
+  const rLiteral = await postR(grepExec(agentR, 'TODO: fix later'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  record('R 字面量类 pattern 不替换', rLiteral?.kind === 'accept' && rLiteral?.content === undefined, JSON.stringify(rLiteral).slice(0, 90))
+  const rErr = await postR(grepExec(agentR, 'usageSection'), { content: [], isError: true, error: { message: 'boom' } }, nextPost)
+  record('R 失败结果不替换（被 deny 物化的错误不该再被改写）', rErr?.kind === 'accept' && rErr?.content === undefined, JSON.stringify(rErr).slice(0, 90))
+  const rnCalls = []
+  const rn = await mount({ enforce: 'replace', dirtyTracking: false, telemetry: false }, makeStubProxy(rnCalls, { project: `stub-${process.pid}-rnohit`, emptySearch: true }))
+  await rn.tools.get('code_setup').execute({}, withSignal(REPO))
+  const rNoHit = await (rn.events['tools/post-execute'] ?? [])[0](grepExec(fakeAgent(`sess-${process.pid}-rnohit`, REPO), 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  record('R 图谱无命中时保留原输出：没答案就不换，grep 才是对的工具', rNoHit?.kind === 'accept' && rNoHit?.content === undefined, JSON.stringify(rNoHit).slice(0, 90))
+  const rdCalls = []
+  const rd = await mount({ enforce: 'replace' }, makeStubProxy(rdCalls, { project: `stub-${process.pid}-rdirty` }))
+  await rd.tools.get('code_setup').execute({}, withSignal(REPO))
+  const rdBook = (rd.events['tools/post-execute'] ?? [])[0]
+  const rdRep = (rd.events['tools/post-execute'] ?? [])[1]
+  const agentRd = fakeAgent(`sess-${process.pid}-rdirty`, REPO)
+  await rdBook({ name: 'edit', arguments: { file_path: join(REPO, 'index.js') }, agent: agentRd, signal: sig() }, { content: [], isError: false }, nextPost)
+  const dirtySwap = await rdRep(grepExec(agentRd, 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  record('R 本会话写过代码 ⇒ 不换（台账脏=坐标可能过期，拿旧图替换就是骗人）',
+    dirtySwap?.kind === 'accept' && dirtySwap?.content === undefined, JSON.stringify(dirtySwap).slice(0, 90))
+  let flipRep = 'off'
+  const rf = await mount({ enforce: { get: () => flipRep }, dirtyTracking: false, telemetry: false }, makeStubProxy([], { project: `stub-${process.pid}-rflip` }))
+  await rf.tools.get('code_setup').execute({}, withSignal(REPO))
+  const postRf = (rf.events['tools/post-execute'] ?? [])[0]
+  const flipBefore = await postRf(grepExec(fakeAgent(`sess-${process.pid}-rflip`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
+  flipRep = 'replace'
+  const flipAfter = await postRf(grepExec(fakeAgent(`sess-${process.pid}-rflip`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
+  record('R 热翻 volatile enforce 立即作用于替换通道（不用重启）',
+    flipBefore?.content === undefined && /stubSymbol/.test(flipAfter?.content?.[0]?.text ?? ''), `off→${JSON.stringify(flipBefore).slice(0, 40)} replace→${JSON.stringify(flipAfter).slice(0, 60)}`)
+  const rReport = await r.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('R 遥测计数里能看到 intercept-replace', /intercept-replace=1/.test(rReport), /遥测计数:.*$/m.exec(rReport)?.[0]?.slice(0, 220) ?? '(缺行)')
   rmSync(tRepo, { recursive: true, force: true })
 
   // ── 臂 B：工作区绑定 ────────────────────────────────────────────────────────

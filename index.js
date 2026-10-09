@@ -39,7 +39,7 @@ const INDEX_MODES = ['full', 'moderate', 'fast', 'cross-repo-intelligence']
 const PROXY_TOOL = 'mcp__cbm__mcp'
 
 /** 触发层（docs/design-v2.md）的常量。跨平台：内置工具是裸名小写（官方 tool-fs-search README 与实装一致）。 */
-const ENFORCE_MODES = ['off', 'deny-once', 'deny']
+const ENFORCE_MODES = ['off', 'deny-once', 'deny', 'replace']
 /** 语义检索层（zvec-grep）的 MCP 工具集：agent 只暴露 zvec_grep_search；rg/index/status 走 CLI 与我们的后台补刷。 */
 const ZG_TOOLSETS = ['agent', 'full']
 /** 会写文件的内置工具（官方 tool-fs README：路径字段统一 snake_case `file_path`）。 */
@@ -634,16 +634,23 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
  * ── 触发层（docs/design-v2.md 杠杆 ①②③⑤）────────────────────────────────────
  *
  * 一句话：把"该用代码图"从**劝**变成**给结果**——高频动线包成原生工具（①）、
- * 符号类 grep 可拦截（②）、按 query 注入 1–2 行状态（③）、写后记账保证前两者
- * 的结果可信（⑤）。每一条都可关，且全部 fail-open：hook 里出错一律放行。
+ * 符号类 grep 可拦截（②，deny 系）或直接替换成索引命中（replace，见下）、
+ * 按 query 注入 1–2 行状态（③）、写后记账保证前两者的结果可信（⑤）。
+ * 每一条都可关，且全部 fail-open：hook 里出错一律放行。
  *
  * 三个经源码核实的宿主契约（宿主 0.1.5-rc.2 实装，见 docs/design-v2.md 4.3）：
  *   - `tools/pre-execute` 是 waterfall：`(exec, next) => PreToolDecision`，只能
  *     allow/deny/cancel/ask，**放行时不能附带上下文**；deny 的 `reason` 会被原样
  *     物化成 `Error: <reason>` 给模型看，且 denied 调用仍会走 post-execute。
+ *     注意：pre-execute **不能改写参数**（宿主契约原文 "Input rewriting is
+ *     excluded because arguments are already logged and presented"；实参在钩子
+ *     运行前已被 deepFreeze，index.d.ts:442-443 / index.js:3163-3167）。
  *   - `tools/post-execute` 是 waterfall：`(exec, result, next) => PostToolDecision`。
- *     本插件只用它做写入记账（⑤），不回 `additionalContexts`——advise 事件注入
- *     （④）已于 2026-10-08 验收撤回。
+ *     除写入记账（⑤）外，enforce=replace 时它还是**硬替换**通道：accept 分支带
+ *     `content` 即整体替换模型可见输出（index.d.ts:461-479 "accept keeps the
+ *     call successful (replacing content when given)"，L130-133 "Policy
+ *     replacements remain authoritative"）；advise 事件注入（④）已于 2026-10-08
+ *     验收撤回，不回 additionalContexts。
  *   - `ctx.tools.execute(input)` 是**公开方法**（宿主工具目录：presentAs/register/
  *     restrict/guard/get/schemas/executionMode/execute），所以封装工具直接复用
  *     keep-alive 的代理链路，不必 spawn CLI —— 实测 `cli` 单次 5.5–8.3s，而
@@ -744,13 +751,13 @@ function resultText(res) {
  * 经宿主工具管线调一次 cbm（`mcp__cbm__mcp` 是 keep-alive 的那条长连接）。
  * 返回 `{ ok, text }`；链路不健康 / 被隐藏 / 超时都 `ok:false`，由调用方决定放行。
  */
-async function cbmCall(ctx, exec, tool, args, budgetMs) {
+async function cbmCall(ctx, exec, tool, args, budgetMs, namePrefix = 'cbm') {
   if (typeof ctx?.tools?.execute !== 'function') return { ok: false, text: '' }
   const signal = exec?.signal ?? new AbortController().signal
   const input = {
     callId: randomUUID(),
     name: PROXY_TOOL,
-    arguments: { tool: `cbm_${tool}`, args },
+    arguments: { tool: `${namePrefix}_${tool}`, args },
     signal,
     ...(exec?.agent ? { agent: exec.agent } : {}),
   }
@@ -819,6 +826,23 @@ function renderInterceptHint(symbol, project, hits) {
     `project=${project} 的 search_graph 命中：`,
     (hits || '(无命中)').trim(),
     `下一步：code_find("${symbol}") 拿源码，或 code_callers("<qualified_name>") 拿调用者。`,
+  ].join('\n'), HINT_MAX_CODEPOINTS)
+}
+
+/**
+ * replace 档（enforce=replace）的模型可见内容：原始 grep 输出整体换成索引命中。
+ * 走的是宿主 post-execute 的 accept+content 替换通道（契约：dsh-tools
+ * index.d.ts PostToolDecision——"accept keeps the call successful (replacing
+ * content when given)"；pre-execute 不能改写参数，参数在执行前已被 deepFreeze）。
+ * 不留原输出是刻意的：两者都给，模型（和人）的习惯会赢回 grep——用户验收结论
+ * （m00773"还是软限制"）要的是换了就真换了。
+ */
+function renderReplacement(symbol, source, project, hits) {
+  return truncateCodepoints([
+    `dsh-codebase-memory（enforce=replace）：grep "${symbol}" 的原始输出已替换为${source === 'graph' ? '代码图谱' : '语义检索（zvec-grep）'}命中。要看原始 grep 结果，把 enforce 改回 off。`,
+    `${source === 'graph' ? `project=${project} 的 search_graph` : 'zvec_grep_search'} 命中：`,
+    (hits || '(无命中)').trim(),
+    source === 'graph' ? `下一步：code_find("${symbol}") 拿源码，或 code_callers("<qualified_name>") 拿调用者。` : '下一步：code_find / code_callers 走图谱，或继续 zg 检索。',
   ].join('\n'), HINT_MAX_CODEPOINTS)
 }
 
@@ -938,8 +962,24 @@ function scheduleDirtyRefresh(ctx, cfg, state, sess, exec) {
 }
 
 /**
+ * 会话前提检查（replace 档后置监听用；deny 档因夹带 deny-once 的已拦集合，
+ * 保留内联判序）：工具在拦截名单里、pattern 判为符号、拿得到会话 key 与 cwd、
+ * 引擎就绪。返回 null = 前提不满足（调用方一律放行 / 不替换）。
+ */
+function interceptPremises(exec, cfg, state) {
+  if (!isGrepLike(exec?.name, cfg.interceptTools)) return null
+  const q = classifyPattern(exec?.arguments?.pattern, exec?.arguments?.path)
+  if (q.kind !== 'symbol') return null
+  const key = sessionKey(exec?.agent)
+  const cwd = exec?.agent?.session?.header?.cwd
+  if (!key || !cwd || !state.ok) return null
+  return { q, key, cwd, sess: sessionOf(state, key) }
+}
+
+/**
  * post-execute 的观察：写入类工具记进会话脏集合（不触发 refresh，纯记账）。
- * advise 事件注入（原杠杆 ④）已于 2026-10-08 验收撤回：不返回任何消息。
+ * advise 事件注入（原杠杆 ④）已于 2026-10-08 验收撤回：不返回任何消息；
+ * replace 档的内容替换走独立注册的后置监听（enforce=replace），不在这里。
  */
 function observeCall(ctx, cfg, state, exec, result) {
   const key = sessionKey(exec?.agent)
@@ -1226,7 +1266,7 @@ export async function apply(ctx, config) {
   if (typeof ctx.on === 'function') {
     ctx.on('tools/pre-execute', async (exec, next) => {
       try {
-        if (cfg.enforce === 'off' || !isGrepLike(exec.name, cfg.interceptTools)) return next()
+        if (cfg.enforce === 'off' || cfg.enforce === 'replace' || !isGrepLike(exec.name, cfg.interceptTools)) return next()
         const q = classifyPattern(exec.arguments?.pattern, exec.arguments?.path)
         if (q.kind !== 'symbol') return next()
         const key = sessionKey(exec.agent)
@@ -1282,6 +1322,54 @@ export async function apply(ctx, config) {
         telemetry(cfg, state, 'post-execute-error', { message: String(error?.message ?? error).slice(0, 200) })
       }
       return next()
+    })
+  }
+
+  // ── 杠杆 ②b：replace 档——符号类 grep 的**输出**整体换成索引命中（enforce=replace）
+  // 通道是 post-execute 的 accept+content 替换（宿主契约见触发层总注）：grep 照常
+  // 执行、照常成功，模型拿到的内容已是图谱命中——不再依赖模型"自觉"，也不给
+  // isError 假错误。常驻注册：enforce 是 volatile 字段，热切换不能靠重启；非
+  // replace 时第一行就 next()，代价一次属性读。注册在记账之后：waterfall 按注册序
+  // 执行，记账永远先看原始 exec，替换只决定模型看到什么。
+  if (typeof ctx.on === 'function') {
+    ctx.on('tools/post-execute', async (exec, result, next) => {
+      if (cfg.enforce !== 'replace') return next()
+      try {
+        if (result?.isError) return next() // 失败结果（含被 deny 物化的）不换：替换只针对成功输出
+        const prem = interceptPremises(exec, cfg, state)
+        if (!prem) return next()
+        const { q, key, cwd, sess } = prem
+        if (ledgerStale(sess) !== 'fresh') {
+          // 台账脏 ⇒ 图里的坐标不可信，替换就是骗人：保留原 grep 输出 + 后台补刷。
+          telemetry(cfg, state, 'replace-pass-dirty', { session: key, symbol: q.symbol, dirty: sess.dirty.size })
+          scheduleDirtyRefresh(ctx, cfg, state, sess, exec)
+          return next()
+        }
+        const project = await projectFor(ctx, exec, cfg, state, sess, cwd)
+        let source = ''
+        let text = ''
+        if (project) {
+          const hits = await cbmCall(ctx, exec, 'search_graph', { project, query: q.symbol, limit: 5 }, cfg.interceptBudgetMs)
+          if (hits.ok && !noHits(hits.text)) { source = 'graph'; text = hits.text }
+        }
+        // 图谱没答案才轮到 zg 语义层；root 由钩子补上——模型忘填必填参数的坑就此消掉。
+        // ponytail: zg 冷启动实测 3.3s，超过默认 2500ms 预算 ⇒ 会话里第一条被换的
+        // 符号搜索会超时退回原输出，之后热（1.4s）能换。宁缺勿塞，升级路径是常驻
+        // daemon 或独立 zgReplaceBudgetMs 配置。
+        if (!text && state.zg === 'ready') {
+          const z = await cbmCall(ctx, exec, 'zvec_grep_search', { query: q.symbol, root: cwd, limit: 5 }, cfg.interceptBudgetMs, 'zg')
+          if (z.ok && !noHits(z.text)) { source = 'zg'; text = z.text }
+        }
+        if (!text) {
+          telemetry(cfg, state, 'replace-pass-no-hit', { session: key, symbol: q.symbol })
+          return next() // 索引本来没答案 ⇒ grep 才是对的工具
+        }
+        telemetry(cfg, state, 'intercept-replace', { session: key, symbol: q.symbol, source })
+        return { kind: 'accept', content: [{ type: 'text', text: renderReplacement(q.symbol, source, project, text) }] }
+      } catch (error) {
+        telemetry(cfg, state, 'replace-error', { message: String(error?.message ?? error).slice(0, 200) })
+      }
+      return next() // fail-open：拿不准就保留原始 grep 输出
     })
   }
 
