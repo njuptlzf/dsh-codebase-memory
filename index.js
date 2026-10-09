@@ -66,11 +66,14 @@ export const Config = z.object({
   sessionRefresh: z.boolean().default(true),
   // ── 触发层（docs/design-v2.md 4.8）：每个杠杆独立开关，全部可回滚 ──────────
   wrapperTools: z.boolean().default(true),
-  enforce: z.string().default('off'),
+  // enforce / interceptBudgetMs / telemetry 标了 volatile：宿主的设置表单只暴露
+  // volatile 字段（dsh-settings 写非 volatile 字段直接 throw），并且改动由 loader
+  // 推进同一个引用、**不用重启**就生效。其余字段仍是 apply 时的快照，改了要重启。
+  enforce: z.string().default('off').volatile(),
   interceptTools: z.string().default('grep,glob'),
-  interceptBudgetMs: z.number().default(2500),
+  interceptBudgetMs: z.number().default(2500).volatile(),
   contextHint: z.boolean().default(true),
-  telemetry: z.boolean().default(true),
+  telemetry: z.boolean().default(true).volatile(),
   dirtyTracking: z.boolean().default(true),
   dirtyRefreshCooldownSec: z.number().default(120),
 })
@@ -80,9 +83,18 @@ const dshHome = () => process.env.DSH_HOME || join(homedir(), '.dsh')
 /** 逗号分隔的名单（配置写字符串最省事，也避免 profile YAML 里数组的解析歧义）。 */
 const csv = (s) => String(s ?? '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean)
 
+/**
+ * volatile 字段在运行时是宿主持有的**稳定引用**（loader 热更新时把新值推进同一个
+ * 引用，见 cordis-plugin-loader 的 `_commitVolatile`），所以读它必须每次 `.get()`；
+ * 普通字段（以及验收里直接传的裸值）原样返回。
+ */
+const live = (value) => (value && typeof value.get === 'function' ? value.get() : value)
+
+/** 把 volatile 字段挂成 getter：读点永远拿到当前值，而不是 apply 时的快照。 */
+const defineLive = (cfg, key, read) => Object.defineProperty(cfg, key, { get: read, enumerable: true, configurable: true })
+
 /** 正整数配置（含 0 = 关闭）；非法值降级为默认并记 note，绝不 throw。 */
-function positiveInt(config, key, fallback, notes) {
-  const raw = config[key]
+function positiveInt(key, raw, fallback, notes) {
   const n = typeof raw === 'number' ? Math.floor(raw) : Number.parseInt(String(raw ?? ''), 10)
   if (!Number.isFinite(n) || n < 0) {
     notes.push(`${key}="${raw}" 非法，已按 ${fallback} 处理`)
@@ -119,16 +131,22 @@ function normalize(config = {}) {
   }
   // 触发层
   cfg.wrapperTools = boolOf(config.wrapperTools, true, cfg.notes, 'wrapperTools')
-  cfg.enforce = ENFORCE_MODES.includes(config.enforce) ? config.enforce : 'off'
-  if (config.enforce !== undefined && !ENFORCE_MODES.includes(config.enforce)) {
-    cfg.notes.push(`enforce="${config.enforce}" 非法，已按 off 处理（可选：${ENFORCE_MODES.join('|')}；advise 的事件注入已于 2026-10-08 撤回）`)
-  }
   cfg.interceptTools = csv(config.interceptTools || 'grep,glob')
-  cfg.interceptBudgetMs = positiveInt(config, 'interceptBudgetMs', 2500, cfg.notes)
   cfg.contextHint = boolOf(config.contextHint, true, cfg.notes, 'contextHint')
-  cfg.telemetry = boolOf(config.telemetry, true, cfg.notes, 'telemetry')
   cfg.dirtyTracking = boolOf(config.dirtyTracking, true, cfg.notes, 'dirtyTracking')
-  cfg.dirtyRefreshCooldownSec = positiveInt(config, 'dirtyRefreshCooldownSec', 120, cfg.notes)
+  cfg.dirtyRefreshCooldownSec = positiveInt('dirtyRefreshCooldownSec', config.dirtyRefreshCooldownSec, 120, cfg.notes)
+  // enforce / interceptBudgetMs / telemetry 是 volatile 字段（设置页只写这三项），
+  // 留成 getter 而不是快照：快照一次就等于"UI 里改了、钩子还在用旧值"。
+  // 非法值只在归一化这一次记进 notes——getter 会被反复读，往里 push 会把 notes 灌满。
+  const enforceRaw = live(config.enforce)
+  if (enforceRaw !== undefined && !ENFORCE_MODES.includes(enforceRaw)) {
+    cfg.notes.push(`enforce="${enforceRaw}" 非法，已按 off 处理（可选：${ENFORCE_MODES.join('|')}；advise 的事件注入已于 2026-10-08 撤回）`)
+  }
+  positiveInt('interceptBudgetMs', live(config.interceptBudgetMs), 2500, cfg.notes)
+  boolOf(live(config.telemetry), true, cfg.notes, 'telemetry')
+  defineLive(cfg, 'enforce', () => (ENFORCE_MODES.includes(live(config.enforce)) ? live(config.enforce) : 'off'))
+  defineLive(cfg, 'interceptBudgetMs', () => positiveInt('interceptBudgetMs', live(config.interceptBudgetMs), 2500, []))
+  defineLive(cfg, 'telemetry', () => boolOf(live(config.telemetry), true, [], 'telemetry'))
   cfg.adapterMjs = join(cfg.adapterDir, 'node_modules', '@njuptlzf', 'mcp-adapter', 'mcp-server.mjs')
   cfg.adapterConfig = join(cfg.adapterDir, 'cbm.json')
   return cfg
@@ -371,7 +389,7 @@ export function engineVerdict(version, tested = testedEngine()) {
  * 注意它的能力边界：能测「仓库 ≠ 拷贝」（该 sync），**测不出**「sync 了但 host 没重启」
  * （运行中的代码没有对自己加载字节的哈希）。
  */
-const RUNTIME_FILES = ['index.js', 'cordis.patch.yml', 'package.json']
+const RUNTIME_FILES = ['index.js', 'cordis.patch.yml', 'package.json', 'lib/client.js']
 
 /** 本模块被加载的位置（= profile 里的那份拷贝）所在的包目录。 */
 const loadedPackageDir = () => dirname(fileURLToPath(import.meta.url))
@@ -425,6 +443,8 @@ function report(cfg, state) {
     `清单: ${state.configPath ?? '(未写)'}  exclude=${JSON.stringify(EXCLUDE_TOOLS)}`,
     `代理工具: ${PROXY_TOOL}  bootstrap=${cfg.bootstrap}  adapterVersion=${cfg.adapterVersion}`,
     `触发层: wrapper=${cfg.wrapperTools ? 'on' : 'off'}  enforce=${cfg.enforce}  intercept=${cfg.interceptTools.join('+') || '(无)'}  budget=${cfg.interceptBudgetMs}ms  dirty=${cfg.dirtyTracking ? 'on' : 'off'}(冷却 ${cfg.dirtyRefreshCooldownSec}s)  context=${cfg.contextHint ? 'on' : 'off'}`,
+    // 只说 UI 真的能改的东西：volatile 是必要条件，页面只画了 enforce / telemetry。
+    '热改: enforce / telemetry → 设置 → 插件 → dsh-codebase-memory → codebase-memory 行「配置」（不用重启）；interceptBudgetMs 也是 volatile，但只能改配置文件',
     `遥测计数: ${Object.entries(state.counts).map(([k, v]) => `${k}=${v}`).join(' ') || '(无事件)'}`,
     `auto_index: ${state.autoIndex || '(未设置)'}（期望 ${cfg.autoIndex ? 'true' : 'false'}；机器级共享配置，只补"无索引的新项目"，不刷新陈旧坐标）`,
     syncStatusLine(),
@@ -1125,11 +1145,13 @@ export async function apply(ctx, config) {
   // 关键路径上的同步钩子：只做纯本地判断，必要才查（实测代理查询 ~30–60ms，
   // 而 cbm CLI 冷启动实测 5.5–8.3s —— 绝不能在钩子里 spawn CLI）。任何不满足
   // 前提 / 超时 / 出错的情形一律放行。
-  const denyActive = cfg.enforce === 'deny-once' || cfg.enforce === 'deny'
-  if (denyActive && typeof ctx.on === 'function') {
+  // 常驻注册：enforce 是 volatile 字段，设置页改完当场生效——钩子按启动时的值条件
+  // 注册的话，"打开拦截"就得重启，那正是这次要消掉的东西。off 时第一行就放行，
+  // 代价只有一次属性读。
+  if (typeof ctx.on === 'function') {
     ctx.on('tools/pre-execute', async (exec, next) => {
       try {
-        if (!isGrepLike(exec.name, cfg.interceptTools)) return next()
+        if (cfg.enforce === 'off' || !isGrepLike(exec.name, cfg.interceptTools)) return next()
         const q = classifyPattern(exec.arguments?.pattern, exec.arguments?.path)
         if (q.kind !== 'symbol') return next()
         const key = sessionKey(exec.agent)

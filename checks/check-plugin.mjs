@@ -191,7 +191,7 @@ async function verify(profile) {
   console.log(`\n[${profile}] ${installed}`)
 
   const mod = await import(pathToFileURL(installed).href)
-  const { apply, name, inject, engineVerdict, fileDrift, classifyPattern, truncateCodepoints, isGrepLike, normPath, projectFromListing } = mod
+  const { apply, name, inject, engineVerdict, fileDrift, classifyPattern, truncateCodepoints, isGrepLike, normPath, projectFromListing, Config } = mod
   if (name !== 'dsh-codebase-memory') throw new Error(`unexpected plugin name: ${name}`)
   record('装载', true, `name=${name}  inject=${inject.join(',')}`)
 
@@ -221,20 +221,27 @@ async function verify(profile) {
 
   record('A code_setup 报出「同步状态」', /^同步状态: /m.test(setup), /^同步状态:.*$/m.exec(setup)?.[0]?.slice(0, 170) ?? '(没有 同步状态 行)')
   // 漂移判定对两个临时目录证伪：一致→[]；改一个文件→只命中它；读不到→null（不许误报成"不一致"）
+  // 清单含嵌套的 lib/client.js——客户端半部漏同步的话设置页会整块消失，必须能被比出来。
   const driftA = join(tmpdir(), `cbm-drift-a-${process.pid}`)
   const driftB = join(tmpdir(), `cbm-drift-b-${process.pid}`)
   mkdirSync(driftA, { recursive: true }); mkdirSync(driftB, { recursive: true })
-  for (const f of ['index.js', 'cordis.patch.yml', 'package.json']) {
+  mkdirSync(join(driftA, 'lib'), { recursive: true }); mkdirSync(join(driftB, 'lib'), { recursive: true })
+  for (const f of ['index.js', 'cordis.patch.yml', 'package.json', 'lib/client.js']) {
     writeFileSync(join(driftA, f), 'same', 'utf8'); writeFileSync(join(driftB, f), 'same', 'utf8')
   }
   const cleanDrift = typeof fileDrift === 'function' ? fileDrift(driftA, driftB) : undefined
   writeFileSync(join(driftB, 'index.js'), 'changed', 'utf8')
   const oneDrift = typeof fileDrift === 'function' ? fileDrift(driftA, driftB) : undefined
+  writeFileSync(join(driftB, 'lib/client.js'), 'changed', 'utf8')
+  const nestedDrift = typeof fileDrift === 'function' ? fileDrift(driftA, driftB) : undefined
   const missingDrift = typeof fileDrift === 'function' ? fileDrift(driftA, join(driftB, 'nope')) : undefined
   record('A 漂移判定可证伪（一致→[]；改一个→只命中它；读不到→null）',
     typeof fileDrift === 'function' && Array.isArray(cleanDrift) && cleanDrift.length === 0
       && Array.isArray(oneDrift) && oneDrift.length === 1 && oneDrift[0] === 'index.js' && missingDrift === null,
     typeof fileDrift !== 'function' ? '插件未导出 fileDrift' : `一致→${JSON.stringify(cleanDrift)} 改index.js→${JSON.stringify(oneDrift)} 读不到→${missingDrift}`)
+  record('A 嵌套的 lib/client.js 也参与比对（漏同步要能报出来）',
+    Array.isArray(nestedDrift) && nestedDrift.length === 2 && nestedDrift.includes('lib/client.js'),
+    JSON.stringify(nestedDrift))
   rmSync(driftA, { recursive: true, force: true }); rmSync(driftB, { recursive: true, force: true })
   record('A prompt 段就位', a.sections.some((s) => s.name === 'codebase-memory' && s.order === 850))
   record('A prompt 段已就绪文案', /code_index/.test(a.sections.at(-1).text()))
@@ -476,12 +483,15 @@ async function verify(profile) {
   const staleFind = await f.tools.get('code_find').execute({ query: 'probeSymbol' }, { agent: agentF, signal: sig() })
   record('G code_find 按台账给出过期警告', staleFind?.status === 'stale' && /probe\.ts/.test(staleFind?.text ?? ''), JSON.stringify(staleFind).slice(0, 150))
 
-  // G7 撤回验证：④ advise 事件注入已于 2026-10-08 验收撤回。默认 enforce=off 不注册
-  // 拦截；post-execute 只剩写入记账——既不追加上下文，也仍要把坐标标脏。
+  // G7 撤回验证：④ advise 事件注入已于 2026-10-08 验收撤回。默认 enforce=off 时拦截
+   // 钩子照常注册（enforce 是 volatile 字段，设置页改了要立刻生效），但必须原样放行；
+   // post-execute 只剩写入记账——既不追加上下文，也仍要把坐标标脏。
   const vCalls = []
   const v = await mount({ telemetry: false }, makeStubProxy(vCalls, { project: `stub-${process.pid}-adv` }))
   await v.tools.get('code_setup').execute({}, withSignal(REPO))
-  record('G 默认 enforce=off 时不注册 pre-execute 拦截', (v.events['tools/pre-execute'] ?? []).length === 0, `handlers=${(v.events['tools/pre-execute'] ?? []).length}`)
+  const preV = (v.events['tools/pre-execute'] ?? [])[0]
+  record('G 默认 enforce=off 时拦截钩子常驻但原样放行', typeof preV === 'function' && (await preV(grepExec(fakeAgent(`sess-${process.pid}-offv`, REPO), 'usageSection'), next))?.kind === 'allow',
+    `handlers=${(v.events['tools/pre-execute'] ?? []).length}`)
   const vReport = await v.tools.get('code_setup').execute({}, withSignal(REPO))
   record('G 报表默认 enforce=off（advise 模式已撤回）', /触发层:.*enforce=off/.test(vReport), /触发层:.*$/m.exec(vReport)?.[0]?.slice(0, 130) ?? '(缺行)')
   const postV = (v.events['tools/post-execute'] ?? [])[0]
@@ -491,6 +501,37 @@ async function verify(profile) {
   await postV({ name: 'edit', arguments: { file_path: join(REPO, 'index.js') }, agent: agentV, signal: sig() }, { content: [], isError: false }, nextPost)
   const dirtyFind = await v.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: agentV, signal: sig() })
   record('G 默认 off 下写后记账照常工作（台账仍会把坐标标脏）', dirtyFind?.status === 'stale' && /index\.js/.test(dirtyFind?.text ?? ''), JSON.stringify(dirtyFind?.status))
+
+  // G7.5 volatile 契约（设置页的唯一写路径）：enforce / interceptBudgetMs / telemetry
+  // 必须①在 schema 上标 volatile——dsh-settings 只把 volatile 字段放进表单，写非 volatile
+  // 字段直接抛 "Config field ... is not volatile"；②在钩子里读**引用当前值**——apply 时
+  // 快照的话，UI 改了、拦截行为还是旧的，那比没有 UI 更糟。这里用假引用模拟 loader 的
+  // _commitVolatile（它就是把新快照 updateVolatile 进同一个引用）。
+  const VOLATILE_KEYS = ['enforce', 'interceptBudgetMs', 'telemetry']
+  // schemastery 的字段表在 `Config.dict`（宿主 dsh-settings 的 volatileForm 也是递归它）。
+  const marked = VOLATILE_KEYS.filter((k) => Config?.dict?.[k]?.meta?.volatile === true)
+  record('G 三项热字段在 Config 里标了 volatile（宿主才肯 serve/写）', marked.length === 3, `标了的是 ${marked.join(',') || '(无)'}`)
+  const extra = Object.keys(Config?.dict ?? {}).filter((k) => Config.dict[k]?.meta?.volatile === true && !VOLATILE_KEYS.includes(k))
+  record('G 没有把需要重启的字段标成 volatile（标错等于对 UI 撒谎）', extra.length === 0, extra.join(','))
+
+  let flipMode = 'off'
+  const f2Calls = []
+  const f2 = await mount(
+    // 只有 enforce 传引用：顺带证明 getter 对裸值同样成立（向后兼容老配置与别的臂）。
+    { enforce: { get: () => flipMode }, telemetry: false },
+    makeStubProxy(f2Calls, { project: `stub-${process.pid}-flip` }),
+  )
+  await f2.tools.get('code_setup').execute({}, withSignal(REPO))
+  const preF2 = (f2.events['tools/pre-execute'] ?? [])[0]
+  const agentF2 = fakeAgent(`sess-${process.pid}-flip`, REPO)
+  const flipStep = async () => (await preF2(grepExec(agentF2, 'usageSection'), next))?.kind
+  const flipOff = await flipStep()
+  flipMode = 'deny'
+  const flipDeny = await flipStep()
+  flipMode = 'off'
+  const flipBack = await flipStep()
+  record('G 挂载后翻 volatile enforce 立即改变拦截（读的是引用当前值）',
+    flipOff === 'allow' && flipDeny === 'deny' && flipBack === 'allow', `off→${flipOff} deny→${flipDeny} off→${flipBack}`)
 
   // G8 杠杆 ③：按 query 条件注入；不像在查代码结构就一个字符都不占。
   const hint = (v.contexts ?? []).find((c) => c.name === 'codebase-memory:hint')

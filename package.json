@@ -1,12 +1,13 @@
 {
   "name": "dsh-codebase-memory",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "DSH host bundle: index the session workspace with codebase-memory-mcp, expose it through @njuptlzf/mcp-adapter (one ~250-token MCP proxy tool instead of 17 tool schemas), and add trigger layers — code_find/code_callers wrappers, optional grep/glob intercept, conditional runtime context, write-after staleness tracking — so symbol lookups reach the code graph without depending on how the question was phrased.",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
+    "./client": "./lib/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json",
     "./skills": "./skills",
@@ -14,6 +15,7 @@
   },
   "files": [
     "index.js",
+    "lib/client.js",
     "cordis.patch.yml",
     "skills"
   ],
@@ -34,15 +36,24 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ]
+    },
     "testedEngine": "0.11"
   },
   "scripts": {
     "sync": "node scripts/sync.mjs",
     "check:patch": "node checks/check-patch.mjs",
+    "check:client": "node checks/check-client.mjs",
     "check:plugin": "node checks/check-plugin.mjs",
     "check:chain": "node checks/check-chain.mjs",
     "check:tokens": "node checks/check-tokens.mjs",
-    "check": "npm run check:patch && npm run check:plugin && npm run check:chain && npm run check:tokens"
+    "check": "npm run check:patch && npm run check:client && npm run check:plugin && npm run check:chain && npm run check:tokens"
   },
   "keywords": [
     "dsh",

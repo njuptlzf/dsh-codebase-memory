@@ -80,15 +80,17 @@ for (const profile of targets) {
   if (!existsSync(dest)) throw new Error(`profile ${profile} 里没有安装：${dest}`)
   console.log(`\n[${profile}] -> ${dest}`)
 
-  for (const file of ['index.js', 'cordis.patch.yml', 'package.json']) {
+  for (const file of ['index.js', 'cordis.patch.yml', 'package.json', 'lib/client.js']) {
     const src = join(repo, file)
     const dst = join(dest, file)
+    if (!existsSync(src)) throw new Error(`仓库里缺少 ${file}（bundle 装载依赖它）`)
     // 只动有差异的文件：运行中的 host 会盯着已注册 bundle 的 composition，
     // 无差别覆盖会撞上文件占用（实测 cordis.patch.yml 被锁）。
     if (existsSync(dst) && digest(src) === digest(dst)) {
       console.log(`  unchanged ${file}`)
       continue
     }
+    mkdirSync(dirname(dst), { recursive: true })
     copyFileSync(src, dst)
     if (digest(src) !== digest(dst)) throw new Error(`同步后哈希不一致：${profile}/${file}`)
     console.log(`  copied    ${file}`)
