@@ -1,8 +1,8 @@
 {
   "name": "dsh-codebase-memory",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
-  "description": "DSH host bundle: index the session workspace with codebase-memory-mcp, expose it through @njuptlzf/mcp-adapter (one ~250-token MCP proxy tool instead of 17 tool schemas), and add trigger layers — code_find/code_callers wrappers, optional grep/glob intercept, conditional runtime context, write-after staleness tracking — so symbol lookups reach the code graph without depending on how the question was phrased. Optional built-in zvec-grep semantic layer (off by default; 430MB requires an explicit install:zg).",
+  "description": "DSH host bundle: index the session workspace with codebase-memory-mcp, expose it through @njuptlzf/mcp-adapter (one ~250-token MCP proxy tool instead of 17 tool schemas), and add trigger layers — code_find/code_callers wrappers, optional grep/glob intercept, conditional runtime context, write-after staleness tracking — so symbol lookups reach the code graph without depending on how the question was phrased, with live intercept/replace counters pushed to the settings page over a read-only volatile channel. Optional built-in zvec-grep semantic layer (off by default; 430MB requires an explicit install:zg).",
   "type": "module",
   "main": "index.js",
   "exports": {

@@ -260,7 +260,7 @@ code_index（建索引 / 改完代码后刷新）
 
 ## 配置（可选）
 
-改配置有两条路。**设置 → 插件 → dsh-codebase-memory → `codebase-memory` 行 → 「配置」** 管三个热字段（`enforce`、`telemetry`、`interceptBudgetMs`——页面上只画了前两个，budget 仍要手改配置文件），**不用重启就生效**：宿主把新值推进拦截钩子正在读的那个 volatile 引用，所以会话中途把 `off` 翻成 `deny-once`，下一条 grep 就按新模式判定。其余字段照旧写在 composition 的 `codebase-memory` 行的 `config:` 里（**要重启**：配置文档在 boot 时组合）：
+改配置有两条路。**设置 → 插件 → dsh-codebase-memory → `codebase-memory` 行 → 「配置」** 管两个可改热字段（`enforce`、`telemetry`），并显示一块**只读的运行读数**（拦截/替换/脏台账的实时计数，事件驱动刷新，见 `stats` 行）；`interceptBudgetMs` 同为热字段但页面没画，仍要手改配置文件。**不用重启就生效**：宿主把新值推进拦截钩子正在读的那个 volatile 引用，所以会话中途把 `off` 翻成 `deny-once`，下一条 grep 就按新模式判定。其余字段照旧写在 composition 的 `codebase-memory` 行的 `config:` 里（**要重启**：配置文档在 boot 时组合）：
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
@@ -280,11 +280,12 @@ code_index（建索引 / 改完代码后刷新）
 | `zgEnabled` | `false` | 语义检索层（①b）。`true` 时清单多注册一个 `zg` server（lifecycle `lazy`），prompt 多三行工具路由。**要重启**：`cbm.json` 在适配层进程启动时才读，热改无意义——所以它（连 `zgToolset`/`zgVendorDir`）**刻意不标 volatile**，设置页画了反而是说谎。前置：`npm run install:zg` 已跑过，否则报表 `语义层(zg): missing` 并提示补跑 |
 | `zgToolset` | `agent` | 传给 `zg server --mcp-toolset` 的工具集：`agent`（只露 `zvec_grep_search`，索引检索一条）/ `full`（另露受管 rg 直通与 4 个索引/状态工具——一般不必给模型） |
 | `zgVendorDir` | `$DSH_HOME/vendor/zvec-grep` | `install:zg` 的落点；CLI 路径 = `<该目录>/node_modules/@zvec/zvec-grep/dist/cli/index.js` |
-| `telemetry` | `true` | **热改**（设置页）。每次拦截 / 放行 / 记账 / 补刷写一行 JSON 到 `$DSH_HOME/vendor/mcp-adapter/telemetry.log`，并在 `code_setup` 里给出计数。要不要升 `deny-once`，靠这个数据拍 |
+| `telemetry` | `true` | **热改**（设置页）。每次拦截 / 放行 / 记账 / 补刷写一行 JSON 到 `$DSH_HOME/vendor/mcp-adapter/telemetry.log`，并在 `code_setup` 里给出计数。要不要升 `deny-once`，靠这个数据拍。设置页「运行读数」与这些计数**同门**：关遥测 ⇒ 计数冻结、读数停在最后推送值（不是清零） |
+| `stats` | `""` | **插件写的，人不要配**。设置页「运行读数」的数据源：volatile 引用里的全量计数 JSON——`describe()` 直接读 `ref.get()` 把运行期数据推给页面，**不碰持久化文档**（指纹只含文档层值，不涨 revision）；每次推送后 emit `settings/document-updated` 触发浏览器重拉镜像，2 秒节流合并。它是**方向反转的 volatile**（插件→页面）；用户在文档里写什么都会被下一个事件的全量重建覆盖 |
 
 回滚按杠杆来：`{"enforce":"off","contextHint":false,"dirtyTracking":false,"wrapperTools":false}` 就退回 v0.2 的行为，新开会话即生效。
 
-**为什么页面是一段自己写的代码。** DSH 的设置服务只暴露 schema 里标了 `.volatile()` 的字段，而且**明确不替它们生成页面**（`@deepseek-ai/dsh-settings` README：“Each form reports `autoGenerate` … **no shipped client does so yet**”）。所以可改的三个字段在 `Config` 里标 volatile，`lib/client.js` —— 一段手写的 `__ModuleLoader__` bundle，没有构建步骤，形状照官方 `dsh-client-ui-settings-agent-loop` —— 把它注册进 `plugins.row.config` 槽，key 是 `<包名>#<row id>`。写入走宿主自己的 `ctx.configForms`/`remote.settings` 通道，落盘位置就是 profile 的 `cordis.patch.yml`。两个后果值得知道，因为它决定了以后能不能往页面上加字段：**没标 volatile 的字段结构上就看不见**（`describe()` 直接跳过没有任何 volatile 字段的条目——这就是当初那个开关"设置里找不到"的原因）；**标了 volatile 的字段必须在决策点用 `.get()` 读**，在 `apply` 里取快照会让页面变成谎言。`lib/client.js` 在 `RUNTIME_FILES` 里，所以客户端副本过期会和 `index.js` 过期一样被 `code_setup` 报出来。
+**为什么页面是一段自己写的代码。** DSH 的设置服务只暴露 schema 里标了 `.volatile()` 的字段，而且**明确不替它们生成页面**（`@deepseek-ai/dsh-settings` README：“Each form reports `autoGenerate` … **no shipped client does so yet**”）。所以可改的两个字段（连同没画在页上的 budget）加一条**反向**的读数通道 `stats`，共四个在 `Config` 里标 volatile——`stats` 不是页面写给插件，是插件推给页面：volatile 是 `describe()` 解引用 `ref.get()` 把运行期数据带进页面的唯一通道，且不碰持久化文档。`lib/client.js` —— 一段手写的 `__ModuleLoader__` bundle，没有构建步骤，形状照官方 `dsh-client-ui-settings-agent-loop` —— 把它注册进 `plugins.row.config` 槽，key 是 `<包名>#<row id>`。写入走宿主自己的 `ctx.configForms`/`remote.settings` 通道，落盘位置就是 profile 的 `cordis.patch.yml`。两个后果值得知道，因为它决定了以后能不能往页面上加字段：**没标 volatile 的字段结构上就看不见**（`describe()` 直接跳过没有任何 volatile 字段的条目——这就是当初那个开关"设置里找不到"的原因）；**标了 volatile 的字段必须在决策点用 `.get()` 读**，在 `apply` 里取快照会让页面变成谎言。`lib/client.js` 在 `RUNTIME_FILES` 里，所以客户端副本过期会和 `index.js` 过期一样被 `code_setup` 报出来。
 
 ## 验收
 
@@ -295,8 +296,8 @@ npm run check   # = check:patch + check:client + check:plugin + check:chain + ch
 | 检查 | 证明什么 |
 |---|---|
 | `check-patch.mjs` | `cordis.patch.yml` 里 3 个 `!!js` 表达式按 Loader 原语义能求值，且指向真实文件；`DSH_HOME` 缺失时的回退同值 |
-| `check-client.mjs` | 不开浏览器也验设置页：在 `node:vm` 里用桩 `__ModuleLoader__` / react / primitives / ctx 加载 `lib/client.js`，断言 package.json 里 `dsh.client`、`exports["./client"]`、`files` 三处声明齐全，**槽 key = `<包名>#<row id>` 是从 `cordis.patch.yml` 反解出来的**（改行 id 忘了改 key，按钮就不出现，而且 GUI 一声不响），served namespace 等于宿主 entry id，`require` 的名字全在宿主 baseline 内（名字打错同样是不出现，不是报错），中英词典覆盖 `ENFORCE_MODES` 的每个模式，五种快照态（ready / writable:false / loading / unavailable / summary）渲染正确，点一下真的落到 `form.set('enforce', …)` / `form.unset(…)` |
-| `check-plugin.mjs` | 假 ctx（镜像真实服务的前提校验，含 `tools.execute` 与 `systemPrompt.section/context`）真实跑 `apply` 与**每一条触发层**：链路就绪、工作区来自会话 cwd、不同工作区→不同 project、cbm 缺失时 throw 并给出安装命令；`classifyPattern` 用 12 个符号类 + 21 个字面量类正反例证伪（**误拦必须为 0**）；`deny-once` 拦一次后放行；超预算 / 未索引 / 坐标过期一律 **fail-open**；post-execute 不再追加任何上下文（advise 注入已撤回，臂 G7 断言的就是这一点）；脏路径惰性记账且工作区外不入集合；条件注入命中给一行、不命中给 `""`；**臂 Z**：默认清单**不含** `zg`、prompt 不含 zvec 路由，`zgEnabled` 后临时清单里 `zg` 以 `lazy` 注册且 prompt 出现 `zg_zvec_grep_search`，vendor 缺失只报表提示 `install:zg`（**绝不自动装**——430MB 是人的决定），非法 `zgToolset` 回落 `agent` 并留 note；**臂 R**（`enforce=replace`）：符号形 grep 照常执行成功、模型看到的输出被整体换成图谱命中（无 `additionalContexts`、查询走代理不 spawn CLI），字面量 / 失败结果 / 图谱语义都无命中 / 脏台账会话一律**原样放行**，volatile 开关热翻立即开合替换通道，报表计数 `intercept-replace` 可见；**热改契约**：三个可改字段确实标了 volatile（且没有多余字段被标——标错等于把需要重启的东西伪装成热改），拦截钩子在 `enforce: off` 时**照样注册但直接放行**，把 volatile 引用在已挂载的插件上从 `off` 翻到 `deny` 再翻回来，判定立刻跟着变 |
+| `check-client.mjs` | 不开浏览器也验设置页：在 `node:vm` 里用桩 `__ModuleLoader__` / react / primitives / ctx 加载 `lib/client.js`，断言 package.json 里 `dsh.client`、`exports["./client"]`、`files` 三处声明齐全，**槽 key = `<包名>#<row id>` 是从 `cordis.patch.yml` 反解出来的**（改行 id 忘了改 key，按钮就不出现，而且 GUI 一声不响），served namespace 等于宿主 entry id，`require` 的名字全在宿主 baseline 内（名字打错同样是不出现，不是报错），中英词典覆盖 `ENFORCE_MODES` 的每个模式，五种快照态（ready / writable:false / loading / unavailable / summary）渲染正确，点一下真的落到 `form.set('enforce', …)` / `form.unset(…)`；**运行读数块**无数据给占位、有数据按词典模板渲染，且除既有开关外不新增任何交互件（读数只读） |
+| `check-plugin.mjs` | 假 ctx（镜像真实服务的前提校验，含 `tools.execute` 与 `systemPrompt.section/context`）真实跑 `apply` 与**每一条触发层**：链路就绪、工作区来自会话 cwd、不同工作区→不同 project、cbm 缺失时 throw 并给出安装命令；`classifyPattern` 用 12 个符号类 + 21 个字面量类正反例证伪（**误拦必须为 0**）；`deny-once` 拦一次后放行；超预算 / 未索引 / 坐标过期一律 **fail-open**；post-execute 不再追加任何上下文（advise 注入已撤回，臂 G7 断言的就是这一点）；脏路径惰性记账且工作区外不入集合；条件注入命中给一行、不命中给 `""`；**臂 Z**：默认清单**不含** `zg`、prompt 不含 zvec 路由，`zgEnabled` 后临时清单里 `zg` 以 `lazy` 注册且 prompt 出现 `zg_zvec_grep_search`，vendor 缺失只报表提示 `install:zg`（**绝不自动装**——430MB 是人的决定），非法 `zgToolset` 回落 `agent` 并留 note；**臂 R**（`enforce=replace`）：符号形 grep 照常执行成功、模型看到的输出被整体换成图谱命中（无 `additionalContexts`、查询走代理不 spawn CLI），字面量 / 失败结果 / 图谱语义都无命中 / 脏台账会话一律**原样放行**，volatile 开关热翻立即开合替换通道，报表计数 `intercept-replace` 可见；**臂 S**（设置页读数通道）：替换事件后 volatile `stats` 引用里是**从计数全量重建**的 JSON（`replace.hit`/`graph` 拆分 + `at` 时间戳），恰好 emit `settings/document-updated`（字符串 ns 首参——cordis 才不会把它当 thisArg 过滤；浏览器端参数被忽略，事件本身即刷新扳机），封装调用与提示注入也进读数，**遥测关时既不推也不 emit**；**热改契约**：可改字段加读数通道共四个确实标了 volatile（且没有多余字段被标——标错等于把需要重启的东西伪装成热改），拦截钩子在 `enforce: off` 时**照样注册但直接放行**，把 volatile 引用在已挂载的插件上从 `off` 翻到 `deny` 再翻回来，判定立刻跟着变 |
 | `check-chain.mjs` | 真拉起 adapter → cbm 做 MCP 握手：代理工具就位、懒连接被唤醒、`search_graph` 返回真实行、**阶段 3.5 实测钩子的时间预算**，最后 `describe` 出 prompt 承诺的参数形状 |
 | `check-tokens.mjs` | **消融臂**：直连 cbm vs 经代理的 `tools/list` 实际体积；代理不比直连小就 throw |
 
@@ -304,7 +305,7 @@ npm run check   # = check:patch + check:client + check:plugin + check:chain + ch
 
 ```
 PATCH OK
-174/174 臂通过（tauri + web 两个 profile）   PLUGIN OK
+182/182 臂通过（tauri + web 两个 profile）   PLUGIN OK
 CHAIN OK — 阶段3.5 代理链路延迟 ms: min=28 中位=32 max=34；配了 zg 的临时清单另跑 阶段2b：桥接 + 语义检索返回真实结果
 臂A 直连 cbm            : 17 工具, 17308 B ≈ 4327 tokens
 臂B 代理·冷缓存         :  2 工具,  4278 B ≈ 1070 tokens  （省 4.0x）
@@ -324,6 +325,7 @@ cbm CLI 同一台机器单次 search_graph        : 5491 / 6526 / 8280 ms  ← �
 | 某次 grep 返回 `Error: dsh-codebase-memory：…` | 这是层 ② 的**拦截**，不是故障：默认 `enforce=off` 根本不拦，只有你显式设成 `deny-once`/`deny` 才会出现；`deny-once` 对同一会话同一符号**只拦一次**，reason 里已带 `search_graph` 命中。想彻底关掉：设置页一键，或 `{"enforce":"off"}` |
 | grep 的"结果"变成几行索引命中、没有文件内容 | 不是故障：`enforce=replace`（层 ②b）把符号形 grep 的模型可见输出换成了图谱/语义命中，调用本身照常成功、不出错误。想回到原始输出：设置页把 enforce 翻回 `off`，即时生效。本会话台账脏（刚写过代码）时替换会自动让路，这时又是原输出——两种都正常 |
 | 设置页改了 `enforce`，但 grep 照样不被拦 | 先分清是"没生效"还是"合法放行"。`code_setup` 触发层那行现在报的是**实时值**，跟着设置页变就说明钩子每次调用都在重读配置（报表跟着变本身就是证据）。仍不拦的三种合法情形：pattern 被分成**字面量**（层 ② 只拦符号形）、代码图对该符号**无命中**、当前会话没有可绑定的工作区（cwd 不是路径，比如远程会话）。要确认钩子有没有跑，看 `telemetry.log` 里的 `intercept-*` 行 |
+| 设置页「运行读数」长时间不动 | 读数由拦截 / 替换 / 记账事件驱动：没有符号形 grep，或遥测关着（关遥测 = 计数冻结、读数停在最后推送值），都不会动。改一次配置会让宿主把 volatile 引用复位成文档默认——**不是丢数据**，计数在插件内存里，下一个事件即推回全量读数 |
 | `codebase-memory` 行**没有「配置」按钮**（设置 → 插件） | 按钮由 `lib/client.js` 注册，且三个条件同时成立才出现——**每一个失败都不报错**，所以这条单独列出：① 宿主只有在 `describe()` 发现该 entry 有 volatile 字段时才 serve 命名空间，装进去的 `index.js` 若没有 `.volatile()` 就没有按钮（`node scripts/sync.mjs` 后重启）；② 槽 key 必须严格等于 `<包名>#<row id>`（本包是 `dsh-codebase-memory#codebase-memory`），只改 `cordis.patch.yml` 的行 id 不改 key，按钮就消失——所以 `npm run check:client` 从 patch 反解 key，不信 bundle 里的常量；③ bundle 必须是开着的（`@deepseek-ai/dsh-client-ui-plugin-manager` README：“The bundle's patch must declare the row under that id, and the registration exists while the bundle is on”）。客户端副本装歪会被 `code_setup` 的 `fileDrift` 报出来（`lib/client.js` 在 `RUNTIME_FILES` 里），但它不会告诉你按钮不见了。**页面上没有的字段**（`wrapperTools`/`interceptTools`/`contextHint`/`dirtyTracking`/`sessionRefresh`/`autoIndex`/`bootstrap`/`zgEnabled`/`zgToolset`/`zgVendorDir`）仍是 composition 级：改 patch，重启宿主 |
 | `code_find` 提示"坐标很可能已过期" | 层 ⑤ 的自检生效了：返回的源码里没有那个符号名（上游 issue #1750 的静默错位）。跑一次 `code_index`；插件已经在后台补刷，但**别在补刷完成前信这些行号** |
 | 当前会话工具清单里没有 `code_index`/`code_setup`，但 `code_setup` 能调通 | 工具清单是**会话级快照**：新开的对话才看得到。"没列出"≠"没注册" |

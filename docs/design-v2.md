@@ -452,6 +452,23 @@ API（已核实，官方源码 `packages/core/agent/src/runtime-types.ts` + `pac
 
 ---
 
+## 6.4 设置页读数通道的核实结果（v0.7.0）
+
+6.3 收尾时留了下一个问题：replace 要"跑几天看 `replace-pass-dirty`/`no-hit` 占比"，可计数只躺在 `telemetry.log` 里——不看日志就没人知道占比。这一节把"插件往设置页推进数据"这条通道的每一步都照宿主源码核死（`@deepseek-ai/dsh-settings`、`@deepseek-ai/cordis-plugin-loader`、`@deepseek-ai/dsh-client-ui-settings`、cosmokit，均本机安装的 dist）。
+
+| 核实的点（原文证据） | 结论与落地 |
+|---|---|
+| 设置页显示的 `value` 从哪来？`describe()` 算的是 `projectForm(form, plainConfig(entry.fiber.config))`（dsh-settings `lib/index.js:413` 起），`plainConfig` 对 volatile 节点做 `isVolatile(v) ? v.get() : v`（`lib/index.js:98`） | **volatile 字段是双向的**：不只是"页面写→插件热生效"，`ref.get()` 的值也会被 describe 原样读给页面——插件把自己算好的 JSON 推进 `config.stats` 这个 volatile 引用，页面就能看到**运行期数据而不碰持久化文档**。指纹 `raw=[uid, schema.toJSON(), entry.options.config]` 只含文档层值，不含 ref 值 ⇒ 推读数**不涨 revision、不触发写栅栏** |
+| 推完怎么让页面刷新？浏览器侧 `ctx.remote.$on("settings/document-updated", () => mirror.load())`（dsh-client-ui-settings `lib/client.js:1512`）——**参数被忽略**，任何一次该事件的到线都会重拉整个 describe 镜像 | 插件推完 ref 后 `ctx.emit('settings/document-updated', <ns>, <revision>)` 即触发刷新。推送做节流：首个事件立即 emit，之后 2s 窗口合并（`STATS_PUSH_MS`），窗口内的计数只更新 ref 不发线——读数是聚合值，晚 2 秒到页面没有任何代价 |
+| 插件写的 ref 会不会被宿主覆盖？`_commitVolatile`（cordis-plugin-loader `lib/index.js:393-414`）在任何用户配置写入后把 volatile 引用按**文档解析值**逐个 `updateVolatile` 复位 | 会被复位——**接受**：复位只发生在人动配置的那一刻，插件在下一个事件就全量重建推回去。所以推送的必须是**从 `state.counts` 全量重建的完整 JSON**，绝不能做增量改写（增量遇上复位就永久错位）。这也定死了 stats 字段的归属：它是**插件所有的草稿区**，人在文档里写什么都无意义 |
+| 写引用要不要 `import { createVolatile } from '@deepseek-ai/cosmokit'`？ | **不加依赖**。cosmokit 的 write 通道是 `Symbol.for('cosmokit.volatile.write')`——**全局符号注册表**，跨包副本天然同键（cosmokit `lib/index.js:83`）。插件侧 `isVolRef`/写入直接用这个全局符号即可；宿主自己的官方插件（dsh-llm-deepseek）是直接 import 的，但我们 `package.json` 没有 dependencies 字段，运行时靠的是宿主已解析的同一条 `require` 链——引一个没声明的包，不如引一个协议级全局符号 |
+| 计数要不要和遥测开关解耦？`telemetry()` 第一行就是 `if (!cfg.telemetry) return` | **同一道门**：关遥测 = 计数冻结（不是清零），页面读数停在最后一次推送并标注"关遥测即冻结"。另开一条 always-on 计数路径要多一套门闩和测试，换来的只是"关了遥测还能看数"——这本来就是用户明确不要的可见性，不值得 |
+| 页面上要展示什么？（指标审计结论） | 用户拍板的那条：替换命中率 `intercept-replace / (replace + pass-dirty + pass-no-hit + replace-error)` 及**按来源拆分**——`fields.source` 以前只进日志行字段，现在事件名伴生键 `${event}:${fields.source}`（如 `intercept-replace:graph`/`:zg`）进计数，图谱/语义两条腿的占比直接可见。同时补了两个此前完全没数的软杠杆：封装工具真实调用数（`runCbmFlow` 里记 `wrapper-call`）与提示注入次数（`hint-injected`）——杠杆 ①③ 有没有人在用，是"要不要继续花钱养它们"的决策数据。deny 侧三件套、脏台账积压（sched−done−fail）、索引争用重试一并上页；**没答案的行不展示占位**（`at` 时间戳缺失整块显示"暂无读数"） |
+
+验收：check-plugin **臂 S**（×2 profile，共 8 条）——替换事件后 volatile ref 里是 `replace.hit===1 && replace.graph===1` 的全量 JSON、emit 恰好带 `('settings/document-updated', 'codebase-memory', <数字 revision>)`、软杠杆两项都进了读数、**遥测关时不推不 emit**；G7.5 的 volatile 白名单从三件套扩成四件套（`stats` 的 volatile 是方向反转的通道，不标则 describe 根本不解引用）。总数 174→182。
+
+---
+
 ## 7. 参考链接
 
 **DSH**

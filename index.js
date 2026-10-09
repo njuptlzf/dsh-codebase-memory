@@ -76,6 +76,11 @@ export const Config = z.object({
   interceptBudgetMs: z.number().default(2500).volatile(),
   contextHint: z.boolean().default(true),
   telemetry: z.boolean().default(true).volatile(),
+  // stats 是**插件→设置页**的读数通道，不是用户配置：pushStats 把计数推进这个引用，
+  // 宿主 describe() 用 plainConfig 读同一引用（dsh-settings/lib/index.js:98,436），
+  // 浏览器收到转发的 settings/document-updated 后重读。写成 JSON 字符串是为了让
+  // zod 校验始终成立（volatileForm 也会带上它，但面板只读、不渲染输入框）。不落盘。
+  stats: z.string().default('').volatile(),
   dirtyTracking: z.boolean().default(true),
   dirtyRefreshCooldownSec: z.number().default(120),
   // ── 语义检索层（zvec-grep，可选，docs/design-v2.md 第 9 节）─────────────────
@@ -100,6 +105,18 @@ const live = (value) => (value && typeof value.get === 'function' ? value.get() 
 
 /** 把 volatile 字段挂成 getter：读点永远拿到当前值，而不是 apply 时的快照。 */
 const defineLive = (cfg, key, read) => Object.defineProperty(cfg, key, { get: read, enumerable: true, configurable: true })
+
+/**
+ * cosmokit 的 volatile 引用写符号。Symbol.for 走全局注册表，跨模块副本同键
+ * （cosmokit lib/index.js:83,116 的设计），所以**不必把 cosmokit 声明成依赖**，
+ * 拿引用对象上的这个方法就是宿主自己的写协议。引用被 Object.freeze，但 freeze
+ * 挡不住调用闭包方法——loader 的 updateVolatile 同样是 target[write](...)。
+ */
+const VOL_WRITE = Symbol.for('cosmokit.volatile.write')
+const isVolRef = (v) => !!v && typeof v === 'object' && typeof v.get === 'function' && VOL_WRITE in v
+
+/** 读数推送的合并窗口（ms）：dirty-record 每次 write/edit 都会触发，必须节流 emit。 */
+const STATS_PUSH_MS = 2000
 
 /** 正整数配置（含 0 = 关闭）；非法值降级为默认并记 note，绝不 throw。 */
 function positiveInt(key, raw, fallback, notes) {
@@ -806,6 +823,24 @@ const ledgerStale = (sess) => (sess.dirty.size > 0 ? 'stale' : 'fresh')
 
 /** 遥测：一行 JSON。写失败绝不影响会话（与 refreshLog 同一原则）。 */
 const TELEMETRY_MAX_BYTES = 512 * 1024
+
+/**
+ * state.counts → 设置页读数（JSON 字符串）。**每次全量重建**：用户任何一次配置写
+ * 都会让 loader 把这个 volatile 字段复位成 schema 默认（_commitVolatile 只认文档
+ * 层），下一个事件回填，所以绝不能做增量。键名是面板的契约，改键要同步 lib/client.js。
+ */
+function renderStats(state) {
+  const n = (k) => state.counts[k] ?? 0
+  return JSON.stringify({
+    at: Date.now(),
+    replace: { hit: n('intercept-replace'), graph: n('intercept-replace:graph'), zg: n('intercept-replace:zg'), passDirty: n('replace-pass-dirty'), passNoHit: n('replace-pass-no-hit'), error: n('replace-error') },
+    deny: { blocked: n('intercept-deny'), passDirty: n('intercept-pass-dirty'), passNoHit: n('intercept-pass-no-hit'), passQueryFailed: n('intercept-pass-query-failed'), skipSeen: n('intercept-skip-seen'), error: n('intercept-error') },
+    dirty: { record: n('dirty-record'), refreshScheduled: n('dirty-refresh-scheduled'), refreshDone: n('dirty-refresh-done'), refreshFail: n('dirty-refresh-fail') },
+    lever: { wrapperCalls: n('wrapper-call'), hintInjected: n('hint-injected') },
+    index: { retryContention: n('index-retry-contention'), zgIndexFail: n('zg-index-fail') },
+  })
+}
+
 function telemetry(cfg, state, event, fields = {}) {
   if (!cfg.telemetry) return
   try {
@@ -817,6 +852,17 @@ function telemetry(cfg, state, event, fields = {}) {
     writeFileSync(path, `${JSON.stringify({ ts: new Date().toISOString(), event, ...fields })}\n`, { flag: 'a' })
   } catch { /* 忽略 */ }
   state.counts[event] = (state.counts[event] ?? 0) + 1
+  // 带 source 的事件额外记一份 "event:source" 计数（intercept-replace 的图谱/语义
+  // 占比就靠它）。code_setup 的计数行会多列一个键，属预期；文件行格式不变。
+  if (typeof fields.source === 'string') state.counts[`${event}:${fields.source}`] = (state.counts[`${event}:${fields.source}`] ?? 0) + 1
+  state.pushStats?.()
+}
+
+/** 只进计数不进日志的软杠杆计数（提示注入每轮装配都可能触发，写文件会淹掉日志）。 */
+function bumpCount(cfg, state, event) {
+  if (!cfg.telemetry) return
+  state.counts[event] = (state.counts[event] ?? 0) + 1
+  state.pushStats?.()
 }
 
 /** deny 的 reason：模型这一轮就要拿到可用结果，而不是一句说教。 */
@@ -903,6 +949,9 @@ const formatRows = (rows) => rows
  * 与 code_index 同样的纪律：**前提不成立即 throw**，不静默降级成 grep。
  */
 async function runCbmFlow(ctx, cfg, state, exec, work) {
+  // 杠杆 ① 的采纳率读数：模型真的在用封装动词吗？两个封装工具共用这条动线，
+  // 所以计一次点在这里，而不是各自的 execute 里。
+  telemetry(cfg, state, 'wrapper-call', {})
   const cwd = exec?.agent?.session?.header?.cwd
   if (!cwd) throw new Error('封装工具需要会话工作区：exec.agent.session.header.cwd 为空')
   await bootstrap(ctx, cfg, state, exec.signal).catch((error) => {
@@ -1016,6 +1065,25 @@ export async function apply(ctx, config) {
   const ac = new AbortController()
   state.abortSignal = ac.signal
   ctx.effect(() => () => ac.abort(), 'dsh-codebase-memory.abort')
+
+  // ── 设置页读数通道（docs/design-v2.md 第 6.4 节）────────────────────────────
+  // 把 state.counts 全量重建进 volatile `stats` 引用，节流 emit
+  // 'settings/document-updated' 让浏览器 mirror 重新 describe 读到新值。
+  // 读的是 config 传进来的**同一个引用**（生产是 cosmokit volatile ref；验收里
+  // 传裸对象 → isVolRef 为假就静默跳过，不影响别的臂）。emit 首参必须是字符串
+  // （ns），否则 cordis dispatch 会把它当 thisArg 过滤掉监听器。
+  state.statsRef = config.stats
+  let statsTimer = null
+  const doStatsEmit = () => { try { ctx.emit('settings/document-updated', 'codebase-memory', Date.now()) } catch { /* 没有转发器就算了 */ } }
+  state.pushStats = () => {
+    const ref = state.statsRef
+    if (isVolRef(ref)) { try { ref[VOL_WRITE](renderStats(state)) } catch { /* 绝不影响会话 */ } }
+    if (statsTimer) return // 合并窗口内：只等尾随那一次，页面拿到窗口末的最新值
+    doStatsEmit()
+    statsTimer = setTimeout(() => { statsTimer = null; doStatsEmit() }, STATS_PUSH_MS)
+    if (typeof statsTimer.unref === 'function') statsTimer.unref()
+  }
+  ctx.effect(() => () => { if (statsTimer) clearTimeout(statsTimer) }, 'dsh-codebase-memory.stats-push')
 
   // 后台自举：绝不 await 成 boot 失败；失败只落在 state.lastError。
   const work = Promise.resolve()
@@ -1395,6 +1463,8 @@ export async function apply(ctx, config) {
           const tail = project
             ? '找定义/调用关系用 code_find / code_callers；字符串、日志、配置值仍用 grep。'
             : '第一步：code_index。'
+          // 只数真正注入的那一次（每轮装配都调这个回调，注入与否是 ③ 的有效性读数）。
+          bumpCount(cfg, state, 'hint-injected')
           return noVars(`${head} ${tail}`)
         } catch {
           return ''

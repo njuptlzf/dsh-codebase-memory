@@ -105,6 +105,8 @@ function makeCtx(tools, sections, events = {}, contexts = [], proxy = null, opts
     effect: (fn) => fn(),
     // 记录监听器而不是吞掉：H2 的会话启动刷新挂在 'agent/session-start' 上，验收要能调到它。
     on: (name, fn) => { (events[name] ??= []).push(fn) },
+    // emit 同样记账而不抛 "not a function"：读数通道的节流 emit 要靠它断言。
+    emit: (...args) => { (opts.emits ??= []).push(args) },
     tools: {
       register: (tool) => tools.set(tool.name, tool),
       // 宿主实装的公开方法（工具目录里有 execute）：封装工具与钩子都靠它复用长连接。
@@ -200,11 +202,12 @@ async function verify(profile) {
     const sections = []
     const contexts = []
     const events = {}
-    await apply(makeCtx(tools, sections, events, contexts, proxy, ctxOpts ?? {}), config)
+    const emits = []
+    await apply(makeCtx(tools, sections, events, contexts, proxy, { ...(ctxOpts ?? {}), emits }), config)
     if (!tools.has('code_index') || !tools.has('code_setup')) {
       throw new Error(`期望注册 code_index + code_setup，实际 ${[...tools.keys()].join(',')}`)
     }
-    return { tools, sections, contexts, events }
+    return { tools, sections, contexts, events, emits }
   }
 
   // ── 臂 A：链路就绪 ──────────────────────────────────────────────────────────
@@ -544,15 +547,17 @@ async function verify(profile) {
   const dirtyFind = await v.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: agentV, signal: sig() })
   record('G 默认 off 下写后记账照常工作（台账仍会把坐标标脏）', dirtyFind?.status === 'stale' && /index\.js/.test(dirtyFind?.text ?? ''), JSON.stringify(dirtyFind?.status))
 
-  // G7.5 volatile 契约（设置页的唯一写路径）：enforce / interceptBudgetMs / telemetry
-  // 必须①在 schema 上标 volatile——dsh-settings 只把 volatile 字段放进表单，写非 volatile
+  // G7.5 volatile 契约（设置页的写路径 + 读数通道）：enforce / interceptBudgetMs /
+  // telemetry 必须①在 schema 上标 volatile——dsh-settings 只把 volatile 字段放进表单，写非 volatile
   // 字段直接抛 "Config field ... is not volatile"；②在钩子里读**引用当前值**——apply 时
   // 快照的话，UI 改了、拦截行为还是旧的，那比没有 UI 更糟。这里用假引用模拟 loader 的
   // _commitVolatile（它就是把新快照 updateVolatile 进同一个引用）。
-  const VOLATILE_KEYS = ['enforce', 'interceptBudgetMs', 'telemetry']
+  // stats 方向相反：不是用户可写项，是插件→页面的只读读数通道，但它同样必须 volatile
+  // ——describe() 只把 volatile 字段解引用进快照，标错（或漏标）页面就永远看不到读数。
+  const VOLATILE_KEYS = ['enforce', 'interceptBudgetMs', 'telemetry', 'stats']
   // schemastery 的字段表在 `Config.dict`（宿主 dsh-settings 的 volatileForm 也是递归它）。
   const marked = VOLATILE_KEYS.filter((k) => Config?.dict?.[k]?.meta?.volatile === true)
-  record('G 三项热字段在 Config 里标了 volatile（宿主才肯 serve/写）', marked.length === 3, `标了的是 ${marked.join(',') || '(无)'}`)
+  record('G 三项热字段 + 读数通道在 Config 里标了 volatile（宿主才肯 serve/写）', marked.length === 4, `标了的是 ${marked.join(',') || '(无)'}`)
   const extra = Object.keys(Config?.dict ?? {}).filter((k) => Config.dict[k]?.meta?.volatile === true && !VOLATILE_KEYS.includes(k))
   record('G 没有把需要重启的字段标成 volatile（标错等于对 UI 撒谎）', extra.length === 0, extra.join(','))
 
@@ -650,6 +655,37 @@ async function verify(profile) {
     flipBefore?.content === undefined && /stubSymbol/.test(flipAfter?.content?.[0]?.text ?? ''), `off→${JSON.stringify(flipBefore).slice(0, 40)} replace→${JSON.stringify(flipAfter).slice(0, 60)}`)
   const rReport = await r.tools.get('code_setup').execute({}, withSignal(REPO))
   record('R 遥测计数里能看到 intercept-replace', /intercept-replace=1/.test(rReport), /遥测计数:.*$/m.exec(rReport)?.[0]?.slice(0, 220) ?? '(缺行)')
+
+  // ── 臂 S：设置页读数通道 —— counts → volatile stats 引用 + 节流 emit ────────────
+  // 生产里 stats 引用由 loader 造（cosmokit createVolatile）；验收环境没装 cosmokit，
+  // 用 Symbol.for('cosmokit.volatile.write') 手捏同形状引用——isVolRef 认的是全局
+  // symbol 注册表（cosmokit 跨副本同一），形状对了语义就对了。
+  const mkVolRef = (v) => { let cur = v; return { get: () => cur, [Symbol.for('cosmokit.volatile.write')]: (next) => { cur = next } } }
+  const sRef = mkVolRef('')
+  const sCalls = []
+  const s = await mount({ enforce: 'replace', dirtyTracking: false, stats: sRef }, makeStubProxy(sCalls, { project: `stub-${process.pid}-stats` }))
+  await s.tools.get('code_setup').execute({}, withSignal(REPO))
+  const agentS = fakeAgent(`sess-${process.pid}-stats`, REPO)
+  await (s.events['tools/post-execute'] ?? [])[0](grepExec(agentS, 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  await s.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: agentS, signal: sig() })
+  const sHint = (s.contexts ?? []).find((c) => c.name === 'codebase-memory:hint')
+  sHint?.text({ agent: fakeAgent(`sess-${process.pid}-stats`, REPO, codeAsk) })
+  let sp = null
+  try { sp = JSON.parse(String(sRef.get())) } catch { /* 下一行断言会把它报出来 */ }
+  record('S 替换事件把全量读数推进 volatile stats 引用（hit + graph 拆分 + at）',
+    sp?.replace?.hit === 1 && sp?.replace?.graph === 1 && typeof sp?.at === 'number', String(sRef.get()).slice(0, 170))
+  const sEmit = (s.emits ?? []).find((x) => x[0] === 'settings/document-updated')
+  record('S 推送后 emit settings/document-updated（首参是字符串 ns，cordis 才不会把它当 thisArg 过滤）',
+    !!sEmit && sEmit[1] === 'codebase-memory' && typeof sEmit[2] === 'number', JSON.stringify(sEmit ?? null))
+  record('S 软杠杆也在数：封装调用 + 提示注入进读数',
+    (sp?.lever?.wrapperCalls ?? 0) >= 1 && (sp?.lever?.hintInjected ?? 0) >= 1, `lever=${JSON.stringify(sp?.lever ?? null)}`)
+  const sOff = mkVolRef('')
+  const so = await mount({ enforce: 'replace', dirtyTracking: false, telemetry: false, stats: sOff }, makeStubProxy([], { project: `stub-${process.pid}-soff` }))
+  await so.tools.get('code_setup').execute({}, withSignal(REPO))
+  await (so.events['tools/post-execute'] ?? [])[0](grepExec(fakeAgent(`sess-${process.pid}-soff`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
+  record('S 遥测关 ⇒ 不推读数也不 emit（页面与日志同一开关，冻结在最后值）',
+    sOff.get() === '' && !(so.emits ?? []).some((x) => x[0] === 'settings/document-updated'), String(sOff.get()).slice(0, 40))
+
   rmSync(tRepo, { recursive: true, force: true })
 
   // ── 臂 B：工作区绑定 ────────────────────────────────────────────────────────
