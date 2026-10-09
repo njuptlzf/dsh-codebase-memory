@@ -12,7 +12,7 @@
  * 任何阶段不成立就 throw（前提不成立即失败，不静默降级）。
  */
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const dshHome = process.env.DSH_HOME || join(process.env.USERPROFILE, '.dsh')
@@ -104,6 +104,22 @@ try {
   if (toolLines.length < 5) fail('阶段2 列出 cbm 工具', `only ${toolLines.length} line(s):\n${listed.slice(0, 800)}`)
   console.log(`PASS 阶段2 列出 cbm 工具: ${toolLines.length} 行`)
   console.log(toolLines.map((l) => '      ' + l).join('\n'))
+
+  // 阶段 2b（可选）：清单里配置了 zg（zgEnabled=true）才跑——真连一次语义层，
+  // 证明 stdio 桥能把 daemon（含首次模型加载）拉起来并返回真实检索结果。
+  const cfgDoc = JSON.parse(readFileSync(configPath, 'utf8'))
+  if (cfgDoc.mcpServers?.zg) {
+    await call('tools/call', { name: proxy, arguments: { connect: 'zg' } }, 300000)
+    const zgListed = textOf(await call('tools/call', { name: proxy, arguments: { server: 'zg' } }))
+    if (!zgListed.includes('zvec_grep_search')) fail('阶段2b zg 工具面', `expected zvec_grep_search:\n${zgListed.slice(0, 500)}`)
+    const zgOut = textOf(await call('tools/call', {
+      name: proxy,
+      arguments: { tool: 'zg_zvec_grep_search', args: { query: 'cooldown preventing repeated background reindex', root: process.cwd(), fuse: true, limit: 3 } },
+    }, 300000))
+    if (!/[a-zA-Z0-9_\-.]+:\d/.test(zgOut)) fail('阶段2b zg 真检索', `no file:line hits:\n${zgOut.slice(0, 600)}`)
+    console.log('PASS 阶段2b zg 桥接+语义检索返回真实结果')
+    console.log('      ' + zgOut.replace(/\s+/g, ' ').slice(0, 300))
+  }
 
   // 阶段 3：真调用一次，取回真实检索行
   if (project) {

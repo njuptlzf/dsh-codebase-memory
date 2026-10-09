@@ -58,6 +58,18 @@ Unblock-File .\install.ps1; .\install.ps1 --skip-config
 
 装完后插件会按 官方安装位 → `$DSH_HOME/vendor/codebase-memory-mcp/bin` → PATH 的顺序探测；也可以用 `cbmPath` 配置指死。
 
+### ①b 可选：语义检索层（zvec-grep，默认关）
+
+cbm 图谱**不做向量检索**（0.11.0 实测：`search_graph` 是 BM25/正则，`search_code` 是 graph-ranked text）。要"用自然语言搜代码/文档"就补一层 [zvec-grep](https://github.com/zvec-ai/zvec-grep)——插件把它接成第二个 MCP server，**默认关**，因为它 ~430MB：
+
+```powershell
+npm run install:zg          # 一次性：npm 安装并裁剪（删 transformers.js 不用的推理后端），430MB，约 3 分钟
+# 然后在 profile 的 cordis.patch.yml 里给 codebase-memory 行的 config: 加 zgEnabled: true，重启宿主
+```
+
+开启后 `code_setup` 报表多出 `语义层(zg): ready`，清单（`cbm.json`）里注册 `zg` server（lifecycle `lazy`：首次使用才拉起本地守护进程，约 2.2s，之后热查询 1.4s），模型侧只暴露一个工具 **`zg_zvec_grep_search`**（`agent` 工具集——rg/索引/守护进程管理留在 CLI 侧；**注意代理工具名带 server 键前缀**，直连叫 `zvec_grep_search`，经代理必须叫 `zg_zvec_grep_search`）。调用**必须传 `root`**（工作区绝对路径），没有会报 `root: Invalid input`。索引产物落在被索引仓库的 `.zvec-grep/`（建议加进 gitignore——本仓库已经加了）。裁剪安全性有门禁：`install:zg` 末尾会 `--version` 自检；索引新鲜度复用脏台账链路——`dirtyTracking` 开着时，写文件后的后台补刷会连 `zg index` 一起跑（增量约 2s）。
+
+
 ### ② 把 bundle 挂进 profile（②③④全自动）
 
 ```powershell
@@ -264,6 +276,9 @@ code_index（建索引 / 改完代码后刷新）
 | `contextHint` | `true` | 层 ③：按 query 条件注入一行 `systemPrompt.context`。极简 agent 预设会整块压制 runtime-context，那时它不送达（①②⑤ 不受影响） |
 | `dirtyTracking` | `true` | 层 ⑤：按会话记 `write`/`edit` 路径。**台账本身就是过期信号**（见触发层 ⑤——引擎那个逐路径结论并不是，理由见下表 ⑤ 行）；只有 `code_index`，或**真的跑完的**后台补刷，才会清空它 |
 | `dirtyRefreshCooldownSec` | `120` | 脏路径触发的后台补刷冷却（复用 `sessionRefresh` 那条带闸门的链路，同回合多次写入自然并成一次） |
+| `zgEnabled` | `false` | 语义检索层（①b）。`true` 时清单多注册一个 `zg` server（lifecycle `lazy`），prompt 多三行工具路由。**要重启**：`cbm.json` 在适配层进程启动时才读，热改无意义——所以它（连 `zgToolset`/`zgVendorDir`）**刻意不标 volatile**，设置页画了反而是说谎。前置：`npm run install:zg` 已跑过，否则报表 `语义层(zg): missing` 并提示补跑 |
+| `zgToolset` | `agent` | 传给 `zg server --mcp-toolset` 的工具集：`agent`（只露 `zvec_grep_search`，索引检索一条）/ `full`（另露受管 rg 直通与 4 个索引/状态工具——一般不必给模型） |
+| `zgVendorDir` | `$DSH_HOME/vendor/zvec-grep` | `install:zg` 的落点；CLI 路径 = `<该目录>/node_modules/@zvec/zvec-grep/dist/cli/index.js` |
 | `telemetry` | `true` | **热改**（设置页）。每次拦截 / 放行 / 记账 / 补刷写一行 JSON 到 `$DSH_HOME/vendor/mcp-adapter/telemetry.log`，并在 `code_setup` 里给出计数。要不要升 `deny-once`，靠这个数据拍 |
 
 回滚按杠杆来：`{"enforce":"off","contextHint":false,"dirtyTracking":false,"wrapperTools":false}` 就退回 v0.2 的行为，新开会话即生效。
@@ -280,7 +295,7 @@ npm run check   # = check:patch + check:client + check:plugin + check:chain + ch
 |---|---|
 | `check-patch.mjs` | `cordis.patch.yml` 里 3 个 `!!js` 表达式按 Loader 原语义能求值，且指向真实文件；`DSH_HOME` 缺失时的回退同值 |
 | `check-client.mjs` | 不开浏览器也验设置页：在 `node:vm` 里用桩 `__ModuleLoader__` / react / primitives / ctx 加载 `lib/client.js`，断言 package.json 里 `dsh.client`、`exports["./client"]`、`files` 三处声明齐全，**槽 key = `<包名>#<row id>` 是从 `cordis.patch.yml` 反解出来的**（改行 id 忘了改 key，按钮就不出现，而且 GUI 一声不响），served namespace 等于宿主 entry id，`require` 的名字全在宿主 baseline 内（名字打错同样是不出现，不是报错），中英词典覆盖 `ENFORCE_MODES` 的每个模式，五种快照态（ready / writable:false / loading / unavailable / summary）渲染正确，点一下真的落到 `form.set('enforce', …)` / `form.unset(…)` |
-| `check-plugin.mjs` | 假 ctx（镜像真实服务的前提校验，含 `tools.execute` 与 `systemPrompt.section/context`）真实跑 `apply` 与**每一条触发层**：链路就绪、工作区来自会话 cwd、不同工作区→不同 project、cbm 缺失时 throw 并给出安装命令；`classifyPattern` 用 12 个符号类 + 21 个字面量类正反例证伪（**误拦必须为 0**）；`deny-once` 拦一次后放行；超预算 / 未索引 / 坐标过期一律 **fail-open**；post-execute 不再追加任何上下文（advise 注入已撤回，臂 G7 断言的就是这一点）；脏路径惰性记账且工作区外不入集合；条件注入命中给一行、不命中给 `""`；**热改契约**：三个可改字段确实标了 volatile（且没有多余字段被标——标错等于把需要重启的东西伪装成热改），拦截钩子在 `enforce: off` 时**照样注册但直接放行**，把 volatile 引用在已挂载的插件上从 `off` 翻到 `deny` 再翻回来，判定立刻跟着变 |
+| `check-plugin.mjs` | 假 ctx（镜像真实服务的前提校验，含 `tools.execute` 与 `systemPrompt.section/context`）真实跑 `apply` 与**每一条触发层**：链路就绪、工作区来自会话 cwd、不同工作区→不同 project、cbm 缺失时 throw 并给出安装命令；`classifyPattern` 用 12 个符号类 + 21 个字面量类正反例证伪（**误拦必须为 0**）；`deny-once` 拦一次后放行；超预算 / 未索引 / 坐标过期一律 **fail-open**；post-execute 不再追加任何上下文（advise 注入已撤回，臂 G7 断言的就是这一点）；脏路径惰性记账且工作区外不入集合；条件注入命中给一行、不命中给 `""`；**臂 Z**：默认清单**不含** `zg`、prompt 不含 zvec 路由，`zgEnabled` 后临时清单里 `zg` 以 `lazy` 注册且 prompt 出现 `zg_zvec_grep_search`，vendor 缺失只报表提示 `install:zg`（**绝不自动装**——430MB 是人的决定），非法 `zgToolset` 回落 `agent` 并留 note；**热改契约**：三个可改字段确实标了 volatile（且没有多余字段被标——标错等于把需要重启的东西伪装成热改），拦截钩子在 `enforce: off` 时**照样注册但直接放行**，把 volatile 引用在已挂载的插件上从 `off` 翻到 `deny` 再翻回来，判定立刻跟着变 |
 | `check-chain.mjs` | 真拉起 adapter → cbm 做 MCP 握手：代理工具就位、懒连接被唤醒、`search_graph` 返回真实行、**阶段 3.5 实测钩子的时间预算**，最后 `describe` 出 prompt 承诺的参数形状 |
 | `check-tokens.mjs` | **消融臂**：直连 cbm vs 经代理的 `tools/list` 实际体积；代理不比直连小就 throw |
 
@@ -288,8 +303,8 @@ npm run check   # = check:patch + check:client + check:plugin + check:chain + ch
 
 ```
 PATCH OK
-132/132 臂通过（tauri + web 两个 profile）   PLUGIN OK
-CHAIN OK — 阶段3.5 代理链路延迟 ms: min=29 中位=33 max=34；check_index_coverage(单路径)=29
+156/156 臂通过（tauri + web 两个 profile）   PLUGIN OK
+CHAIN OK — 阶段3.5 代理链路延迟 ms: min=28 中位=32 max=34；配了 zg 的临时清单另跑 阶段2b：桥接 + 语义检索返回真实结果
 臂A 直连 cbm            : 17 工具, 17308 B ≈ 4327 tokens
 臂B 代理·冷缓存         :  2 工具,  4278 B ≈ 1070 tokens  （省 4.0x）
 臂C 代理·缓存含resources:  3 工具,  4871 B ≈ 1218 tokens  （省 3.6x）
@@ -303,9 +318,11 @@ cbm CLI 同一台机器单次 search_graph        : 5491 / 6526 / 8280 ms  ← �
 
 | 症状 | 原因与处置 |
 |---|---|
+| `zg_zvec_grep_search` 报 `root: Invalid input: expected string` | `root` 是**必填**——工作区绝对路径（守护进程可见的那个）。代理不替模型填参数：让模型用它已知的会话工作目录传入即可 |
+| 模型调 `zvec_grep_search` 报 tool_not_found | 代理把 MCP 工具名**按 mcpServers 键加前缀**：经本插件的清单它叫 `zg_zvec_grep_search`（zg 直连才叫裸名）。usage prompt 已给对名字——看到裸名说明会话里是旧 bundle，`npm run sync` + 重启 |
 | 某次 grep 返回 `Error: dsh-codebase-memory：…` | 这是层 ② 的**拦截**，不是故障：默认 `enforce=off` 根本不拦，只有你显式设成 `deny-once`/`deny` 才会出现；`deny-once` 对同一会话同一符号**只拦一次**，reason 里已带 `search_graph` 命中。想彻底关掉：设置页一键，或 `{"enforce":"off"}` |
 | 设置页改了 `enforce`，但 grep 照样不被拦 | 先分清是"没生效"还是"合法放行"。`code_setup` 触发层那行现在报的是**实时值**，跟着设置页变就说明钩子每次调用都在重读配置（报表跟着变本身就是证据）。仍不拦的三种合法情形：pattern 被分成**字面量**（层 ② 只拦符号形）、代码图对该符号**无命中**、当前会话没有可绑定的工作区（cwd 不是路径，比如远程会话）。要确认钩子有没有跑，看 `telemetry.log` 里的 `intercept-*` 行 |
-| `codebase-memory` 行**没有「配置」按钮**（设置 → 插件） | 按钮由 `lib/client.js` 注册，且三个条件同时成立才出现——**每一个失败都不报错**，所以这条单独列出：① 宿主只有在 `describe()` 发现该 entry 有 volatile 字段时才 serve 命名空间，装进去的 `index.js` 若没有 `.volatile()` 就没有按钮（`node scripts/sync.mjs` 后重启）；② 槽 key 必须严格等于 `<包名>#<row id>`（本包是 `dsh-codebase-memory#codebase-memory`），只改 `cordis.patch.yml` 的行 id 不改 key，按钮就消失——所以 `npm run check:client` 从 patch 反解 key，不信 bundle 里的常量；③ bundle 必须是开着的（`@deepseek-ai/dsh-client-ui-plugin-manager` README：“The bundle's patch must declare the row under that id, and the registration exists while the bundle is on”）。客户端副本装歪会被 `code_setup` 的 `fileDrift` 报出来（`lib/client.js` 在 `RUNTIME_FILES` 里），但它不会告诉你按钮不见了。**页面上没有的字段**（`wrapperTools`/`interceptTools`/`contextHint`/`dirtyTracking`/`sessionRefresh`/`autoIndex`/`bootstrap`）仍是 composition 级：改 patch，重启宿主 |
+| `codebase-memory` 行**没有「配置」按钮**（设置 → 插件） | 按钮由 `lib/client.js` 注册，且三个条件同时成立才出现——**每一个失败都不报错**，所以这条单独列出：① 宿主只有在 `describe()` 发现该 entry 有 volatile 字段时才 serve 命名空间，装进去的 `index.js` 若没有 `.volatile()` 就没有按钮（`node scripts/sync.mjs` 后重启）；② 槽 key 必须严格等于 `<包名>#<row id>`（本包是 `dsh-codebase-memory#codebase-memory`），只改 `cordis.patch.yml` 的行 id 不改 key，按钮就消失——所以 `npm run check:client` 从 patch 反解 key，不信 bundle 里的常量；③ bundle 必须是开着的（`@deepseek-ai/dsh-client-ui-plugin-manager` README：“The bundle's patch must declare the row under that id, and the registration exists while the bundle is on”）。客户端副本装歪会被 `code_setup` 的 `fileDrift` 报出来（`lib/client.js` 在 `RUNTIME_FILES` 里），但它不会告诉你按钮不见了。**页面上没有的字段**（`wrapperTools`/`interceptTools`/`contextHint`/`dirtyTracking`/`sessionRefresh`/`autoIndex`/`bootstrap`/`zgEnabled`/`zgToolset`/`zgVendorDir`）仍是 composition 级：改 patch，重启宿主 |
 | `code_find` 提示"坐标很可能已过期" | 层 ⑤ 的自检生效了：返回的源码里没有那个符号名（上游 issue #1750 的静默错位）。跑一次 `code_index`；插件已经在后台补刷，但**别在补刷完成前信这些行号** |
 | 当前会话工具清单里没有 `code_index`/`code_setup`，但 `code_setup` 能调通 | 工具清单是**会话级快照**：新开的对话才看得到。"没列出"≠"没注册" |
 | `code_setup` 报 `status: NOT READY` | 看它给的缺失项与安装命令，照做后再调一次（它会重试自举，不用重启） |

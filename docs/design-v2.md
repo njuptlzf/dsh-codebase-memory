@@ -411,6 +411,28 @@ API（已核实，官方源码 `packages/core/agent/src/runtime-types.ts` + `pac
 
 ---
 
+## 6.2 语义检索层内置的核实结果（v0.5.0，接入 zvec-grep）
+
+用户验收 2026-10-09 判触发层"**还是软限制**"，要求研究把 [zvec-grep](https://github.com/zvec-ai/zvec-grep)（rg+BM25+向量的统一本地检索，阿里 Zvec 团队，Apache-2.0）内置进本插件。先跑了第 0 步（vendor 装包 + 真索引 + 延迟/命中基准），数据支持"内置"而不是"另起炉灶"，于是 v0.5.0 落**接入层**，v0.6.0 落**替换档**。核实出来的事实与据此的决策：
+
+| 事实（本机实测） | 决策 |
+|---|---|
+| 装包 190 pkg / 3min / **1230MB**，其中 `node-llama-cpp` 743MB + `onnxruntime-web` 90MB 是服务端推理后端，transformers.js 路径**根本不加载**；裁掉后 `--version` / 增量 `index`（2s）/ `query` 全过 | `install:zg` 装完即裁，**末尾 --version 自检**当门禁（裁剪装坏就报错并提示别用 `--omit=optional`）；vendor 净 **430MB** |
+| 引擎 0.11.0 的 15 工具面**没有向量检索**（`search_graph`=BM25/正则，`search_code`=graph-ranked text）；zg 对 `observeCall` 给出精确 span、对已漂移的 `scheduleDirtyRefresh` 坐标**比旧图更新鲜**、`.md` 非代码文件也能语义命中 | zg 定位是**补位不是重复**：语义/文档检索走 `zg_zvec_grep_search`，符号与调用关系仍走图谱，精确字面量仍走 grep——prompt 里三行路由就是这么写的 |
+| 查询延迟：守护进程冷起（含 32MiB 模型池）2.2s、热查询 symbol 1.42s / semantic 1.37s，rg 基线 1.09s；首次查询 3.3s | 清单里 zg 用 **`lazy`**（与 cbm 的 keep-alive 相反）：不需要 `auto_index`/watcher 抢启动，首用 2.2s 可接受，不常驻进程 |
+| 代理把工具名**按 mcpServers 键加前缀**：裸名 `zvec_grep_search` 经清单不可调，可调用名 `zg_zvec_grep_search`（实测 tool_not_found 的 suggest 就是它） | prompt 示例、check-chain 阶段 2b、README 全部用带前缀名 |
+| `root` 参数**必填**（"Absolute workspace root visible to the daemon"），缺省报 `root: Invalid input` | prompt 示例带 `"root":"<工作区绝对路径>"`；**替换档（v0.6.0）的卖点之一**：钩子调用可以拿会话 cwd 预填，模型一个字都不用填 |
+| `--mcp-toolset agent` 只露 1 个检索工具；`full` 另露受管 rg 与 4 个索引/状态工具 | 默认 `agent`：索引/守护进程管理留 CLI 与脏台账补刷链路，不给模型多余按钮 |
+| `cbm.json` 在 adapter **进程启动时**读取；zg 索引产物落仓库的 `.zvec-grep/` | `zgEnabled`/`zgToolset`/`zgVendorDir` **刻意不标 volatile、不进设置页**（页面画了就等于说谎，理由与 6.1"volatile 必须在决策点 `.get()`"同源反用）；要重启。`.zvec-grep/` 进 gitignore（本仓库已加） |
+| vendor 装包=430MB+32MiB 模型下载，属于"要人点头"的开销 | `resolveZg` 缺包只报 `missing` + 提示 `npm run install:zg`，**绝不自动装**（臂 Z 断言）；开关默认 `false`，关掉时清单/prompt/行为与 v0.4.0 完全一致 |
+
+新鲜度不另建 watcher：`dirtyTracking` 的后台补刷现在**两条腿**——图谱 `code_index`（git 闸门）+ `zg index`（不看 git，非 git 工作区也刷），遥测行 `zg-index-done/failed`。
+
+**v0.6.0（替换档）待核实的宿主问题**：`tools/pre-execute` 的 waterfall 能否**改写 exec 参数**后放行（真透明替换），还是只能 deny+reason（答案随拒绝送达）。前者要先在本机宿主 dist 里核 `PreToolDecision` 的实现，再定替换语义（符号形 grep → zg/graph 结果直通）。
+
+
+---
+
 ## 7. 参考链接
 
 **DSH**

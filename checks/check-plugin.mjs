@@ -288,6 +288,48 @@ async function verify(profile) {
   record('E 非 git 工作区被闸门跳过', mine.some((line) => /非 git 工作区/.test(line)), (mine.at(-1) ?? '(日志里没有本次记录)').slice(0, 130))
   rmSync(nonGit, { recursive: true, force: true })
 
+  // ── 臂 Z：语义检索层（zg）——清单接线与降级，全在临时目录，不碰真引擎 ─────────
+  // 引擎没有任何向量工具（0.11.0 实测 15 工具面），zg 是补位；这组臂证明
+  // "zgEnabled ⇒ cbm.json 出现第二个 server"以及所有降级路径，且默认关时清单干净。
+  record('Z 默认（真实清单）没有 zg server', manifest.mcpServers?.zg === undefined,
+    `实际: ${JSON.stringify(manifest.mcpServers?.zg ?? null)}`)
+  record('Z 默认 prompt 不提 zg（未装不画饼）', !prompt.includes('zvec_grep_search'))
+  const zgHome = join(tmpdir(), `cbm-check-zg-${process.pid}`)
+  rmSync(zgHome, { recursive: true, force: true })
+  const zgAdapter = join(zgHome, 'adapter')
+  const zgVendor = join(zgHome, 'vendor')
+  mkdirSync(join(zgAdapter, 'node_modules', '@njuptlzf', 'mcp-adapter'), { recursive: true })
+  mkdirSync(join(zgVendor, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli'), { recursive: true })
+  writeFileSync(join(zgAdapter, 'node_modules', '@njuptlzf', 'mcp-adapter', 'mcp-server.mjs'), '', 'utf8')
+  writeFileSync(join(zgVendor, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli', 'index.js'), '', 'utf8')
+  // cbm 探测只验 existsSync，但 bootstrap 会真的 spawn 它——0 字节假 exe 会让
+  // --version 当场抛错、清单永远写不出来。cmd.exe 是"存在的合法可执行文件"的最小
+  // 形态：喂给它 --version/config 只会快速非零退出，没有任何副作用。
+  const fakeExe = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe')
+  const zgBase = { adapterDir: zgAdapter, cbmPath: fakeExe }
+  const zReady = await mount({ ...zgBase, zgEnabled: true, zgVendorDir: zgVendor })
+  const zSetup = await zReady.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('Z 就绪报表列出语义层状态', /语义层\(zg\): ready/.test(zSetup), /^语义层\(zg\):.*$/m.exec(zSetup)?.[0]?.slice(0, 120) ?? '(没有 zg 行)')
+  record('Z 就绪 prompt 给出 zvec_grep_search 路由', /zvec_grep_search/.test(zReady.sections.map((s) => s.text?.()).join('\n')))
+  const zDoc = JSON.parse(readFileSync(join(zgAdapter, 'cbm.json'), 'utf8'))
+  record('Z 清单第二 server 走自带 stdio 桥', zDoc.mcpServers?.zg?.args?.includes('--stdio') === true
+    && zDoc.mcpServers?.zg?.args?.includes('server') === true, JSON.stringify(zDoc.mcpServers?.zg?.args ?? null))
+  record('Z zg 用 lazy（无启动竞态，daemon 按需起）', zDoc.mcpServers?.zg?.lifecycle === 'lazy'
+    && zDoc.mcpServers?.cbm?.lifecycle === 'keep-alive', `zg=${zDoc.mcpServers?.zg?.lifecycle} cbm=${zDoc.mcpServers?.cbm?.lifecycle}`)
+  const zOff = await mount({ ...zgBase })
+  await zOff.tools.get('code_setup').execute({}, withSignal(REPO)) // bootstrap 是惰性的：不跑一次工具，清单还是上一条写的
+  const zOffDoc = JSON.parse(readFileSync(join(zgAdapter, 'cbm.json'), 'utf8'))
+  record('Z zgEnabled=false 清单只有 cbm', Object.keys(zOffDoc.mcpServers).join() === 'cbm')
+  const zMissing = await mount({ ...zgBase, zgEnabled: true, zgVendorDir: join(zgHome, 'nope') })
+  const zMSetup = await zMissing.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('Z 装了开关但没装包 ⇒ missing + 指路 install:zg',
+    /语义层\(zg\): missing/.test(zMSetup) && /install:zg/.test(zMSetup),
+    /^语义层\(zg\):.*$/m.exec(zMSetup)?.[0]?.slice(0, 100) ?? '(没有 zg 行)')
+  const zBad = await mount({ ...zgBase, zgEnabled: true, zgVendorDir: zgVendor, zgToolset: 'turbo' })
+  const zBadSetup = await zBad.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('Z 非法 toolset 降级 agent 且留 note', /zgToolset="turbo" 非法/.test(zBadSetup) && /已按 agent/.test(zBadSetup))
+  rmSync(zgHome, { recursive: true, force: true })
+
   // ── 臂 F（可选，CBM_CHECK_REFRESH=1）：H2 的**正向**路径真的会刷新 ────────────
   // 默认不跑：它要建 git 仓库、真跑一次 index_repository（约 20–40s）。但它是这条链上
   // 唯一能证明"闸门放行后会真的刷新且第二次不再重复"的检查，所以留在仓库里可随时跑。

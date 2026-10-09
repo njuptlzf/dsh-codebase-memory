@@ -40,6 +40,8 @@ const PROXY_TOOL = 'mcp__cbm__mcp'
 
 /** 触发层（docs/design-v2.md）的常量。跨平台：内置工具是裸名小写（官方 tool-fs-search README 与实装一致）。 */
 const ENFORCE_MODES = ['off', 'deny-once', 'deny']
+/** 语义检索层（zvec-grep）的 MCP 工具集：agent 只暴露 zvec_grep_search；rg/index/status 走 CLI 与我们的后台补刷。 */
+const ZG_TOOLSETS = ['agent', 'full']
 /** 会写文件的内置工具（官方 tool-fs README：路径字段统一 snake_case `file_path`）。 */
 const WRITE_TOOLS = ['write', 'edit']
 const CODE_FILE = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|c|h|cc|cpp|hpp|cs|rb|php|swift|scala|vue|svelte|sql|sh|bash|ps1)$/i
@@ -76,6 +78,12 @@ export const Config = z.object({
   telemetry: z.boolean().default(true).volatile(),
   dirtyTracking: z.boolean().default(true),
   dirtyRefreshCooldownSec: z.number().default(120),
+  // ── 语义检索层（zvec-grep，可选，docs/design-v2.md 第 9 节）─────────────────
+  // zgEnabled 有意不标 volatile：它决定 cbm.json 里有没有第二个 server，而清单是
+  // bootstrap 写的、adapter 进程只在启动时读——热改不会生效，标了反而骗人。
+  zgEnabled: z.boolean().default(false),
+  zgToolset: z.string().default('agent'),
+  zgVendorDir: z.string().default(''),
 })
 
 const dshHome = () => process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -135,6 +143,14 @@ function normalize(config = {}) {
   cfg.contextHint = boolOf(config.contextHint, true, cfg.notes, 'contextHint')
   cfg.dirtyTracking = boolOf(config.dirtyTracking, true, cfg.notes, 'dirtyTracking')
   cfg.dirtyRefreshCooldownSec = positiveInt('dirtyRefreshCooldownSec', config.dirtyRefreshCooldownSec, 120, cfg.notes)
+  // 语义检索层：非法值一律降级 + note，boot 不抛（与其余字段同一纪律）。
+  cfg.zgEnabled = boolOf(config.zgEnabled, false, cfg.notes, 'zgEnabled')
+  if (config.zgToolset !== undefined && config.zgToolset !== '' && !ZG_TOOLSETS.includes(config.zgToolset)) {
+    cfg.notes.push(`zgToolset="${config.zgToolset}" 非法，已按 agent 处理（可选：${ZG_TOOLSETS.join('|')}）`)
+  }
+  cfg.zgToolset = ZG_TOOLSETS.includes(config.zgToolset) ? config.zgToolset : 'agent'
+  cfg.zgVendorDir = config.zgVendorDir || join(dshHome(), 'vendor', 'zvec-grep')
+  cfg.zgCli = join(cfg.zgVendorDir, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli', 'index.js')
   // enforce / interceptBudgetMs / telemetry 是 volatile 字段（设置页只写这三项），
   // 留成 getter 而不是快照：快照一次就等于"UI 里改了、钩子还在用旧值"。
   // 非法值只在归一化这一次记进 notes——getter 会被反复读，往里 push 会把 notes 灌满。
@@ -251,6 +267,18 @@ async function resolveCbm(ctx, cfg, state) {
   state.cbm = 'missing'
 }
 
+/**
+ * 语义检索层探测：只查 vendor 里的 CLI 在不在，**不自动安装**。
+ * 与 ensureAdapter 的差别是有意的：装 zg 要拖 ~430MB 依赖 + 首次下载嵌入模型，
+ * 那是用户的一次显式决定（`npm run install:zg`），后台 bootstrap 不许替用户花带宽。
+ */
+function resolveZg(cfg, state) {
+  if (!cfg.zgEnabled) { state.zg = 'off'; return }
+  if (existsSync(cfg.zgCli)) { state.zg = 'ready'; return }
+  state.zg = 'missing'
+  push(state, `zgEnabled=true 但找不到 ${cfg.zgCli}——先跑 npm run install:zg`)
+}
+
 /** 写 adapter 的服务器清单。二进制用绝对 .exe，绕开 .cmd shim。 */
 function writeAdapterConfig(cfg, state) {
   const doc = {
@@ -275,6 +303,19 @@ function writeAdapterConfig(cfg, state) {
         excludeTools: EXCLUDE_TOOLS,
       },
     },
+  }
+  // 语义检索层（可选）。`server --stdio` 是 zg 自带的 MCP 桥——"安全地拉起或复用共享
+  // daemon，代理完 MCP 后让 daemon 继续活着"——所以生命周期零代码。lifecycle 用 lazy
+  // 而不是 cbm 那条 keep-alive：zg 没有 auto_index/watcher 会抢跑，不存在启动竞态，
+  // 换来的是 daemon（含模型池）只在第一次用时才起（实测 2.2s），不常驻吃内存。
+  // toolset=agent：只暴露 1 个 zvec_grep_search；rg/index/status 是 CLI 与后台补刷的，不给模型。
+  if (state.zg === 'ready') {
+    doc.mcpServers.zg = {
+      command: process.execPath,
+      args: [cfg.zgCli, 'server', '--stdio', '--mcp-toolset', cfg.zgToolset],
+      lifecycle: 'lazy',
+      exposeResources: false,
+    }
   }
   mkdirSync(cfg.adapterDir, { recursive: true })
   writeFileSync(cfg.adapterConfig, JSON.stringify(doc, null, 2) + '\n', 'utf8')
@@ -315,6 +356,7 @@ async function bootstrap(ctx, cfg, state, signal, { force = false } = {}) {
   if (state.ok && !force) return state
   await ensureAdapter(ctx, cfg, state, signal)
   await resolveCbm(ctx, cfg, state)
+  resolveZg(cfg, state)
   if (state.cbm === 'ready') {
     const r = await run(ctx, [state.cbmPath, '--version'], { maxBytes: 64 * 1024, signal })
     state.cbmVersion = (r.stdout || r.stderr).trim().split('\n')[0]
@@ -443,6 +485,7 @@ function report(cfg, state) {
     `清单: ${state.configPath ?? '(未写)'}  exclude=${JSON.stringify(EXCLUDE_TOOLS)}`,
     `代理工具: ${PROXY_TOOL}  bootstrap=${cfg.bootstrap}  adapterVersion=${cfg.adapterVersion}`,
     `触发层: wrapper=${cfg.wrapperTools ? 'on' : 'off'}  enforce=${cfg.enforce}  intercept=${cfg.interceptTools.join('+') || '(无)'}  budget=${cfg.interceptBudgetMs}ms  dirty=${cfg.dirtyTracking ? 'on' : 'off'}(冷却 ${cfg.dirtyRefreshCooldownSec}s)  context=${cfg.contextHint ? 'on' : 'off'}`,
+    `语义层(zg): ${state.zg}  toolset=${cfg.zgToolset}  ${cfg.zgCli}`,
     // 只说 UI 真的能改的东西：volatile 是必要条件，页面只画了 enforce / telemetry。
     '热改: enforce / telemetry → 设置 → 插件 → dsh-codebase-memory → codebase-memory 行「配置」（不用重启）；interceptBudgetMs 也是 volatile，但只能改配置文件',
     `遥测计数: ${Object.entries(state.counts).map(([k, v]) => `${k}=${v}`).join(' ') || '(无事件)'}`,
@@ -464,7 +507,7 @@ function usageSection(state) {
       '先调用 `code_setup` 查看缺什么，按它给出的命令补齐后再用索引检索。',
     ].join('\n')
   }
-  return [
+  const lines = [
     '本工作区已接入 codebase-memory 代码索引（经 mcp-adapter 压成单个代理工具）。',
     '',
     '**首选封装动词**（project 与参数形状由插件填，你只管说要找什么）：',
@@ -484,7 +527,18 @@ function usageSection(state) {
     '  freshness=metadata_changed ⇒ 先 code_index。',
     '',
     '偏移量、实测样本与上游 issue 见本仓库 README 的「已知限制」。',
-  ].join('\n')
+  ]
+  // 语义路由段只在 zg 真的 ready 时出现：图谱引擎（0.11.0 实测）没有任何向量检索，
+  // 这段是唯一能说出"自然语言/文档检索"的地方——zg 没装就一个字都不提，不画饼。
+  if (state.zg === 'ready') {
+    lines.push(
+      '',
+      '**语义/文档检索**（图谱不做向量，这是补位不是重复）：代理工具调 `zg_zvec_grep_search`，',
+      'args {"root":"<工作区绝对路径>","query":"自然语言描述","limit":8}——root 必填；非代码文件（md/配置）也能命中。',
+      '找符号与调用关系仍用 code_find / code_callers，精确字面量仍用 grep——三者各有分工，别互相顶替。',
+    )
+  }
+  return lines.join('\n')
 }
 
 // ── H2：会话启动时的补偿刷新 ─────────────────────────────────────────────────
@@ -840,6 +894,19 @@ async function runCbmFlow(ctx, cfg, state, exec, work) {
 }
 
 /**
+ * 双驱动台账的后半：同一份"本会话写过代码"的事实，图谱补刷之外也喂给 zg 的增量
+ * index（实测 18 文件 ~2s；首次全量 22.7s）。不进图谱那条 withIndexLock——两条索引
+ * 互不相干，撞车的代价只是多跑一次 CLI。失败静默：查询会退回 eventual freshness，
+ * 结果里的 freshness 行自己会说话，不假装刷新过。
+ */
+async function refreshZgIndex(ctx, cfg, cwd, signal) {
+  const r = await run(ctx, [process.execPath, cfg.zgCli, 'index'], {
+    cwd, maxBytes: 256 * 1024, graceMs: 120000, signal,
+  })
+  return r.exitCode === 0
+}
+
+/**
  * 脏路径触发的后台补刷：冷却期内合并（同回合的多次写入自然并成一次）。
  * 复用 H2 那条带闸门的 refreshSessionWorkspace——它自己会验 git 状态是否真变了。
  */
@@ -849,6 +916,13 @@ function scheduleDirtyRefresh(ctx, cfg, state, sess, exec) {
   sess.lastRefreshAt = now
   const paths = [...sess.dirty]
   telemetry(cfg, state, 'dirty-refresh-scheduled', { paths: paths.length })
+  // zg 那半边不看 git 闸门：台账里有写入就值得刷（工作区甚至可以不是 git 仓库）。
+  const zgCwd = exec?.agent?.session?.header?.cwd
+  if (state.zg === 'ready' && zgCwd) {
+    void refreshZgIndex(ctx, cfg, zgCwd, state.abortSignal)
+      .then((ok) => telemetry(cfg, state, ok ? 'zg-index-done' : 'zg-index-failed', { paths: paths.length }))
+      .catch((error) => telemetry(cfg, state, 'zg-index-fail', { message: String(error?.message ?? error).slice(0, 200) }))
+  }
   void refreshSessionWorkspace(ctx, cfg, state, exec?.agent, state.abortSignal)
     .then((outcome) => {
       // 只有**真的重建过**才清账：被闸门挡下（非 git / 冷却 / 未索引）等于什么都没做，
@@ -895,6 +969,7 @@ export async function apply(ctx, config) {
   const cfg = normalize(config)
   const state = {
     adapter: 'unknown', cbm: 'unknown', ok: false, autoIndex: '', refreshing: new Set(), notes: [], lastError: '',
+    zg: 'off',
     sessions: new Map(), projectsByCwd: new Map(), counts: {}, indexJobs: new Map(),
   }
 
