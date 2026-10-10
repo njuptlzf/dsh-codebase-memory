@@ -87,7 +87,7 @@ Once enabled, `code_setup` gains a `语义层(zg): ready  包=已装  页面开�
 There is no npm package and no `dsh install` command — plugin installation *is* `dsh plugin <args>`, which runs pnpm in the profile directory. So install from the GitHub release directly:
 
 ```powershell
-dsh plugin --profile <your-profile> add github:njuptlzf/dsh-codebase-memory#v0.11.1
+dsh plugin --profile <your-profile> add github:njuptlzf/dsh-codebase-memory#v0.11.2
 ```
 
 Keep the `#<tag>` pin: a tag resolves to one commit, so a later `pnpm install` does not silently move under you. Bump the tag (or drop it to follow `main`) when you want a newer release.

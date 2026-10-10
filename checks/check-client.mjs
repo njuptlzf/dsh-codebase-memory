@@ -285,6 +285,36 @@ ok(layerText({ zgEnabled: true, stats: JSON.stringify({ zg: 'missing', zgInstall
 ok(layerText({ zgEnabled: true, stats: JSON.stringify({ zg: 'installing' }) }).includes('layer.zg.installing'),
   'agent 正在装（volatile 推帧）⇒ installing')
 
+// v0.11.2：五态文字必须分三档色，否则「开关已开、清单未重建」看起来和「已启用」
+// 一模一样，用户看不出待重启。断言取 zg 那行的 RVAL span 的 color 表达式。
+const zgColor = (v) => {
+  storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, ...v }, base: {}, user: {}, writable: true, revision: 16 }
+  return flatten(panel.component({ ...props }))
+    .filter((n) => typeof n.props?.children === 'string' && n.props.children.startsWith('layer.zg.'))
+    .map((n) => n.props.style?.color)
+    .filter(Boolean)
+    .pop() ?? null
+}
+const C_DEFAULT = 'var(--dsw-alias-label-secondary)'
+const C_WARN = 'var(--dsw-alias-warning, #d97706)'
+const C_ERROR = 'var(--dsw-alias-error, crimson)'
+ok(zgColor({ zgEnabled: false, stats: JSON.stringify({ zg: 'off' }) }) === C_DEFAULT,
+  'off ⇒ 常态灰（不是警示色，避免误报）', String(zgColor({ zgEnabled: false, stats: JSON.stringify({ zg: 'off' }) })))
+ok(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'ready' }) }) === C_DEFAULT,
+  'ready ⇒ 常态灰', String(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'ready' }) })))
+ok(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'off' }) }) === C_ERROR,
+  'pending-on ⇒ 报错红（zgEnabled:true 但清单没生效，用户配置没落地，真异常）', String(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'off' }) })))
+ok(zgColor({ zgEnabled: false, stats: JSON.stringify({ zg: 'ready' }) }) === C_WARN,
+  'pending-off ⇒ 警示橙', String(zgColor({ zgEnabled: false, stats: JSON.stringify({ zg: 'ready' }) })))
+ok(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'missing', zgInstalled: true }) }) === C_WARN,
+  'installed（包在、清单未重建）⇒ 警示橙', String(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'missing', zgInstalled: true }) })))
+ok(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'installing' }) }) === C_WARN,
+  'installing ⇒ 警示橙', String(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'installing' }) })))
+ok(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'missing' }) }) === C_ERROR,
+  'missing（包没装）⇒ 报错红', String(zgColor({ zgEnabled: true, stats: JSON.stringify({zg: 'missing' }) })))
+ok(zgColor({ zgEnabled: true }) === C_ERROR,
+  'unknown（遥测未推帧）⇒ 报错红', String(zgColor({ zgEnabled: true })))
+
 storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, zgEnabled: false, stats: JSON.stringify({ zg: 'off' }) }, base: {}, user: {}, writable: true, revision: 17 }
 tree = panel.component({ ...props })
 const zgEl = findType(tree, (n) => typeof n.type === 'function' && n.type.name === 'ZgToggle')

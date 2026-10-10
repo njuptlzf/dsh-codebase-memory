@@ -85,7 +85,7 @@ npm run install:zg          # 手动：npm 安装并裁剪（删 transformers.js
 本插件没有 npm 包，也没有 `dsh install` 命令——装插件就是 `dsh plugin <args>`，本质是在 profile 目录里跑 pnpm。所以直接从 GitHub 装：
 
 ```powershell
-dsh plugin --profile <你的profile> add github:njuptlzf/dsh-codebase-memory#v0.11.1
+dsh plugin --profile <你的profile> add github:njuptlzf/dsh-codebase-memory#v0.11.2
 ```
 
 `#<tag>` 要留着：tag 钉死一个 commit，之后 `pnpm install` 不会悄悄漂移。要更新时改 tag（或去掉 tag 跟随 `main`）。
