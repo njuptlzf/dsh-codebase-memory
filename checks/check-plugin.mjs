@@ -559,17 +559,17 @@ async function verify(profile) {
   const dirtyFind = await v.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: agentV, signal: sig() })
   record('G 默认 off 下写后记账照常工作（台账仍会把坐标标脏）', dirtyFind?.status === 'stale' && /index\.js/.test(dirtyFind?.text ?? ''), JSON.stringify(dirtyFind?.status))
 
-  // G7.5 volatile 契约（设置页的写路径 + 读数通道）：enforce / interceptBudgetMs /
-  // telemetry 必须①在 schema 上标 volatile——dsh-settings 只把 volatile 字段放进表单，写非 volatile
+  // G7.5 volatile 契约（设置页的写路径 + 读数通道）：六个设置页可写字段（enforce / interceptTools /
+  // interceptBudgetMs / contextHint / telemetry / dirtyTracking）必须①在 schema 上标 volatile——dsh-settings 只把 volatile 字段放进表单，写非 volatile
   // 字段直接抛 "Config field ... is not volatile"；②在钩子里读**引用当前值**——apply 时
   // 快照的话，UI 改了、拦截行为还是旧的，那比没有 UI 更糟。这里用假引用模拟 loader 的
   // _commitVolatile（它就是把新快照 updateVolatile 进同一个引用）。
   // stats 方向相反：不是用户可写项，是插件→页面的只读读数通道，但它同样必须 volatile
   // ——describe() 只把 volatile 字段解引用进快照，标错（或漏标）页面就永远看不到读数。
-  const VOLATILE_KEYS = ['enforce', 'interceptBudgetMs', 'telemetry', 'stats']
+  const VOLATILE_KEYS = ['enforce', 'interceptTools', 'interceptBudgetMs', 'contextHint', 'telemetry', 'dirtyTracking', 'stats']
   // schemastery 的字段表在 `Config.dict`（宿主 dsh-settings 的 volatileForm 也是递归它）。
   const marked = VOLATILE_KEYS.filter((k) => Config?.dict?.[k]?.meta?.volatile === true)
-  record('G 三项热字段 + 读数通道在 Config 里标了 volatile（宿主才肯 serve/写）', marked.length === 4, `标了的是 ${marked.join(',') || '(无)'}`)
+  record('G 六个可热改字段 + 读数通道在 Config 里标了 volatile（宿主才肯 serve/写）', marked.length === 7, `标了的是 ${marked.join(',') || '(无)'}`)
   const extra = Object.keys(Config?.dict ?? {}).filter((k) => Config.dict[k]?.meta?.volatile === true && !VOLATILE_KEYS.includes(k))
   record('G 没有把需要重启的字段标成 volatile（标错等于对 UI 撒谎）', extra.length === 0, extra.join(','))
 
@@ -621,13 +621,13 @@ async function verify(profile) {
   // "accept keeps the call successful (replacing content when given)"；pre-execute
   // 不能改写参数——"Input rewriting is excluded", index.d.ts:442-443，实参
   // deepFreeze）。语义：grep 照常跑、照常成功；换的只是模型看到的内容。前提不满足
-  // /失败结果/图谱无命中 ⇒ 保留原输出，且全程不出 isError。dirtyTracking:false 的
-  // 挂载里 post-execute 只有 replace 监听一个，索引 0 就是它；记账开着时它在 1。
+  // /失败结果/图谱无命中 ⇒ 保留原输出，且全程不出 isError。记账监听器常驻
+  // （v0.9.0 热翻契约）⇒ post-execute 索引 0 永远是记账，replace 在 1。
   const rCalls = []
   const r = await mount({ enforce: 'replace', dirtyTracking: false }, makeStubProxy(rCalls, { project: `stub-${process.pid}-rep` }))
   await r.tools.get('code_setup').execute({}, withSignal(REPO))
   const preR = (r.events['tools/pre-execute'] ?? [])[0]
-  const postR = (r.events['tools/post-execute'] ?? [])[0]
+  const postR = (r.events['tools/post-execute'] ?? [])[1]
   const agentR = fakeAgent(`sess-${process.pid}-rep`, REPO)
   const rAllow = await preR(grepExec(agentR, 'usageSection'), next)
   record('R replace 档不拦截：grep 照常执行（替换是后置的）', rAllow?.kind === 'allow', JSON.stringify(rAllow))
@@ -647,7 +647,7 @@ async function verify(profile) {
   const rnCalls = []
   const rn = await mount({ enforce: 'replace', dirtyTracking: false, telemetry: false }, makeStubProxy(rnCalls, { project: `stub-${process.pid}-rnohit`, emptySearch: true }))
   await rn.tools.get('code_setup').execute({}, withSignal(REPO))
-  const rNoHit = await (rn.events['tools/post-execute'] ?? [])[0](grepExec(fakeAgent(`sess-${process.pid}-rnohit`, REPO), 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  const rNoHit = await (rn.events['tools/post-execute'] ?? [])[1](grepExec(fakeAgent(`sess-${process.pid}-rnohit`, REPO), 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
   record('R 图谱无命中时保留原输出：没答案就不换，grep 才是对的工具', rNoHit?.kind === 'accept' && rNoHit?.content === undefined, JSON.stringify(rNoHit).slice(0, 90))
   const rdCalls = []
   const rd = await mount({ enforce: 'replace' }, makeStubProxy(rdCalls, { project: `stub-${process.pid}-rdirty` }))
@@ -662,7 +662,7 @@ async function verify(profile) {
   let flipRep = 'off'
   const rf = await mount({ enforce: { get: () => flipRep }, dirtyTracking: false, telemetry: false }, makeStubProxy([], { project: `stub-${process.pid}-rflip` }))
   await rf.tools.get('code_setup').execute({}, withSignal(REPO))
-  const postRf = (rf.events['tools/post-execute'] ?? [])[0]
+  const postRf = (rf.events['tools/post-execute'] ?? [])[1]
   const flipBefore = await postRf(grepExec(fakeAgent(`sess-${process.pid}-rflip`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
   flipRep = 'replace'
   const flipAfter = await postRf(grepExec(fakeAgent(`sess-${process.pid}-rflip`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
@@ -685,7 +685,7 @@ async function verify(profile) {
     !!spBoot && typeof spBoot.at === 'number' && (spBoot.replace?.hit ?? -1) === 0, String(sRef.get()).slice(0, 60))
   await s.tools.get('code_setup').execute({}, withSignal(REPO))
   const agentS = fakeAgent(`sess-${process.pid}-stats`, REPO)
-  await (s.events['tools/post-execute'] ?? [])[0](grepExec(agentS, 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  await (s.events['tools/post-execute'] ?? [])[1](grepExec(agentS, 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
   await s.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: agentS, signal: sig() })
   const sHint = (s.contexts ?? []).find((c) => c.name === 'codebase-memory:hint')
   sHint?.text({ agent: fakeAgent(`sess-${process.pid}-stats`, REPO, codeAsk) })
@@ -701,7 +701,7 @@ async function verify(profile) {
   const sOff = mkVolRef('')
   const so = await mount({ enforce: 'replace', dirtyTracking: false, telemetry: false, stats: sOff }, makeStubProxy([], { project: `stub-${process.pid}-soff` }))
   await so.tools.get('code_setup').execute({}, withSignal(REPO))
-  await (so.events['tools/post-execute'] ?? [])[0](grepExec(fakeAgent(`sess-${process.pid}-soff`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
+  await (so.events['tools/post-execute'] ?? [])[1](grepExec(fakeAgent(`sess-${process.pid}-soff`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
   record('S 遥测关 ⇒ 不推读数也不 emit（页面与日志同一开关，冻结在最后值）',
     sOff.get() === '' && !(so.emits ?? []).some((x) => x[0] === 'settings/document-updated'), String(sOff.get()).slice(0, 40))
 
@@ -711,7 +711,7 @@ async function verify(profile) {
   const r2Calls = []
   const r2 = await mount({ enforce: 'replace', dirtyTracking: false, telemetry: false }, makeStubProxy(r2Calls, { project: `stub-${process.pid}-rscope` }))
   await r2.tools.get('code_setup').execute({}, withSignal(REPO))
-  const postR2 = (r2.events['tools/post-execute'] ?? [])[0]
+  const postR2 = (r2.events['tools/post-execute'] ?? [])[1]
   const agentR2 = fakeAgent(`sess-${process.pid}-rscope`, REPO)
   const outSwap = await postR2(grepExec(agentR2, 'usageSection', { path: ADAPTER_DIR }), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
   record('R2 搜工作区之外的 grep 原样保留（不查两层、不换）',
@@ -725,7 +725,7 @@ async function verify(profile) {
   const r3Ref = mkVolRef('')
   const r3 = await mount({ enforce: 'replace', dirtyTracking: false, stats: r3Ref }, makeStubProxy([], { project: `stub-${process.pid}-rerr`, errorSearch: true }))
   await r3.tools.get('code_setup').execute({}, withSignal(REPO))
-  const r3Swap = await (r3.events['tools/post-execute'] ?? [])[0](grepExec(fakeAgent(`sess-${process.pid}-rerr`, REPO), 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  const r3Swap = await (r3.events['tools/post-execute'] ?? [])[1](grepExec(fakeAgent(`sess-${process.pid}-rerr`, REPO), 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
   let r3Stats = null
   try { r3Stats = JSON.parse(String(r3Ref.get())) } catch { /* 下一条断言报出来 */ }
   record('R3 Error 文本判为失败：不替换，且计成 passFailed 而非 noHit',
@@ -742,10 +742,51 @@ async function verify(profile) {
   record('S2 重启不归零：开机从累计文件播种，第一帧读数就带历史数',
     (s2Boot?.replace?.hit ?? 0) === 7 && (s2Boot?.replace?.graph ?? 0) === 5, String(s2Ref.get()).slice(0, 120))
   await s2.tools.get('code_setup').execute({}, withSignal(REPO))
-  await (s2.events['tools/post-execute'] ?? [])[0](grepExec(fakeAgent(`sess-${process.pid}-s2`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
+  await (s2.events['tools/post-execute'] ?? [])[1](grepExec(fakeAgent(`sess-${process.pid}-s2`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
   const s2File = JSON.parse(String(readFileSync(seedFile, 'utf8')))
   record('S2 新事件落盘：与文件 max 合并（7→8），不是覆盖也不是只留内存',
     (s2File['intercept-replace'] ?? 0) === 8 && (s2File['intercept-replace:graph'] ?? 0) === 6, JSON.stringify(s2File).slice(0, 170))
+
+  // ── 臂 T：v0.9.0 新上设置页三字段的**热翻契约**——监听器常驻、字段在决策点现读。
+  // 这是"页面不说谎"的机器证明：翻引用不重挂载，行为当场跟着变。
+  let flipDt = true
+  let flipHint = true
+  let flipTools = 'grep'
+  const t = await mount({
+    enforce: 'replace', telemetry: false, stats: mkVolRef(''),
+    dirtyTracking: { get: () => flipDt },
+    contextHint: { get: () => flipHint },
+    interceptTools: { get: () => flipTools },
+  }, makeStubProxy([], { project: `stub-${process.pid}-hot` }))
+  await t.tools.get('code_setup').execute({}, withSignal(REPO))
+  const tBook = (t.events['tools/post-execute'] ?? [])[0]
+  const tRep = (t.events['tools/post-execute'] ?? [])[1]
+  const editExec = (agent) => ({ name: 'edit', arguments: { file_path: join(REPO, 'index.js') }, agent, signal: sig() })
+  const agentT1 = fakeAgent(`sess-${process.pid}-hot1`, REPO)
+  await tBook(editExec(agentT1), { content: [], isError: false }, nextPost)
+  const yieldDirty = await tRep(grepExec(agentT1, 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
+  flipDt = false
+  const agentT2 = fakeAgent(`sess-${process.pid}-hot2`, REPO)
+  await tBook(editExec(agentT2), { content: [], isError: false }, nextPost)
+  const swapAfterOff = await tRep(grepExec(agentT2, 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
+  record('T 热翻 dirtyTracking 立即开合记账：开着脏台账让路，关了不再入册',
+    yieldDirty?.content === undefined && /stubSymbol/.test(swapAfterOff?.content?.[0]?.text ?? ''),
+    `on→${JSON.stringify(yieldDirty).slice(0, 30)} off→${JSON.stringify(swapAfterOff).slice(0, 40)}`)
+  const tHint = (t.contexts ?? []).find((c) => c.name === 'codebase-memory:hint')
+  const hintAgent = fakeAgent(`sess-${process.pid}-hot3`, REPO, codeAsk)
+  const hintOn = typeof tHint?.text === 'function' ? tHint.text({ agent: hintAgent }) : 'x'
+  flipHint = false
+  const hintOff = typeof tHint?.text === 'function' ? tHint.text({ agent: hintAgent }) : 'x'
+  record('T 热翻 contextHint 立即静音注入（监听器常驻，回调里现读）',
+    /code_find/.test(String(hintOn)) && hintOff === '', `on=${String(hintOn).slice(0, 40)} off=${JSON.stringify(hintOff)}`)
+  const agentT4 = fakeAgent(`sess-${process.pid}-hot4`, REPO)
+  const globExec = { name: 'glob', arguments: { pattern: 'usageSection' }, agent: agentT4, signal: sig() }
+  const globNarrow = await tRep(globExec, { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
+  flipTools = 'grep,glob'
+  const globWide = await tRep(globExec, { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
+  record('T 热翻 interceptTools 立即开合名单：glob 不在名单不碰，进了名单照换',
+    globNarrow?.content === undefined && /stubSymbol/.test(globWide?.content?.[0]?.text ?? ''),
+    `['grep']→${JSON.stringify(globNarrow).slice(0, 30)} ['grep,glob']→${JSON.stringify(globWide).slice(0, 40)}`)
 
   rmSync(tRepo, { recursive: true, force: true })
 

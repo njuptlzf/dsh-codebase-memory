@@ -68,20 +68,24 @@ export const Config = z.object({
   sessionRefresh: z.boolean().default(true),
   // ── 触发层（docs/design-v2.md 4.8）：每个杠杆独立开关，全部可回滚 ──────────
   wrapperTools: z.boolean().default(true),
-  // enforce / interceptBudgetMs / telemetry 标了 volatile：宿主的设置表单只暴露
-  // volatile 字段（dsh-settings 写非 volatile 字段直接 throw），并且改动由 loader
-  // 推进同一个引用、**不用重启**就生效。其余字段仍是 apply 时的快照，改了要重启。
+  // enforce / interceptTools / interceptBudgetMs / contextHint / telemetry /
+  // dirtyTracking / stats 标了 volatile：宿主的设置表单只暴露 volatile 字段
+  // （dsh-settings 写非 volatile 字段直接 throw），并且改动由 loader 推进同一个
+  // 引用、**不用重启**就生效。标 volatile 的前提是**决策点现读**（normalize 里挂
+  // getter，钩子每次调用重读）——注册期快照的字段标了就是让页面说谎，所以
+  // wrapperTools（tools.register 只在 apply 跑一次，没有反注册）与 zg*（清单是
+  // bootstrap 写的）等仍留在文件级。其余普通字段改了要重启。
   enforce: z.string().default('off').volatile(),
-  interceptTools: z.string().default('grep,glob'),
+  interceptTools: z.string().default('grep,glob').volatile(),
   interceptBudgetMs: z.number().default(2500).volatile(),
-  contextHint: z.boolean().default(true),
+  contextHint: z.boolean().default(true).volatile(),
   telemetry: z.boolean().default(true).volatile(),
   // stats 是**插件→设置页**的读数通道，不是用户配置：pushStats 把计数推进这个引用，
   // 宿主 describe() 用 plainConfig 读同一引用（dsh-settings/lib/index.js:98,436），
   // 浏览器收到转发的 settings/document-updated 后重读。写成 JSON 字符串是为了让
   // zod 校验始终成立（volatileForm 也会带上它，但面板只读、不渲染输入框）。不落盘。
   stats: z.string().default('').volatile(),
-  dirtyTracking: z.boolean().default(true),
+  dirtyTracking: z.boolean().default(true).volatile(),
   dirtyRefreshCooldownSec: z.number().default(120),
   // ── 语义检索层（zvec-grep，可选，docs/design-v2.md 第 9 节）─────────────────
   // zgEnabled 有意不标 volatile：它决定 cbm.json 里有没有第二个 server，而清单是
@@ -156,9 +160,6 @@ function normalize(config = {}) {
   }
   // 触发层
   cfg.wrapperTools = boolOf(config.wrapperTools, true, cfg.notes, 'wrapperTools')
-  cfg.interceptTools = csv(config.interceptTools || 'grep,glob')
-  cfg.contextHint = boolOf(config.contextHint, true, cfg.notes, 'contextHint')
-  cfg.dirtyTracking = boolOf(config.dirtyTracking, true, cfg.notes, 'dirtyTracking')
   cfg.dirtyRefreshCooldownSec = positiveInt('dirtyRefreshCooldownSec', config.dirtyRefreshCooldownSec, 120, cfg.notes)
   // 语义检索层：非法值一律降级 + note，boot 不抛（与其余字段同一纪律）。
   cfg.zgEnabled = boolOf(config.zgEnabled, false, cfg.notes, 'zgEnabled')
@@ -168,8 +169,8 @@ function normalize(config = {}) {
   cfg.zgToolset = ZG_TOOLSETS.includes(config.zgToolset) ? config.zgToolset : 'agent'
   cfg.zgVendorDir = config.zgVendorDir || join(dshHome(), 'vendor', 'zvec-grep')
   cfg.zgCli = join(cfg.zgVendorDir, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli', 'index.js')
-  // enforce / interceptBudgetMs / telemetry 是 volatile 字段（设置页只写这三项），
-  // 留成 getter 而不是快照：快照一次就等于"UI 里改了、钩子还在用旧值"。
+  // 设置页可写字段（enforce/interceptTools/budget/contextHint/telemetry/dirtyTracking）
+  // 全部留成 getter 而不是快照：快照一次就等于"UI 里改了、钩子还在用旧值"。
   // 非法值只在归一化这一次记进 notes——getter 会被反复读，往里 push 会把 notes 灌满。
   const enforceRaw = live(config.enforce)
   if (enforceRaw !== undefined && !ENFORCE_MODES.includes(enforceRaw)) {
@@ -177,9 +178,16 @@ function normalize(config = {}) {
   }
   positiveInt('interceptBudgetMs', live(config.interceptBudgetMs), 2500, cfg.notes)
   boolOf(live(config.telemetry), true, cfg.notes, 'telemetry')
+  boolOf(live(config.contextHint), true, cfg.notes, 'contextHint')
+  boolOf(live(config.dirtyTracking), true, cfg.notes, 'dirtyTracking')
   defineLive(cfg, 'enforce', () => (ENFORCE_MODES.includes(live(config.enforce)) ? live(config.enforce) : 'off'))
   defineLive(cfg, 'interceptBudgetMs', () => positiveInt('interceptBudgetMs', live(config.interceptBudgetMs), 2500, []))
   defineLive(cfg, 'telemetry', () => boolOf(live(config.telemetry), true, [], 'telemetry'))
+  // v0.9.0：这三个也上了设置页 ⇒ 同一纪律。interceptTools 是决策点现读的名单
+  // （csv 对任何字符串都成立，非法只可能是"写错工具名"，那本来就是空名单语义）。
+  defineLive(cfg, 'interceptTools', () => csv(live(config.interceptTools) || 'grep,glob'))
+  defineLive(cfg, 'contextHint', () => boolOf(live(config.contextHint), true, [], 'contextHint'))
+  defineLive(cfg, 'dirtyTracking', () => boolOf(live(config.dirtyTracking), true, [], 'dirtyTracking'))
   cfg.adapterMjs = join(cfg.adapterDir, 'node_modules', '@njuptlzf', 'mcp-adapter', 'mcp-server.mjs')
   cfg.adapterConfig = join(cfg.adapterDir, 'cbm.json')
   return cfg
@@ -1444,8 +1452,9 @@ export async function apply(ctx, config) {
   }
 
   // ── 杠杆 ⑤：写后记账（tools/post-execute）。只记账，绝不回 additionalContexts
-  // ——④ advise 事件注入已于 2026-10-08 验收撤回。───────────────────────────────
-  if (cfg.dirtyTracking && typeof ctx.on === 'function') {
+  // ——④ advise 事件注入已于 2026-10-08 验收撤回。监听器常驻，dirtyTracking
+  // 在 observeCall 里现读：设置页热翻立即开合记账通道（v0.9.0）。────────────────
+  if (typeof ctx.on === 'function') {
     ctx.on('tools/post-execute', async (exec, result, next) => {
       try {
         observeCall(ctx, cfg, state, exec, result)
@@ -1510,12 +1519,15 @@ export async function apply(ctx, config) {
   }
 
   // ── 杠杆 ③：按 query 条件注入（易变状态进 context，绝不进常驻段）──────────────
-  if (cfg.contextHint && ctx.systemPrompt?.context) {
+  // 监听器常驻、contextHint 在回调里现读：设置页热翻立即开合注入通道
+  // （v0.9.0——注册期快照的话页面就会说谎）。
+  if (ctx.systemPrompt?.context) {
     ctx.effect(() => ctx.systemPrompt.context({
       name: 'codebase-memory:hint',
       order: 130, // 宿主已占的槽位是 110/115/120（sandbox/approval/delegation）
       text: (assembly) => {
         try {
+          if (!cfg.contextHint) return '' // 关着：一行都不注入，也不计数
           if (!state.ok) return '' // 链路没就绪就别推荐
           const agent = assembly?.agent
           const cwd = agent?.session?.header?.cwd

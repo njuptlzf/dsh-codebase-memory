@@ -505,6 +505,16 @@ v0.8.0 验收截图（m02738）：措辞已生效，但运行读数仍是一行"
 
 教训：**给决策者看的每个数，先问它会不会说谎**。会伪造坐标的替换比不替换更坏；会把故障混进"无命中率"的占比比没有占比更坏。臂 R2/R3/S2（+5，双臂 ×2，186→196）就是这三问的回归锁。
 
+## 6.8 其余字段上设置页：能热改才配被热改（v0.9.0）
+
+用户（m02897）指着 0.8.2 页脚那行"其余字段仍需改 cordis.patch.yml 并重启"问：能不能也放到设置页？答案是分三类，判据只有一条——**宿主写路径（dsh-settings `write()`）物理拒绝非 volatile 字段，而 volatile 的语义承诺是"改了当场算数"**。所以"上页面"不是画控件，是把字段改到配得上被标 volatile：
+
+1. **本来就热、页面漏画**：`interceptBudgetMs`（v0.7.0 起就是 volatile，钩子每次 `.get()` 现读）——补个输入框了事。
+2. **语义可热、实现说了谎**：`interceptTools` / `contextHint` / `dirtyTracking` 原本在 **apply 期取快照 + 注册期门闸**（`if (cfg.dirtyTracking) ctx.on(...)`、`if (cfg.contextHint) ctx.systemPrompt.context(...)`）——直接标 volatile 会得到一个"页面上能翻、下个会话才生效"的假开关。改法：监听器**常驻注册**，门闸挪进回调第一行现读（deny 钩子 v0.3.0 就是这个形状，照抄）。代价如实记录：记账监听器从此永远占 post-execute[0]，replace 监听器一律后移到 [1]——harness 12 处索引引用逐一审计（8 处改、4 处不变），臂 T 三条断言（翻 `dirtyTracking` 记账当场开合 / 翻 `contextHint` 回调变 `''` / 翻 `interceptTools` glob 当场被换）就是"不重挂载、当场变"的回归锁。
+3. **结构上热不了，别装**：`wrapperTools`（`tools.register` 无注销）、`zgEnabled`/`zgToolset`/`zgVendorDir`（`cbm.json` 清单在适配层进程启动时才读）、`bootstrap`/`adapterDir`/`cbmPath`/`autoIndex`/`sessionRefresh`（apply 期语义）。这些留在配置文件，页脚文案点名它们，并写明**为什么**不能热——页面的诚实比页面的字段数重要。
+
+顺带两个小决定：输入框只在 blur/回车且值合法时写（非法值拨回当前值，一个字节都不写）——开关即时写是既有语义，文本框逐键写会把一次编辑变成一串文档写；`dirtyRefreshCooldownSec` 有热读语义但刻意不上页（调优参数，不是决策参数，页面每多一个控件就多一份维护契约）。臂数 196→202。
+
 ---
 
 ## 7. 参考链接

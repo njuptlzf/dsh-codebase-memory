@@ -157,8 +157,13 @@ for (const lang of ['zh', 'en']) ok(!!dictEntry?.dict?.[lang], `字典有 ${lang
 const keys = Object.keys(dictEntry?.dict?.zh || {})
 for (const key of ['title', 'summary', 'loading', 'unavailable', 'enforce.label', 'telemetry.label', 'reset', 'saveFailed', 'foot',
   'stats.label', 'stats.empty', 'stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index', 'stats.updated',
-  'stats.r.graph', 'stats.r.zg']) {
+  'stats.r.graph', 'stats.r.zg',
+  'hint.label', 'hint.hint', 'dirty.label', 'dirty.hint', 'interceptBudgetMs.label', 'interceptBudgetMs.hint',
+  'interceptTools.label', 'interceptTools.hint']) {
   ok(keys.includes(key), `字典有 key ${key}`)
+}
+for (const key of ['hint.label', 'dirty.label', 'interceptBudgetMs.label', 'interceptTools.label']) {
+  ok(Object.keys(dictEntry?.dict?.en || {}).includes(key), `en 字典有 key ${key}`)
 }
 for (const mode of modes) {
   ok(keys.includes(`enforce.${mode}`) && keys.includes(`enforce.${mode}.hint`), `字典覆盖模式 ${mode}`)
@@ -187,8 +192,10 @@ ok(JSON.stringify(segValues) === JSON.stringify(modes), '分段控件的选项 =
 ok(seg?.props?.value === 'deny-once', '分段控件当前值取自主机快照', seg?.props?.value)
 ok(seg?.props?.disabled === false, 'writable 时控件可用')
 const switches = flatten(tree).filter((n) => n.type === primitives.Switch)
-ok(switches.length === 1, '渲染出 1 个 Switch（telemetry）', String(switches.length))
+ok(switches.length === 3, '渲染出 3 个 Switch（telemetry / contextHint / dirtyTracking）', String(switches.length))
 ok(switches[0]?.props?.checked === true, 'telemetry=true → checked', String(switches[0]?.props?.checked))
+ok(switches[1]?.props?.checked === true && switches[2]?.props?.checked === true,
+  'contextHint / dirtyTracking 缺省即开（!== false 判定）', `${switches[1]?.props?.checked}|${switches[2]?.props?.checked}`)
 
 // 点击：改写宿主表单，而不是本地状态。
 seg.props.onChange('deny')
@@ -206,6 +213,37 @@ ok(JSON.stringify(calls.unset) === JSON.stringify(['enforce']), '按钮走 form.
 storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: false }, base: {}, user: {}, writable: false, revision: 9 }
 tree = panel.component({ ...props })
 ok(findType(tree, (n) => n.type === primitives.SegmentedControl)?.props?.disabled === true, 'writable=false → 控件禁用', JSON.stringify(findType(tree, (n) => n.type === primitives.SegmentedControl)?.props?.disabled))
+
+/* ---- 5b. v0.9.0 新控件：contextHint/dirtyTracking 开关 + 预算/名单 blur 输入 ---- */
+storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, contextHint: false, dirtyTracking: true, interceptBudgetMs: 2500, interceptTools: 'grep,glob' }, base: {}, user: { contextHint: false }, writable: true, revision: 15 }
+tree = panel.component({ ...props })
+const sw2 = flatten(tree).filter((n) => n.type === primitives.Switch)
+calls.set.length = 0
+sw2[1].props.onChange(true)
+ok(sw2[1].props.checked === false, 'contextHint=false → 开关显示关（缺省开只属于 !== false）', String(sw2[1].props.checked))
+const inputs = flatten(tree).filter((n) => n.type === primitives.Input)
+ok(inputs.length === 2, '两个输入框（interceptBudgetMs / interceptTools）', String(inputs.length))
+ok(inputs[0]?.props?.type === 'number' && inputs[0]?.props?.defaultValue === 2500
+  && inputs[1]?.props?.defaultValue === 'grep,glob', '输入框回填主机快照当前值', `${inputs[0]?.props?.defaultValue}|${inputs[1]?.props?.defaultValue}`)
+inputs[0].props.onBlur({ target: { value: '1800' } })
+ok(JSON.stringify(calls.set) === JSON.stringify([['contextHint', true], ['interceptBudgetMs', 1800]]),
+  '开关即时写；blur 且值合法才写表单（数字已解析）', JSON.stringify(calls.set))
+const badNum = { value: 'abc' }
+const badCsv = { value: '   ' }
+inputs[0].props.onBlur({ target: badNum })
+inputs[1].props.onBlur({ target: badCsv })
+ok(calls.set.length === 2 && badNum.value === '2500' && badCsv.value === 'grep,glob',
+  '非法/空值一个字节都不写，输入框拨回当前值', `${badNum.value}|${badCsv.value}`)
+let blurred = 0
+const fakeTarget = { blur: () => { blurred += 1 } }
+inputs[1].props.onKeyDown({ key: 'Enter', currentTarget: fakeTarget })
+inputs[1].props.onKeyDown({ key: 'a', currentTarget: fakeTarget })
+ok(blurred === 1, '回车即提交（走 blur），普通按键不打扰表单', String(blurred))
+calls.unset.length = 0
+const btns2 = flatten(tree).filter((n) => n.props && typeof n.props.onClick === 'function')
+ok(btns2.length === 1, 'user 层只有 contextHint ⇒ 恰一个「恢复默认」', String(btns2.length))
+btns2[0].props.onClick()
+ok(JSON.stringify(calls.unset) === JSON.stringify(['contextHint']), '新字段的恢复默认同样走 form.unset', JSON.stringify(calls.unset))
 
 storeSnapshot = { status: 'loading', value: {}, base: {}, user: {}, writable: false, revision: 0 }
 tree = panel.component({ ...props })
