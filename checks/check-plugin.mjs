@@ -57,6 +57,11 @@ const record = (label, ok, detail = '') => {
   console.log(`  ${ok ? 'PASS' : 'FAIL'} ${label}${detail ? '  ' + detail : ''}`)
 }
 
+// 生产里 volatile 引用由 loader 造（cosmokit createVolatile）；验收环境没装 cosmokit，
+// 用 Symbol.for('cosmokit.volatile.write') 手捏同形状引用——isVolRef 认的是全局
+// symbol 注册表（cosmokit 跨副本同一），形状对了语义就对了。
+const mkVolRef = (v) => { let cur = v; return { get: () => cur, [Symbol.for('cosmokit.volatile.write')]: (next) => { cur = next } } }
+
 /**
  * 假代理工具：把 `mcp__cbm__mcp` 的形状照抄下来（content[0].text = cbm 的返回），
  * 但不起真引擎——这样封装工具 / 拦截 / 记账的**决策逻辑**可证伪，而不用等
@@ -329,6 +334,7 @@ async function verify(profile) {
   const zReady = await mount({ ...zgBase, zgEnabled: true, zgVendorDir: zgVendor })
   const zSetup = await zReady.tools.get('code_setup').execute({}, withSignal(REPO))
   record('Z 就绪报表列出语义层状态', /语义层\(zg\): ready/.test(zSetup), /^语义层\(zg\):.*$/m.exec(zSetup)?.[0]?.slice(0, 120) ?? '(没有 zg 行)')
+  record('Z 就绪报表三轴齐全（清单事实 / 包实测 / 页面开关）', /ready  包=已装  页面开关=on/.test(zSetup), /^语义层\(zg\):.*$/m.exec(zSetup)?.[0]?.slice(0, 140) ?? '(没有 zg 行)')
   record('Z 就绪 prompt 给出 zvec_grep_search 路由', /zvec_grep_search/.test(zReady.sections.map((s) => s.text?.()).join('\n')))
   const zDoc = JSON.parse(readFileSync(join(zgAdapter, 'cbm.json'), 'utf8'))
   record('Z 清单第二 server 走自带 stdio 桥', zDoc.mcpServers?.zg?.args?.includes('--stdio') === true
@@ -347,6 +353,43 @@ async function verify(profile) {
   const zBad = await mount({ ...zgBase, zgEnabled: true, zgVendorDir: zgVendor, zgToolset: 'turbo' })
   const zBadSetup = await zBad.tools.get('code_setup').execute({}, withSignal(REPO))
   record('Z 非法 toolset 降级 agent 且留 note', /zgToolset="turbo" 非法/.test(zBadSetup) && /已按 agent/.test(zBadSetup))
+
+  // ── v0.11.0：三轴读数 / 页面开关的延迟态 / agent 安装路线（全在临时目录，already 分支不触网）──
+  const zWantRef = mkVolRef(false)
+  const zStats = mkVolRef('')
+  const zPend = await mount({ ...zgBase, zgEnabled: zWantRef, zgVendorDir: join(zgHome, 'nope'), stats: zStats })
+  let zp = null
+  try { zp = JSON.parse(String(zStats.get())) } catch { /* 下一条断言会报出来 */ }
+  record('Z stats 载荷三轴齐全（zg / zgWant / zgInstalled）',
+    !!zp && typeof zp.zg === 'string' && typeof zp.zgWant === 'boolean' && typeof zp.zgInstalled === 'boolean', String(zStats.get()).slice(0, 140))
+  await zPend.tools.get('code_setup').execute({}, withSignal(REPO)) // 先跑一次：清单按"开关=关"定成 off
+  zWantRef[Symbol.for('cosmokit.volatile.write')](true) // 再模拟页面开关：loader 把新值推进同一引用
+  const zPendSetup = await zPend.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('Z 开关已开而清单未重建 ⇒ 报表明说「重启后生效」并指路 install-zg',
+    /页面已开启.*重启/.test(zPendSetup) && /install-zg/.test(zPendSetup) && /包=未装  页面开关=on/.test(zPendSetup),
+    /^语义层\(zg\):.*$/m.exec(zPendSetup)?.[0]?.slice(0, 150) ?? '(没有 zg 行)')
+  const zgVendor2 = join(zgHome, 'vendor2')
+  mkdirSync(join(zgVendor2, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli'), { recursive: true })
+  writeFileSync(join(zgVendor2, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli', 'index.js'), "console.log('0.2.2')\n", 'utf8')
+  const zAlready = await mount({ ...zgBase, zgEnabled: true, zgVendorDir: zgVendor2 })
+  const zIns = await zAlready.tools.get('code_setup').execute({ action: 'install-zg' }, withSignal(REPO))
+  record('Z install-zg 探到包已就位 ⇒ 不重复下载（already + zg-install-skip 计数）',
+    /已就位/.test(zIns) && /zg-install-skip=1/.test(zIns) && !/npm install/.test(zIns), zIns.slice(0, 110))
+  record('Z install-zg 结果文案带重启与 .zvec-grep gitignore 提醒', /\.gitignore/.test(zIns) && /重启/.test(zIns), zIns.split('\n')[0]?.slice(0, 90) ?? '')
+  let zActErr = ''
+  try { await zAlready.tools.get('code_setup').execute({ action: 'nope' }, withSignal(REPO)) } catch (e) { zActErr = String(e?.message ?? e) }
+  record('Z 未知 action 直接抛错（绝不静默走回检查路线）', /未知 action/.test(zActErr), zActErr.slice(0, 90))
+  const idxSrc = readFileSync(join(REPO, 'index.js'), 'utf8')
+  const scrSrc = readFileSync(join(REPO, 'scripts', 'install-zg.mjs'), 'utf8')
+  const idxPkg = /const ZG_PKG = '([^']+)'/.exec(idxSrc)?.[1]
+  const scrPkg = /const PKG = '([^']+)'/.exec(scrSrc)?.[1]
+  const idxVer = /const ZG_VERSION = '([^']+)'/.exec(idxSrc)?.[1]
+  const scrVer = /const VERSION = '([^']+)'/.exec(scrSrc)?.[1]
+  const idxPrune = (/const ZG_PRUNE = \[([^\]]*)\]/.exec(idxSrc)?.[1] ?? '').replace(/\s/g, '')
+  const scrPrune = (/const PRUNE = \[([^\]]*)\]/.exec(scrSrc)?.[1] ?? '').replace(/\s/g, '')
+  record('Z 两条安装路线钉同一版本（index.js ↔ install-zg.mjs 三对字面量一致）',
+    idxPkg === scrPkg && idxVer === scrVer && idxPrune === scrPrune,
+    `index=${idxPkg}@${idxVer} script=${scrPkg}@${scrVer} prune 一致=${idxPrune === scrPrune}`)
   rmSync(zgHome, { recursive: true, force: true })
 
   // ── 臂 F（可选，CBM_CHECK_REFRESH=1）：H2 的**正向**路径真的会刷新 ────────────
@@ -564,17 +607,18 @@ async function verify(profile) {
   const dirtyFind = await v.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: agentV, signal: sig() })
   record('G 默认 off 下写后记账照常工作（台账仍会把坐标标脏）', dirtyFind?.status === 'stale' && /index\.js/.test(dirtyFind?.text ?? ''), JSON.stringify(dirtyFind?.status))
 
-  // G7.5 volatile 契约（设置页的写路径 + 读数通道）：六个设置页可写字段（enforce / interceptTools /
-  // interceptBudgetMs / contextHint / telemetry / dirtyTracking）必须①在 schema 上标 volatile——dsh-settings 只把 volatile 字段放进表单，写非 volatile
+  // G7.5 volatile 契约（设置页的写路径 + 读数通道）：七个设置页可写字段（enforce / interceptTools /
+  // interceptBudgetMs / contextHint / telemetry / dirtyTracking / zgEnabled——最后一个页内可写
+  // 但清单重启才重建）必须①在 schema 上标 volatile——dsh-settings 只把 volatile 字段放进表单，写非 volatile
   // 字段直接抛 "Config field ... is not volatile"；②在钩子里读**引用当前值**——apply 时
   // 快照的话，UI 改了、拦截行为还是旧的，那比没有 UI 更糟。这里用假引用模拟 loader 的
   // _commitVolatile（它就是把新快照 updateVolatile 进同一个引用）。
   // stats 方向相反：不是用户可写项，是插件→页面的只读读数通道，但它同样必须 volatile
   // ——describe() 只把 volatile 字段解引用进快照，标错（或漏标）页面就永远看不到读数。
-  const VOLATILE_KEYS = ['enforce', 'interceptTools', 'interceptBudgetMs', 'contextHint', 'telemetry', 'dirtyTracking', 'stats']
+  const VOLATILE_KEYS = ['enforce', 'interceptTools', 'interceptBudgetMs', 'contextHint', 'telemetry', 'dirtyTracking', 'stats', 'zgEnabled']
   // schemastery 的字段表在 `Config.dict`（宿主 dsh-settings 的 volatileForm 也是递归它）。
   const marked = VOLATILE_KEYS.filter((k) => Config?.dict?.[k]?.meta?.volatile === true)
-  record('G 六个可热改字段 + 读数通道在 Config 里标了 volatile（宿主才肯 serve/写）', marked.length === 7, `标了的是 ${marked.join(',') || '(无)'}`)
+  record('G 六个即时热改字段 + zgEnabled（延迟生效）+ 读数通道在 Config 里标了 volatile（宿主才肯 serve/写）', marked.length === 8, `标了的是 ${marked.join(',') || '(无)'}`)
   const extra = Object.keys(Config?.dict ?? {}).filter((k) => Config.dict[k]?.meta?.volatile === true && !VOLATILE_KEYS.includes(k))
   record('G 没有把需要重启的字段标成 volatile（标错等于对 UI 撒谎）', extra.length === 0, extra.join(','))
 
@@ -677,10 +721,6 @@ async function verify(profile) {
   record('R 遥测计数里能看到 intercept-replace', /intercept-replace=1/.test(rReport), /遥测计数.*$/m.exec(rReport)?.[0]?.slice(0, 220) ?? '(缺行)')
 
   // ── 臂 S：设置页读数通道 —— counts → volatile stats 引用 + 节流 emit ────────────
-  // 生产里 stats 引用由 loader 造（cosmokit createVolatile）；验收环境没装 cosmokit，
-  // 用 Symbol.for('cosmokit.volatile.write') 手捏同形状引用——isVolRef 认的是全局
-  // symbol 注册表（cosmokit 跨副本同一），形状对了语义就对了。
-  const mkVolRef = (v) => { let cur = v; return { get: () => cur, [Symbol.for('cosmokit.volatile.write')]: (next) => { cur = next } } }
   const sRef = mkVolRef('')
   const sCalls = []
   const s = await mount({ enforce: 'replace', dirtyTracking: false, stats: sRef }, makeStubProxy(sCalls, { project: `stub-${process.pid}-stats` }))

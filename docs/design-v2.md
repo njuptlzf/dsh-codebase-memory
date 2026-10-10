@@ -423,7 +423,7 @@ API（已核实，官方源码 `packages/core/agent/src/runtime-types.ts` + `pac
 | 代理把工具名**按 mcpServers 键加前缀**：裸名 `zvec_grep_search` 经清单不可调，可调用名 `zg_zvec_grep_search`（实测 tool_not_found 的 suggest 就是它） | prompt 示例、check-chain 阶段 2b、README 全部用带前缀名 |
 | `root` 参数**必填**（"Absolute workspace root visible to the daemon"），缺省报 `root: Invalid input` | prompt 示例带 `"root":"<工作区绝对路径>"`；**替换档（v0.6.0）的卖点之一**：钩子调用可以拿会话 cwd 预填，模型一个字都不用填 |
 | `--mcp-toolset agent` 只露 1 个检索工具；`full` 另露受管 rg 与 4 个索引/状态工具 | 默认 `agent`：索引/守护进程管理留 CLI 与脏台账补刷链路，不给模型多余按钮 |
-| `cbm.json` 在 adapter **进程启动时**读取；zg 索引产物落仓库的 `.zvec-grep/` | `zgEnabled`/`zgToolset`/`zgVendorDir` **刻意不标 volatile、不进设置页**（页面画了就等于说谎，理由与 6.1"volatile 必须在决策点 `.get()`"同源反用）；要重启。`.zvec-grep/` 进 gitignore（本仓库已加） |
+| `cbm.json` 在 adapter **进程启动时**读取；zg 索引产物落仓库的 `.zvec-grep/` | ~~`zgEnabled` 刻意不标 volatile、不进设置页~~（**2026-10-09 v0.11.0 推翻，见 §6.11**：谎的根源是"开关暗示即时生效"，解法是 pending 状态机不是藏开关——`zgEnabled` 现已上页；`zgToolset`/`zgVendorDir` 仍文件级）。要重启这条不变：清单只在进程启动时重建。`.zvec-grep/` 进 gitignore（本仓库已加；v0.11.0 起确认弹窗与 install-zg 文案都主动提醒） |
 | vendor 装包=430MB+32MiB 模型下载，属于"要人点头"的开销 | `resolveZg` 缺包只报 `missing` + 提示 `npm run install:zg`，**绝不自动装**（臂 Z 断言）；开关默认 `false`，关掉时清单/prompt/行为与 v0.4.0 完全一致 |
 
 新鲜度不另建 watcher：`dirtyTracking` 的后台补刷现在**两条腿**——图谱 `code_index`（git 闸门）+ `zg index`（不看 git，非 git 工作区也刷），遥测行 `zg-index-done/failed`。
@@ -524,7 +524,7 @@ v0.8.0 验收截图（m02738）：措辞已生效，但运行读数仍是一行"
 - **标签行内自铺**。`primitives.Switch` 的 `label` prop 在宿主上不渲染可见文字（截图实证），说明文字孤悬其下就成了无主文本。改法：每行 `span 标签 + 控件 + 恢复按钮` 同行、hint 在行下；check-client 断言 span 在场，锁死"不依赖控件自带 label"。
 - **恢复是逐字段的**。全局"恢复默认"按钮删除，词典里禁止裸 `reset` key（臂守卫）；字段出现在 user 层时行内长出一个"恢复此项"，走 `form.unset(field)`。
 - **按层分节**：软引导 → 硬拦截 → 检索两层 → 记账与遥测 → 参数。enforce 的 hint 文案改为"力度从左到右递增"，不再暗示模式之间与检索层有关。
-- **「检索两层」状态行**（只读）：结构层恒在（索引后即可答），语义层显示实测状态——`stats` 载荷顶层新增 `zg`（off/ready/missing），`resolveZg` 探测完立即补推一帧，没数明说"状态未知"。zgEnabled 依旧不上页（v0.9.0 的判定不变）：状态行给的是**结果**，不是开关——开关会撒谎，结果不会。
+- **「检索两层」状态行**（只读）：结构层恒在（索引后即可答），语义层显示实测状态——`stats` 载荷顶层新增 `zg`（off/ready/missing），`resolveZg` 探测完立即补推一帧，没数明说"状态未知"。~~zgEnabled 依旧不上页（v0.9.0 的判定不变）：状态行给的是**结果**，不是开关——开关会撒谎，结果不会。~~（**2026-10-09 v0.11.0 推翻**：开关上了页，撒谎问题改由三轴状态机解决——见 §6.11）
 - **推帧通道服从遥测开关**。resolveZg 的无条件推帧当场撞掉臂 S 的"遥测关 ⇒ 一帧不推（含开机）"契约（200/202）——页面与日志是同一个开关管着的，冻结语义必须完整。修复：`cfg.telemetry &&` 门住。这条是 v0.8.1 开机快照的镜像教训：**每加一个推帧点，都要重问一遍"遥测关了它推不推"**。
 
 臂数不变（202/202 双臂 + check-client 布局断言若干），改动全部被既有 S 臂与新加的 185 臂接住。
@@ -541,6 +541,21 @@ v0.8.0 验收截图（m02738）：措辞已生效，但运行读数仍是一行"
 - **报表行也是诊断面**。顺手修掉 `code_setup` 热改行的 v0.8 时代残留（"只有 enforce/telemetry 在页面上"——v0.9.0 起是六个字段）：文档说谎和代码说谎一样要验收来抓。
 
 臂 W 四条契约（预热恰好一发 / 重复 code_setup 不叠加 / 两种失败各有其文 / 报告可见 warm），202→210。G6 基线化、双语 README 排错表新增"冷启动 vs 没索引"分辨行。
+
+---
+
+## 6.11 开关上页与代理装包：把"要人点头"做成链路（v0.11.0）
+
+用户（m05382，v0.10.1 验收后）提出：`zgEnabled` 应该进设置页；开启后若缺包，**咨询用户是否下载**，由 harness 触发下载，整条链路可视化、可追溯。这直接推翻了 §6.9 与 §6.2 表里"开关会撒谎，所以不上页"的判定。接受推翻的理由：撒谎的根源不是开关本身，而是**开关暗示即时生效**——只要状态机把"想开 / 已进清单 / 包在位"三件事分开报，开关和诚实可以共存。
+
+- **三轴，不是一轴**。`stats` 载荷从单值 `zg` 扩成 `zg`（清单事实，bootstrap 时定）+ `zgWant`（页面开关现值）+ `zgInstalled`（`existsSync(zgCli)` 包实测）。状态行八态由三轴推导：`off / installing / missing / installed / ready / pending-on / pending-off / unknown`——`pending-on`（"开关已开、清单未重建——重启宿主后生效"）就是原来"不放开关"想避免的那句谎，现在它成了状态机里一个可断言的态。`code_setup` 报表行同步：`语义层(zg): <清单>  包=<已装|未装>  页面开关=<on|off>` + 轴间差 ⚠。**报表与页面是同一套推导的两次渲染**，不许各说各话。
+- **下载不能由按钮触发——客户端没有手**。client 注入只有 locale / ui-settings / ui-plugin-manager 三个模块，无 shell、无 client→插件 RPC（§6.8 同源约束）。所以链路拆两半：开关只写 `zgEnabled`（一个字节都不下载）；**装包走代理**——`code_setup {action:"install-zg"}`，agent 调、人授权（会话里说"装一下"就是授权动作），telemetry 记 `zg-install-start/done/fail/skip`，进度经 volatile 推 `installing` 帧，页面状态行当场可见。"咨询"点前移到**点击开关时**：两步确认面板写明全部代价（全装 1230MB→净 430MB、约 3 分钟、首用再拉 32MiB 模型、`.zvec-grep/` 落进每个被索引仓库——**请加进 .gitignore**、装包不随开关走、要重启）。用户验收时点名要 gitignore 提醒，它现在被 check-client 用正则钉死在中英两份文案里。
+- **两条安装路线不许漂移**。`installZgLayer` 与 `scripts/install-zg.mjs` 是同版本（0.2.2）、同裁剪清单（node-llama-cpp / @node-llama-cpp / onnxruntime-web）、同 `--version` 自检的两条路。仓库没有 node_modules，脚本 import 不了 index.js，常量只能双份——那就**静态比对钉死**：臂 Z 从两份源码正则抠包名/版本/裁剪数组逐项相等，漂移即红。已在位（版本对得上）返回 `already` 不重复下载，计 `zg-install-skip`。
+- **装成功也不改 `state.zg`**。清单事实只有 bootstrap 有权定（`cbm.json` 进程启动时才读）；装完报表是 `missing→包=已装` + "重启后生效"，绝不当场变 `ready`。这条和 §6.9"每加一个推帧点都要重问遥测关了它推不推"并列：**每加一个状态写入点，都要问它写的是哪一轴**。
+- **未知 action 直接抛错**。`code_setup {action:"装一下"}` 若静默走回"只检查"路线，模型会以为装完了。宁可一次报错重说。
+- 臂 Z +7（三轴就绪 / stats 三轴 / pending-on 报表 / already 不重下载 / gitignore+重启文案 / 未知 action 抛错 / 双路线字面量比对），210→224；check-client 新增开关交互臂：确认面板在场时零写入、"确认开启"才落 `form.set`、取消零写入、关闭不经确认直接写。
+
+一个 harness 侧的坑值得单记：check-plugin 从 **profile 已安装拷贝** import index.js，改了仓库忘 `npm run sync` 时，新断言会精确地"全红在旧行为上"——7 条 FAIL 全是同一原因。这不是 gate 的错（它测的本来就是装了的东西），但跑本地门禁前先看一眼 sync 状态，否则会把"没同步"排障成"逻辑坏了"。
 
 ---
 

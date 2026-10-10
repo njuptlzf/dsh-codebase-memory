@@ -12,8 +12,10 @@
  *   不用 `--omit=optional`：@zvec/zvec 的 win32-x64 原生绑定也在 optionalDependencies
  *   里，跳了就没得跑了。先全装再点名删。
  *
- * 装完还要开配置才生效：profile 的 cordis.patch.yml 写 `zgEnabled: true`（或设置页
- * 文件层），然后重启——它决定 cbm.json 里有没有第二个 server，不是热改字段。
+ * 装完还要开启才生效：设置页的「启用语义检索层」开关（v0.11.0）或 profile 的
+ * cordis.patch.yml 写 `zgEnabled: true`，然后重启——它决定 cbm.json 里有没有第二个
+ * server，清单只在进程启动时重建，不是热改字段。页面开关不触发本脚本：装包要么
+ * 用户手动跑这里，要么显式让 agent 调 code_setup {action:"install-zg"}。
  */
 import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
@@ -88,4 +90,4 @@ const sizeMB = (dir) => {
   return Math.round(sum / 1024 / 1024)
 }
 log(`完成：${PKG}@${v}，vendor ${sizeMB(vendor)}MB。`)
-log('下一步：profile cordis.patch.yml 加 zgEnabled: true，然后跑 npm run sync && 重启；首次使用会在项目根建 .zvec-grep/（记得 gitignore）。')
+log('下一步：设置页打开「启用语义检索层」开关（或 profile cordis.patch.yml 加 zgEnabled: true），然后跑 npm run sync && 重启；首次使用会在项目根建 .zvec-grep/（记得 gitignore）。')

@@ -162,13 +162,23 @@ for (const key of ['title', 'summary', 'loading', 'unavailable', 'enforce.label'
   'interceptTools.label', 'interceptTools.hint',
   'sec.soft', 'sec.soft.hint', 'sec.hard', 'sec.hard.hint', 'sec.layers', 'sec.layers.hint',
   'sec.aux', 'sec.aux.hint', 'sec.params', 'sec.params.hint',
-  'layer.graph', 'layer.graph.on', 'layer.zg', 'layer.zg.off', 'layer.zg.ready', 'layer.zg.missing', 'layer.zg.unknown']) {
+  'layer.graph', 'layer.graph.on', 'layer.zg', 'layer.zg.off', 'layer.zg.ready', 'layer.zg.missing', 'layer.zg.unknown',
+  'layer.zg.installed', 'layer.zg.installing', 'layer.zg.pending-on', 'layer.zg.pending-off',
+  'zg.label', 'zg.hint', 'zg.confirm.title', 'zg.confirm.body', 'zg.confirm.yes', 'zg.confirm.no']) {
   ok(keys.includes(key), `字典有 key ${key}`)
 }
 for (const key of ['hint.label', 'dirty.label', 'interceptBudgetMs.label', 'interceptTools.label', 'resetField',
   'sec.soft', 'sec.hard', 'sec.layers', 'sec.aux', 'sec.params',
-  'layer.graph', 'layer.zg', 'layer.zg.off', 'layer.zg.ready', 'layer.zg.missing', 'layer.zg.unknown']) {
+  'layer.graph', 'layer.zg', 'layer.zg.off', 'layer.zg.ready', 'layer.zg.missing', 'layer.zg.unknown',
+  'layer.zg.installed', 'layer.zg.installing', 'layer.zg.pending-on', 'layer.zg.pending-off',
+  'zg.label', 'zg.hint', 'zg.confirm.title', 'zg.confirm.body', 'zg.confirm.yes', 'zg.confirm.no']) {
   ok(Object.keys(dictEntry?.dict?.en || {}).includes(key), `en 字典有 key ${key}`)
+}
+// 确认面板是"人点头"的那一环：文案必须把真实代价写全（v0.11.0 验收要求含 gitignore 提醒）。
+for (const lang of ['zh', 'en']) {
+  const body = dictEntry?.dict?.[lang]?.['zg.confirm.body'] || ''
+  ok(/1230MB/.test(body) && /430MB/.test(body) && /32MiB/.test(body) && /\.zvec-grep\//.test(body) && /gitignore/i.test(body) && /install-zg/.test(body),
+    `${lang} 确认文案写足代价（全装/净体积/模型/.zvec-grep→gitignore/装包路线）`, body.slice(0, 60))
 }
 ok(!keys.includes('reset'), '没有裸「恢复默认」key——每个字段的恢复按钮必须叫「恢复此项」', keys.filter((k) => k.startsWith('reset')).join('|'))
 for (const mode of modes) {
@@ -258,6 +268,50 @@ ok(btns2.length === 1, 'user 层只有 contextHint ⇒ 恰一个「恢复此项�
 btns2[0].props.onClick()
 ok(JSON.stringify(calls.unset) === JSON.stringify(['contextHint']), '新字段的恢复默认同样走 form.unset', JSON.stringify(calls.unset))
 
+/* ---- 5c. v0.11.0 语义层开关：两步确认 + 三轴状态行（页面不撒谎）---- */
+console.log('\n[语义层开关]')
+const layerText = (v) => {
+  storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, ...v }, base: {}, user: {}, writable: true, revision: 16 }
+  return flatten(panel.component({ ...props })).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
+}
+ok(layerText({ zgEnabled: false, stats: JSON.stringify({ zg: 'off', zgWant: false, zgInstalled: false }) }).includes('layer.zg.off'),
+  '开关关 + 清单 off ⇒ 状态行「未启用」')
+ok(layerText({ zgEnabled: true, stats: JSON.stringify({ zg: 'off' }) }).includes('layer.zg.pending-on'),
+  '开关已开、清单未重建 ⇒ pending-on（诚实说「重启后生效」，不谎称已开启）')
+ok(layerText({ zgEnabled: false, stats: JSON.stringify({ zg: 'ready' }) }).includes('layer.zg.pending-off'),
+  '开关已关、清单还带着 ⇒ pending-off')
+ok(layerText({ zgEnabled: true, stats: JSON.stringify({ zg: 'missing', zgInstalled: true }) }).includes('layer.zg.installed'),
+  '清单说 missing 但包实测在 ⇒ installed 待重启（两轴分开报，不合成一个谎）')
+ok(layerText({ zgEnabled: true, stats: JSON.stringify({ zg: 'installing' }) }).includes('layer.zg.installing'),
+  'agent 正在装（volatile 推帧）⇒ installing')
+
+storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, zgEnabled: false, stats: JSON.stringify({ zg: 'off' }) }, base: {}, user: {}, writable: true, revision: 17 }
+tree = panel.component({ ...props })
+const zgEl = findType(tree, (n) => typeof n.type === 'function' && n.type.name === 'ZgToggle')
+ok(!!zgEl, '「检索两层」段渲染出语义层开关组件（ZgToggle）')
+const writes = []
+const zgProps = { ...zgEl.props, onWrite: (v) => writes.push(v) }
+const idleTexts = flatten(zgEl.type(zgProps)).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
+ok(idleTexts.includes('zg.label') && !idleTexts.includes('zg.confirm.title'), '未点击时只有开关行，没有确认面板')
+const zgSwitch = flatten(zgEl.type(zgProps)).find((n) => n.type === primitives.Switch)
+ok(!!zgSwitch && zgSwitch.props.checked === false, '开关态取自 zgEnabled（不是清单事实）', String(zgSwitch?.props?.checked))
+zgSwitch.props.onChange(true)
+ok(writes.length === 0, '点「开」不当场写表单——先停在确认这一步', JSON.stringify(writes))
+reactStub.useState = (init) => [true, () => {}] // 强制 confirming=true，看确认面板
+const confirmTree = zgEl.type(zgProps)
+const cTexts = flatten(confirmTree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
+const cBtns = flatten(confirmTree).filter((n) => n.props && typeof n.props.onClick === 'function')
+ok(cTexts.includes('zg.confirm.title') && cTexts.includes('zg.confirm.body'), '确认面板在场：标题 + 代价文案')
+ok(cBtns.length === 2, '确认面板两个按钮（确认开启 / 取消）', String(cBtns.length))
+cBtns[1].props.onClick()
+ok(writes.length === 0, '点「取消」一个字节都不写', JSON.stringify(writes))
+cBtns[0].props.onClick()
+ok(JSON.stringify(writes) === JSON.stringify([true]), '点「确认开启」才写 zgEnabled=true', JSON.stringify(writes))
+reactStub.useState = (init) => [init, () => {}]
+writes.length = 0
+flatten(zgEl.type(zgProps)).find((n) => n.type === primitives.Switch)?.props.onChange(false)
+ok(JSON.stringify(writes) === JSON.stringify([false]), '关闭不经过确认，直接写（关没有开销）', JSON.stringify(writes))
+
 storeSnapshot = { status: 'loading', value: {}, base: {}, user: {}, writable: false, revision: 0 }
 tree = panel.component({ ...props })
 ok(flatten(tree).some((n) => typeof n.props?.children === 'string' && n.props.children === 'loading'), 'loading 态有占位文案')
@@ -278,7 +332,7 @@ const statsJson = JSON.stringify({
   lever: { wrapperCalls: 12, hintInjected: 3 },
   index: { retryContention: 1, zgIndexFail: 0 },
 })
-storeSnapshot = { status: 'ready', value: { enforce: 'replace', telemetry: true, stats: statsJson }, base: {}, user: {}, writable: true, revision: 11 }
+storeSnapshot = { status: 'ready', value: { enforce: 'replace', telemetry: true, zgEnabled: true, stats: statsJson }, base: {}, user: {}, writable: true, revision: 11 }
 tree = panel.component({ ...props })
 const texts = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
 console.log('\n[读数]')

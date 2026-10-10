@@ -42,6 +42,12 @@ const PROXY_TOOL = 'mcp__cbm__mcp'
 const ENFORCE_MODES = ['off', 'deny-once', 'deny', 'replace']
 /** 语义检索层（zvec-grep）的 MCP 工具集：agent 只暴露 zvec_grep_search；rg/index/status 走 CLI 与我们的后台补刷。 */
 const ZG_TOOLSETS = ['agent', 'full']
+/** 语义层包的钉死版本。与 scripts/install-zg.mjs 是两份字面量（仓库没有本地
+ * node_modules，脚本 import 不动 index.js），漂移由 check-plugin 的静态比对钉住。 */
+const ZG_PKG = '@zvec/zvec-grep'
+const ZG_VERSION = '0.2.2'
+/** transformers.js + onnxruntime-node 路线永不加载的推理后端，装完即裁（~833MB）。 */
+const ZG_PRUNE = ['node_modules/node-llama-cpp', 'node_modules/@node-llama-cpp', 'node_modules/onnxruntime-web']
 /** 会写文件的内置工具（官方 tool-fs README：路径字段统一 snake_case `file_path`）。 */
 const WRITE_TOOLS = ['write', 'edit']
 const CODE_FILE = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|c|h|cc|cpp|hpp|cs|rb|php|swift|scala|vue|svelte|sql|sh|bash|ps1)$/i
@@ -88,9 +94,10 @@ export const Config = z.object({
   dirtyTracking: z.boolean().default(true).volatile(),
   dirtyRefreshCooldownSec: z.number().default(120),
   // ── 语义检索层（zvec-grep，可选，docs/design-v2.md 第 9 节）─────────────────
-  // zgEnabled 有意不标 volatile：它决定 cbm.json 里有没有第二个 server，而清单是
-  // bootstrap 写的、adapter 进程只在启动时读——热改不会生效，标了反而骗人。
-  zgEnabled: z.boolean().default(false),
+  // zgEnabled 标 volatile：设置页的开关写它（v0.11.0）。诚实靠状态机而不是藏开关——
+  // cbm.json 清单仍是 bootstrap 时写的、adapter 进程只在启动时读，所以热改只翻转
+  // 页面开关轴（stats.zgWant），清单轴（stats.zg）要等重启；两轴的差在页面上明说。
+  zgEnabled: z.boolean().default(false).volatile(),
   zgToolset: z.string().default('agent'),
   zgVendorDir: z.string().default(''),
 })
@@ -162,7 +169,7 @@ function normalize(config = {}) {
   cfg.wrapperTools = boolOf(config.wrapperTools, true, cfg.notes, 'wrapperTools')
   cfg.dirtyRefreshCooldownSec = positiveInt('dirtyRefreshCooldownSec', config.dirtyRefreshCooldownSec, 120, cfg.notes)
   // 语义检索层：非法值一律降级 + note，boot 不抛（与其余字段同一纪律）。
-  cfg.zgEnabled = boolOf(config.zgEnabled, false, cfg.notes, 'zgEnabled')
+  boolOf(live(config.zgEnabled), false, cfg.notes, 'zgEnabled')
   if (config.zgToolset !== undefined && config.zgToolset !== '' && !ZG_TOOLSETS.includes(config.zgToolset)) {
     cfg.notes.push(`zgToolset="${config.zgToolset}" 非法，已按 agent 处理（可选：${ZG_TOOLSETS.join('|')}）`)
   }
@@ -188,6 +195,7 @@ function normalize(config = {}) {
   defineLive(cfg, 'interceptTools', () => csv(live(config.interceptTools) || 'grep,glob'))
   defineLive(cfg, 'contextHint', () => boolOf(live(config.contextHint), true, [], 'contextHint'))
   defineLive(cfg, 'dirtyTracking', () => boolOf(live(config.dirtyTracking), true, [], 'dirtyTracking'))
+  defineLive(cfg, 'zgEnabled', () => boolOf(live(config.zgEnabled), false, [], 'zgEnabled'))
   cfg.adapterMjs = join(cfg.adapterDir, 'node_modules', '@njuptlzf', 'mcp-adapter', 'mcp-server.mjs')
   cfg.adapterConfig = join(cfg.adapterDir, 'cbm.json')
   return cfg
@@ -266,6 +274,58 @@ async function ensureAdapter(ctx, cfg, state, signal) {
   state.adapter = 'ready'
 }
 
+/** 语义层 CLI 的实测版本；跑不起来/没装返回 ''。 */
+async function zgVersion(ctx, cfg, signal) {
+  const r = await run(ctx, [process.execPath, cfg.zgCli, '--version'], { cwd: cfg.zgVendorDir, signal })
+  return r.exitCode === 0 ? r.stdout.trim() : ''
+}
+
+/**
+ * 语义层下载安装（v0.11.0，代理路线）：与 scripts/install-zg.mjs 同一条流程——
+ * 全装 → 裁掉 onnxruntime-node 路线永不加载的推理后端（~833MB）→ `--version` 自检当门禁。
+ * 设置页开关**不**触发这里（client 没有执行通道）；只有 code_setup {action:'install-zg'}
+ * 显式调用才装，绝不自发——430MB 是要人点头的开销。state.zg 一律不动：清单才是
+ * 事实（adapter 只在进程启动时读 cbm.json），装完提示重启。并发调用直接抛，不排队。
+ */
+async function installZgLayer(ctx, cfg, state, signal) {
+  if (state.zgInstalling) throw new Error('zg 安装已在进行中（同一时刻只允许一个 install-zg）')
+  if (existsSync(cfg.zgCli) && (await zgVersion(ctx, cfg, signal)) === ZG_VERSION) {
+    telemetry(cfg, state, 'zg-install-skip')
+    return { status: 'already', version: ZG_VERSION }
+  }
+  const npm = npmCliEntry()
+  if (!npm) throw new Error('找不到 npm-cli.js，无法自动安装；请手动跑 npm run install:zg')
+  state.zgInstalling = true // 先立旗再记事件：telemetry 会推 stats，第一帧就得是 installing
+  telemetry(cfg, state, 'zg-install-start', { version: ZG_VERSION })
+  try {
+    mkdirSync(cfg.zgVendorDir, { recursive: true })
+    const pkgJson = join(cfg.zgVendorDir, 'package.json')
+    if (!existsSync(pkgJson)) writeFileSync(pkgJson, JSON.stringify({ name: 'zg-vendor', private: true, version: '0.0.0' }))
+    const r = await run(ctx, [
+      process.execPath, npm, 'install',
+      '--prefix', cfg.zgVendorDir,
+      '--no-audit', '--no-fund', '--loglevel=error',
+      `${ZG_PKG}@${ZG_VERSION}`,
+    ], { cwd: cfg.zgVendorDir, maxBytes: 512 * 1024, signal })
+    if (!existsSync(cfg.zgCli)) {
+      throw new Error(`npm install 退出码 ${r.exitCode}：${(r.stderr || r.stdout).trim().slice(-400) || '(无输出)'}——网络慢可重跑；反复失败就手动 npm run install:zg 看全程输出`)
+    }
+    for (const rel of ZG_PRUNE) rmSync(join(cfg.zgVendorDir, rel), { recursive: true, force: true })
+    const v = await zgVersion(ctx, cfg, signal)
+    if (v !== ZG_VERSION) {
+      throw new Error(`裁剪后自检失败：--version 返回「${v}」（期望 ${ZG_VERSION}）——检查是否用了 --omit=optional 之类跳过可选依赖的安装姿势`)
+    }
+    telemetry(cfg, state, 'zg-install-done', { version: v })
+    return { status: 'installed', version: v }
+  } catch (error) {
+    telemetry(cfg, state, 'zg-install-fail', { error: String(error?.message ?? error).slice(0, 200) })
+    throw error
+  } finally {
+    state.zgInstalling = false
+    if (cfg.telemetry && state.pushStats) state.pushStats()
+  }
+}
+
 /** 探测索引引擎。二进制不自动下载：可执行文件的安全水位高于包。 */
 async function resolveCbm(ctx, cfg, state) {
   const candidates = [
@@ -302,7 +362,7 @@ function resolveZg(cfg, state) {
   else if (existsSync(cfg.zgCli)) { state.zg = 'ready' }
   else {
     state.zg = 'missing'
-    push(state, `zgEnabled=true 但找不到 ${cfg.zgCli}——先跑 npm run install:zg`)
+    push(state, `zgEnabled=true 但找不到 ${cfg.zgCli}——装它：让 agent 调 code_setup {action:"install-zg"}，或手动跑 npm run install:zg`)
   }
   // 页面「检索两层」状态行消费这个字段：探测完立刻推一帧，别等下一个遥测事件。
   // 遥测关时一帧都不推——「关了就冻结」是 S 臂锁住的契约（页面与日志同一开关）。
@@ -518,6 +578,14 @@ function syncStatusLine() {
 }
 
 function report(cfg, state) {
+  // 语义层三轴（清单事实 / 包实测 / 页面开关）不一致时把待办动作写进后缀，别让用户猜。
+  const zgInstalled = existsSync(cfg.zgCli)
+  const zgSuffix = state.zgInstalling ? '  [install-zg 安装中]'
+    : cfg.zgEnabled && state.zg === 'off'
+      ? '  ⚠ 页面已开启，重启后清单才生效' + (zgInstalled ? '' : '（包未装：code_setup {action:"install-zg"}）')
+      : !cfg.zgEnabled && state.zg !== 'off'
+        ? '  ⚠ 页面已关闭，重启后清单才移除'
+        : ''
   const lines = [
     `status: ${state.ok ? 'OK' : 'NOT READY'}`,
     `压缩层(②): ${state.adapter}  ${cfg.adapterMjs}`,
@@ -526,9 +594,9 @@ function report(cfg, state) {
     `清单: ${state.configPath ?? '(未写)'}  exclude=${JSON.stringify(EXCLUDE_TOOLS)}`,
     `代理工具: ${PROXY_TOOL}  bootstrap=${cfg.bootstrap}  adapterVersion=${cfg.adapterVersion}  warm=${state.warm ? (state.warmOk === true ? 'ok' : state.warmOk === false ? 'failed' : 'pending') : 'off'}`,
     `触发层: wrapper=${cfg.wrapperTools ? 'on' : 'off'}  enforce=${cfg.enforce}  intercept=${cfg.interceptTools.join('+') || '(无)'}  budget=${cfg.interceptBudgetMs}ms  dirty=${cfg.dirtyTracking ? 'on' : 'off'}(冷却 ${cfg.dirtyRefreshCooldownSec}s)  context=${cfg.contextHint ? 'on' : 'off'}`,
-    `语义层(zg): ${state.zg}  toolset=${cfg.zgToolset}  ${cfg.zgCli}`,
-    // v0.9.0 起六个热字段全在页面上；volatile 是必要条件，页面画的是全集。
-    '热改: enforce / telemetry / contextHint / dirtyTracking / interceptBudgetMs / interceptTools → 设置 → 插件 → dsh-codebase-memory → codebase-memory 行「配置」（不用重启）；其余字段改 profile 的 cordis.patch.yml 并重启',
+    `语义层(zg): ${state.zgInstalling ? 'installing' : state.zg}  包=${zgInstalled ? '已装' : '未装'}  页面开关=${cfg.zgEnabled ? 'on' : 'off'}  toolset=${cfg.zgToolset}  ${cfg.zgCli}${zgSuffix}`,
+    // 六个即时热字段 + zgEnabled（v0.11.0 起页面可写，但清单重启才重建）；volatile 是必要条件，页面画的是全集。
+    '热改: enforce / telemetry / contextHint / dirtyTracking / interceptBudgetMs / interceptTools → 设置 → 插件 → dsh-codebase-memory → codebase-memory 行「配置」（不用重启）；zgEnabled 也在页面上改，但要重启宿主才进清单；其余字段改 profile 的 cordis.patch.yml 并重启',
     `遥测计数(跨重启累计): ${Object.entries(state.counts).map(([k, v]) => `${k}=${v}`).join(' ') || '(无事件)'}`,
     `auto_index: ${state.autoIndex || '(未设置)'}（期望 ${cfg.autoIndex ? 'true' : 'false'}；机器级共享配置，只补"无索引的新项目"，不刷新陈旧坐标）`,
     syncStatusLine(),
@@ -900,11 +968,15 @@ function loadCounts(cfg) {
  * 都会让 loader 把这个 volatile 字段复位成 schema 默认（_commitVolatile 只认文档
  * 层），下一个事件回填，所以绝不能做增量。键名是面板的契约，改键要同步 lib/client.js。
  */
-function renderStats(state) {
+function renderStats(cfg, state) {
   const n = (k) => state.counts[k] ?? 0
   return JSON.stringify({
     at: Date.now(),
-    zg: state.zg,
+    // 三轴：zg=清单事实（bootstrap 时定），zgWant=页面开关，zgInstalled=包实测。
+    // 面板靠三轴差值推导五态；安装中把 zg 顶成 installing（瞬时态，不是实测结果）。
+    zg: state.zgInstalling ? 'installing' : state.zg,
+    zgWant: cfg.zgEnabled === true,
+    zgInstalled: existsSync(cfg.zgCli),
     replace: { hit: n('intercept-replace'), graph: n('intercept-replace:graph'), zg: n('intercept-replace:zg'), passDirty: n('replace-pass-dirty'), passNoHit: n('replace-pass-no-hit'), passFailed: n('replace-pass-failed'), error: n('replace-error') },
     deny: { blocked: n('intercept-deny'), passDirty: n('intercept-pass-dirty'), passNoHit: n('intercept-pass-no-hit'), passQueryFailed: n('intercept-pass-query-failed'), skipSeen: n('intercept-skip-seen'), error: n('intercept-error') },
     dirty: { record: n('dirty-record'), refreshScheduled: n('dirty-refresh-scheduled'), refreshDone: n('dirty-refresh-done'), refreshFail: n('dirty-refresh-fail') },
@@ -1135,7 +1207,7 @@ export async function apply(ctx, config) {
   const cfg = normalize(config)
   const state = {
     adapter: 'unknown', cbm: 'unknown', ok: false, autoIndex: '', refreshing: new Set(), notes: [], lastError: '',
-    zg: 'off',
+    zg: 'off', zgInstalling: false,
     sessions: new Map(), projectsByCwd: new Map(), counts: {}, indexJobs: new Map(),
     warm: false, warmOk: null, // 冷启动预热（v0.10.1）：warm=打过一次，warmOk=那次的结果
   }
@@ -1159,7 +1231,7 @@ export async function apply(ctx, config) {
   const doStatsEmit = () => { try { ctx.emit('settings/document-updated', 'codebase-memory', Date.now()) } catch { /* 没有转发器就算了 */ } }
   state.pushStats = () => {
     const ref = state.statsRef
-    if (isVolRef(ref)) { try { ref[VOL_WRITE](renderStats(state)) } catch { /* 绝不影响会话 */ } }
+    if (isVolRef(ref)) { try { ref[VOL_WRITE](renderStats(cfg, state)) } catch { /* 绝不影响会话 */ } }
     // 累计落盘：只在计数变了时写；先与文件 max 合并再写——tauri/web 两宿主并跑时
     // 各自只见自己的增量，max 是最接近跨进程总数的廉价做法（真总数要 per-pid 文件+读侧聚合，不值）。
     if (cfg.telemetry) {
@@ -1218,14 +1290,38 @@ export async function apply(ctx, config) {
 
   ctx.tools.register(defineTool({
     name: 'code_setup',
-    description: 'Check and repair the codebase-memory code-index chain for this DSH host: the pinned mcp-adapter token-compression layer (auto-bootstrapped) and the codebase-memory-mcp binary (manual install). Reports exact paths, versions and a copy-pasteable install command when something is missing. Only side effect is installing the pinned adapter package when it is absent.',
-    parameters: {},
+    description: 'Check and repair the codebase-memory code-index chain for this DSH host: the pinned mcp-adapter token-compression layer (auto-bootstrapped) and the codebase-memory-mcp binary (manual install). Reports exact paths, versions and a copy-pasteable install command when something is missing. Only side effect is installing the pinned adapter package when it is absent. Pass action "install-zg" to install the optional semantic retrieval layer (~430MB after pruning) — explicit opt-in only, never automatic, and the running adapter picks it up after a host restart.',
+    parameters: {
+      action: {
+        type: 'string',
+        description: 'Optional. "install-zg" = download and prune the pinned @zvec/zvec-grep into the vendor dir (long-running, hundreds of MB; ask the user first). Omit to just check and report the chain.',
+      },
+    },
     output: {
       // 顶层标量 schema 不接受 required（value schema DSL 只支持 properties.* 里写）。
       schema: { type: 'string' },
       render: (_args, value) => [{ type: 'text', text: value }],
     },
-    async execute() {
+    async execute(args = {}) {
+      const action = String(args?.action ?? '').trim()
+      if (action === 'install-zg') {
+        // 不跑 bootstrap：state.zg 是清单事实，进程启动前不会变——装完就改它，
+        // usageSection 会对着还没加载 zg 的 adapter 撒谎。重启后 bootstrap 自己会探到。
+        const r = await installZgLayer(ctx, cfg, state, ac.signal)
+        const head = r.status === 'already'
+          ? `zvec-grep ${r.version} 已就位（${cfg.zgCli}），没有重复下载。`
+          : `zvec-grep ${r.version} 安装并裁剪完成（净 ~430MB）：${cfg.zgCli}。`
+        return [
+          head,
+          cfg.zgEnabled
+            ? '下一步：重启宿主——清单会加入 zg server，语义层生效。'
+            : '下一步：设置 → 插件 → dsh-codebase-memory → 配置里打开语义层开关，再重启宿主。',
+          '提醒：zg 的索引产物 .zvec-grep/ 会落进每个被索引仓库——把它加进 .gitignore。',
+          '',
+          report(cfg, state),
+        ].join('\n')
+      }
+      if (action) throw new Error(`未知 action "${action}"（可选：install-zg；留空 = 只检查并汇报链路）`)
       await bootstrap(ctx, cfg, state, ac.signal).catch((error) => {
         state.lastError = String(error?.message ?? error)
         state.ok = false
