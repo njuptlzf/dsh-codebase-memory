@@ -20,6 +20,8 @@
  *     写后记账与坐标过期改放行、按 query 条件注入。走假代理工具，不依赖真引擎。
  *   R2/R3/S2 泡数据完整性（v0.8.2，两个遥测里抓到的真 bug 的回归锁）：越界 grep
  *     不替换、底层错误文本不算命中（失败与无命中分开计数）、累计计数跨重启播种+落盘。
+ *   W 冷启动契约（v0.10.1）：bootstrap 会话外预热恰好一发；projectFor 查不到时
+ *     错误消息区分"不在表里/查询失败"并带出代理原文。
  */
 import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -76,6 +78,8 @@ function makeStubProxy(calls, opts = {}) {
       }
       switch (tool) {
         case 'cbm_list_projects':
+          // v0.10.1 臂 W：代理把底层失败包成 Error 文本（isError 不置真）的样子。
+          if (opts.listError) return { content: [{ type: 'text', text: 'Error: MCP server not running' }] }
           return { content: [{ type: 'text', text: `projects: 1  (cols: name root_path branch)\n  ${project} ${root.replace(/\\/g, '/')} main` }] }
         case 'cbm_search_graph':
           // 代理工具会把底层 MCP 错误包成**普通文本**（isError 不置真）——实测
@@ -525,8 +529,9 @@ async function verify(profile) {
   const preF = (f.events['tools/pre-execute'] ?? [])[0]
   const agentF = fakeAgent(`sess-${process.pid}-f`, tRepo)
   const agentClean = fakeAgent(`sess-${process.pid}-clean`, tRepo)
+  const callsBeforeRecord = fCalls.length // v0.10.1 起 bootstrap 预热会留下一发 list_projects——基线差值才等于"记账触发的调用"
   await postF({ name: 'edit', arguments: { file_path: join(tRepo, 'probe.ts') }, agent: agentF, signal: sig() }, { content: [], isError: false }, nextPost)
-  const callsAfterRecord = fCalls.length // 记账本身不查 cbm（惰性：等查询来了再说）
+  const callsAfterRecord = fCalls.length - callsBeforeRecord // 记账本身不查 cbm（惰性：等查询来了再说）
   const dirtyPass = await preF(grepExec(agentF, 'probeSymbol'), next)
   record('G 脏路径记账不触发任何即时 cbm 调用（惰性）', callsAfterRecord === 0, `记账后 cbm 调用数=${callsAfterRecord}`)
   record('G 本会话写过代码 ⇒ 拦截改为放行', dirtyPass?.kind === 'allow', JSON.stringify(dirtyPass))
@@ -787,6 +792,32 @@ async function verify(profile) {
   record('T 热翻 interceptTools 立即开合名单：glob 不在名单不碰，进了名单照换',
     globNarrow?.content === undefined && /stubSymbol/.test(globWide?.content?.[0]?.text ?? ''),
     `['grep']→${JSON.stringify(globNarrow).slice(0, 30)} ['grep,glob']→${JSON.stringify(globWide).slice(0, 40)}`)
+
+  // ── 臂 W：v0.10.1 冷启动预热 + projectFor 的诚实原因 ──────────────────────
+  // 验收实测：宿主重启后第一次 list_projects 撞上引擎冷启动，旧版把"查询失败"
+  // 报成"还没进代码图"，指人去跑 code_index。两条契约：预热每进程恰好一发；
+  // 查不到 project 时错误消息必须区分"不在表里"与"查询失败"并带出代理原文。
+  const wCalls = []
+  const w = await mount({ enforce: 'off', dirtyTracking: false, telemetry: false },
+    makeStubProxy(wCalls, { project: `stub-${process.pid}-warm` }))
+  await w.tools.get('code_setup').execute({}, withSignal(REPO))
+  await w.tools.get('code_setup').execute({}, withSignal(REPO)) // 第二次不许再预热
+  const warmShots = wCalls.filter((c) => c.tool === 'cbm_list_projects').length
+  record('W bootstrap 在会话外预热恰好一发（重复 code_setup 不叠加）', warmShots === 1, `list_projects 调用数=${warmShots}`)
+  const wReport = await w.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('W 报告行报出预热状态', /warm=(ok|pending)/.test(wReport), /代理工具:.*warm=\w+/.exec(wReport)?.[0]?.slice(0, 140) ?? '(没有 warm 字段)')
+  const wn = await mount({ enforce: 'off', dirtyTracking: false, telemetry: false },
+    makeStubProxy([], { project: `stub-${process.pid}-nowhere`, root: 'C:/nowhere-else' }))
+  await wn.tools.get('code_setup').execute({}, withSignal(REPO))
+  let wnErr = '(未抛错)'
+  try { await wn.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: fakeAgent(`sess-${process.pid}-nowhere`, REPO), signal: sig() }) } catch (error) { wnErr = String(error?.message ?? error) }
+  record('W 表里真没有时报"项目表里没有"并指向 code_index', /项目表里没有/.test(wnErr) && /code_index/.test(wnErr), wnErr.slice(0, 110))
+  const wf = await mount({ enforce: 'off', dirtyTracking: false, telemetry: false },
+    makeStubProxy([], { project: `stub-${process.pid}-fail`, listError: true }))
+  await wf.tools.get('code_setup').execute({}, withSignal(REPO))
+  let wfErr = '(未抛错)'
+  try { await wf.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: fakeAgent(`sess-${process.pid}-fail`, REPO), signal: sig() }) } catch (error) { wfErr = String(error?.message ?? error) }
+  record('W 查询失败时报"查询失败"并带出代理原文（冷启动不再谎称没索引）', /查询失败/.test(wfErr) && /MCP server not running/.test(wfErr), wfErr.slice(0, 130))
 
   rmSync(tRepo, { recursive: true, force: true })
 

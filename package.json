@@ -1,8 +1,8 @@
 {
   "name": "dsh-codebase-memory",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "private": true,
-  "description": "DSH host bundle: index the session workspace with codebase-memory-mcp, expose it through @njuptlzf/mcp-adapter (one ~250-token MCP proxy tool instead of 17 tool schemas), and add trigger layers — code_find/code_callers wrappers, optional grep/glob intercept, conditional runtime context, write-after staleness tracking — so symbol lookups reach the code graph without depending on how the question was phrased, with cumulative-across-restart intercept/replace counters shown as read-only cards on the settings page over a volatile channel, with six hot-editable fields (mode/tools/budget/hints/tracking/telemetry) laid out by layer with per-field reset and a read-only retrieval-layer status line. Two complementary retrieval layers: structure (codebase-memory graph) + optional semantic (zvec-grep, off by default; 430MB requires an explicit install:zg).",
+  "description": "DSH host bundle: index the session workspace with codebase-memory-mcp, expose it through @njuptlzf/mcp-adapter (one ~250-token MCP proxy tool instead of 17 tool schemas), and add trigger layers — code_find/code_callers wrappers, optional grep/glob intercept, conditional runtime context, write-after staleness tracking — so symbol lookups reach the code graph without depending on how the question was phrased, with cumulative-across-restart intercept/replace counters shown as read-only cards on the settings page over a volatile channel, with six hot-editable fields (mode/tools/budget/hints/tracking/telemetry) laid out by layer with per-field reset and a read-only retrieval-layer status line, plus an out-of-session engine warm-up so the first query never pays cold-start cost. Two complementary retrieval layers: structure (codebase-memory graph) + optional semantic (zvec-grep, off by default; 430MB requires an explicit install:zg).",
   "type": "module",
   "main": "index.js",
   "exports": {

@@ -394,6 +394,17 @@ async function bootstrap(ctx, cfg, state, signal, { force = false } = {}) {
     await ensureAutoIndex(ctx, cfg, state, signal)
   }
   state.ok = state.adapter === 'ready' && state.cbm === 'ready'
+  // 冷启动预热（v0.10.1）：宿主重启后第一次 cbm_* 代理调用要等 MCP server 进程冷起
+  // （加载全部 project 的图谱库），实测远超拦截预算 2500ms——验收时第一条 code_find
+  // 就是这么被误判成"不在项目表"的。让 bootstrap 在会话外先打一发 list_projects 把
+  // server 焐热，会话里的第一发不再付这笔钱。每进程一次；失败不重试——遥测
+  // cbm-warm 的 ok=false 和后续 pass-query-failed 计数会告诉我们真相。
+  if (state.ok && !state.warm) {
+    state.warm = true
+    cbmCall(ctx, { signal }, 'list_projects', {}, WARM_BUDGET_MS)
+      .then((r) => { state.warmOk = r.ok; telemetry(cfg, state, 'cbm-warm', { ok: r.ok }) })
+      .catch(() => { state.warmOk = false; telemetry(cfg, state, 'cbm-warm', { ok: false }) })
+  }
   return state
 }
 
@@ -513,11 +524,11 @@ function report(cfg, state) {
     `索引引擎(①): ${state.cbm}  ${state.cbmPath || '(未找到)'}${state.cbmVersion ? '  ' + state.cbmVersion : ''}`,
     `引擎实测: 实测通过 ${testedEngine() || '(未声明)'}；当前 ${state.cbmVersion || '(未探测)'}${engineVerdict(state.cbmVersion) === 'untested' ? '  ⚠ 超出实测范围——工具面可能已变，跑 npm run check' : ''}`,
     `清单: ${state.configPath ?? '(未写)'}  exclude=${JSON.stringify(EXCLUDE_TOOLS)}`,
-    `代理工具: ${PROXY_TOOL}  bootstrap=${cfg.bootstrap}  adapterVersion=${cfg.adapterVersion}`,
+    `代理工具: ${PROXY_TOOL}  bootstrap=${cfg.bootstrap}  adapterVersion=${cfg.adapterVersion}  warm=${state.warm ? (state.warmOk === true ? 'ok' : state.warmOk === false ? 'failed' : 'pending') : 'off'}`,
     `触发层: wrapper=${cfg.wrapperTools ? 'on' : 'off'}  enforce=${cfg.enforce}  intercept=${cfg.interceptTools.join('+') || '(无)'}  budget=${cfg.interceptBudgetMs}ms  dirty=${cfg.dirtyTracking ? 'on' : 'off'}(冷却 ${cfg.dirtyRefreshCooldownSec}s)  context=${cfg.contextHint ? 'on' : 'off'}`,
     `语义层(zg): ${state.zg}  toolset=${cfg.zgToolset}  ${cfg.zgCli}`,
-    // 只说 UI 真的能改的东西：volatile 是必要条件，页面只画了 enforce / telemetry。
-    '热改: enforce / telemetry → 设置 → 插件 → dsh-codebase-memory → codebase-memory 行「配置」（不用重启）；interceptBudgetMs 也是 volatile，但只能改配置文件',
+    // v0.9.0 起六个热字段全在页面上；volatile 是必要条件，页面画的是全集。
+    '热改: enforce / telemetry / contextHint / dirtyTracking / interceptBudgetMs / interceptTools → 设置 → 插件 → dsh-codebase-memory → codebase-memory 行「配置」（不用重启）；其余字段改 profile 的 cordis.patch.yml 并重启',
     `遥测计数(跨重启累计): ${Object.entries(state.counts).map(([k, v]) => `${k}=${v}`).join(' ') || '(无事件)'}`,
     `auto_index: ${state.autoIndex || '(未设置)'}（期望 ${cfg.autoIndex ? 'true' : 'false'}；机器级共享配置，只补"无索引的新项目"，不刷新陈旧坐标）`,
     syncStatusLine(),
@@ -829,15 +840,24 @@ export function projectFromListing(text, cwd) {
   return ''
 }
 
-/** project 名：会话缓存 → code_index 落过的记录 → 现查 list_projects。查不到返回 ''。 */
+/**
+ * project 名：会话缓存 → code_index 落过的记录 → 现查 list_projects。
+ * 返回 `{ project, reason }`：查不到时 reason 必须区分**为什么**查不到——
+ * 实测教训（v0.10.0 验收）：引擎冷启动时 list_projects 会失败，旧版把"查询失败"
+ * 和"不在表里"都报成"还没进代码图"，把一个假消息塞进了真错误里，排障的人被带去
+ * 跑 code_index，而真正的原因（代理层报错/超时）一个字都没露。
+ */
 async function projectFor(ctx, exec, cfg, state, session, cwd, budgetMs = cfg.interceptBudgetMs) {
-  if (session.project) return session.project
+  if (session.project) return { project: session.project, reason: '' }
   const cached = state.projectsByCwd.get(cwd)
-  if (cached) { session.project = cached; return cached }
+  if (cached) { session.project = cached; return { project: cached, reason: '' } }
   const r = await cbmCall(ctx, exec, 'list_projects', {}, budgetMs)
-  const found = r.ok ? projectFromListing(r.text, cwd) : ''
-  if (found) { session.project = found; state.projectsByCwd.set(cwd, found) }
-  return found
+  if (!r.ok) {
+    return { project: '', reason: `list_projects 查询失败（${r.timeout ? '超时' : '代理报错'}）：${(r.text || '').trim().slice(0, 120) || '(空输出)'}` }
+  }
+  const found = projectFromListing(r.text, cwd)
+  if (found) { session.project = found; state.projectsByCwd.set(cwd, found); return { project: found, reason: '' } }
+  return { project: '', reason: `项目表里没有 cwd=${cwd}` }
 }
 
 /**
@@ -973,6 +993,8 @@ const noVars = (s) => String(s).replace(/\{\{/g, '{ {')
 
 /** 封装工具走的是模型主动等待的路径，预算给到 20s（实测代理查询 ~30–60ms，冷路径更高）。 */
 const WRAPPER_BUDGET_MS = 20000
+// 预热预算：bootstrap 在会话外跑，不挡任何人，给足冷启动时间（v0.10.1）。
+const WARM_BUDGET_MS = 20000
 
 const tryJson = (text) => { try { return JSON.parse(String(text ?? '')) } catch { return null } }
 
@@ -1015,8 +1037,8 @@ async function runCbmFlow(ctx, cfg, state, exec, work) {
   if (state.adapter !== 'ready') throw new Error('压缩层(②)未就绪，检索无法工作：\n' + report(cfg, state))
   if (state.cbm !== 'ready') throw new Error(cbmInstallHint(state))
   const sess = sessionOf(state, sessionKey(exec.agent))
-  const project = await projectFor(ctx, exec, cfg, state, sess, cwd, WRAPPER_BUDGET_MS)
-  if (!project) throw new Error(`本工作区还没进代码图（project 表里没有 cwd=${cwd}）。第一步：code_index，然后再来用封装工具。`)
+  const { project, reason } = await projectFor(ctx, exec, cfg, state, sess, cwd, WRAPPER_BUDGET_MS)
+  if (!project) throw new Error(`封装工具查不到本工作区的 project（${reason}）。不在表里就先 code_index；查询失败多半是引擎冷启动，再试一次即可。`)
   return work({ project, sess, cwd })
 }
 
@@ -1115,6 +1137,7 @@ export async function apply(ctx, config) {
     adapter: 'unknown', cbm: 'unknown', ok: false, autoIndex: '', refreshing: new Set(), notes: [], lastError: '',
     zg: 'off',
     sessions: new Map(), projectsByCwd: new Map(), counts: {}, indexJobs: new Map(),
+    warm: false, warmOk: null, // 冷启动预热（v0.10.1）：warm=打过一次，warmOk=那次的结果
   }
   // 开机播种累计计数：重启不是归零（写侧与文件 max 合并，见 pushStats）。
   // 遥测关着就不播种——否则 code_setup 的计数行会报上一轮的旧数，像还在记。
@@ -1422,7 +1445,7 @@ export async function apply(ctx, config) {
           telemetry(cfg, state, 'intercept-skip-seen', { session: key, symbol: q.symbol })
           return next()
         }
-        const project = await projectFor(ctx, exec, cfg, state, sess, cwd)
+        const { project } = await projectFor(ctx, exec, cfg, state, sess, cwd)
         if (!project) return next()
         const fresh = ledgerStale(sess)
         if (fresh !== 'fresh') {
@@ -1491,7 +1514,7 @@ export async function apply(ctx, config) {
           scheduleDirtyRefresh(ctx, cfg, state, sess, exec)
           return next()
         }
-        const project = await projectFor(ctx, exec, cfg, state, sess, cwd)
+        const { project } = await projectFor(ctx, exec, cfg, state, sess, cwd)
         let source = ''
         let text = ''
         // 区分"索引本来没答案"与"层查询失败"（超时/底层错误文本）：前者 grep 才是对的
