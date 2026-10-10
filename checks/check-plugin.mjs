@@ -18,6 +18,8 @@
  *   G 触发层（docs/design-v2.md 杠杆 ①②③⑤）：分类器正反例、封装工具、
  *     deny-once 只拦一次、前提不满足/超预算一律 fail-open、
  *     写后记账与坐标过期改放行、按 query 条件注入。走假代理工具，不依赖真引擎。
+ *   R2/R3/S2 泡数据完整性（v0.8.2，两个遥测里抓到的真 bug 的回归锁）：越界 grep
+ *     不替换、底层错误文本不算命中（失败与无命中分开计数）、累计计数跨重启播种+落盘。
  */
 import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -76,6 +78,9 @@ function makeStubProxy(calls, opts = {}) {
         case 'cbm_list_projects':
           return { content: [{ type: 'text', text: `projects: 1  (cols: name root_path branch)\n  ${project} ${root.replace(/\\/g, '/')} main` }] }
         case 'cbm_search_graph':
+          // 代理工具会把底层 MCP 错误包成**普通文本**（isError 不置真）——实测
+          // zg 打不开 collection 时返回 "Error: Failed to open…"。错误文本不是命中。
+          if (opts.errorSearch) return { content: [{ type: 'text', text: 'Error: Failed to open zvec collection storage\n\nExpected parameters:\n  root (string) *required*' }] }
           return { content: [{ type: 'text', text: JSON.stringify(opts.emptySearch
             ? { cols: ['qn', 'label', 'file', 'lines', 'rank'], rows: [], total: 0, returned: 0, has_more: false }
             : { cols: ['qn', 'label', 'file', 'lines', 'rank'], rows: [[`${project}.stubSymbol`, 'Function', 'index.js', '42-44', -1.2]], total: 1, returned: 1, has_more: false }) }] }
@@ -197,7 +202,14 @@ async function verify(profile) {
   if (name !== 'dsh-codebase-memory') throw new Error(`unexpected plugin name: ${name}`)
   record('装载', true, `name=${name}  inject=${inject.join(',')}`)
 
-  const mount = async (config, proxy = null, ctxOpts = null) => {
+  // 累计计数文件是**跨挂载存活**的用户数据；harness 若共享一份，前面的臂会把计数
+  // 泡进后面臂的播种里，精确数字断言全废。所以每次 mount 默认换一个新文件
+  // （DSH_CBM_COUNTS_FILE 是插件侧的测试缝），只有持久化臂显式共用同一份。
+  const countsDir = join(tmpdir(), `cbm-counts-${process.pid}-${profile}`)
+  mkdirSync(countsDir, { recursive: true })
+  let countsSeq = 0
+  const mount = async (config, proxy = null, ctxOpts = null, countsFile = null) => {
+    process.env.DSH_CBM_COUNTS_FILE = countsFile ?? join(countsDir, `c${(countsSeq += 1)}.json`)
     const tools = new Map()
     const sections = []
     const contexts = []
@@ -470,7 +482,7 @@ async function verify(profile) {
   record('G deny-once 字面量类永不拦', literalPass?.kind === 'allow')
   const denyReport = await d.tools.get('code_setup').execute({}, withSignal(REPO))
   record('G 报表里能看到触发层开关与遥测计数', /触发层:.*enforce=deny-once/.test(denyReport) && /intercept-deny=1/.test(denyReport),
-    [/触发层:.*$/m, /遥测计数:.*$/m].map((re) => re.exec(denyReport)?.[0] ?? '(缺行)').join(' | ').slice(0, 220))
+    [/触发层:.*$/m, /遥测计数.*$/m].map((re) => re.exec(denyReport)?.[0] ?? '(缺行)').join(' | ').slice(0, 220))
 
   // G4 前提不满足即放行：索引未就绪（project 查不到）。
   const uCalls = []
@@ -657,7 +669,7 @@ async function verify(profile) {
   record('R 热翻 volatile enforce 立即作用于替换通道（不用重启）',
     flipBefore?.content === undefined && /stubSymbol/.test(flipAfter?.content?.[0]?.text ?? ''), `off→${JSON.stringify(flipBefore).slice(0, 40)} replace→${JSON.stringify(flipAfter).slice(0, 60)}`)
   const rReport = await r.tools.get('code_setup').execute({}, withSignal(REPO))
-  record('R 遥测计数里能看到 intercept-replace', /intercept-replace=1/.test(rReport), /遥测计数:.*$/m.exec(rReport)?.[0]?.slice(0, 220) ?? '(缺行)')
+  record('R 遥测计数里能看到 intercept-replace', /intercept-replace=1/.test(rReport), /遥测计数.*$/m.exec(rReport)?.[0]?.slice(0, 220) ?? '(缺行)')
 
   // ── 臂 S：设置页读数通道 —— counts → volatile stats 引用 + 节流 emit ────────────
   // 生产里 stats 引用由 loader 造（cosmokit createVolatile）；验收环境没装 cosmokit，
@@ -692,6 +704,48 @@ async function verify(profile) {
   await (so.events['tools/post-execute'] ?? [])[0](grepExec(fakeAgent(`sess-${process.pid}-soff`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
   record('S 遥测关 ⇒ 不推读数也不 emit（页面与日志同一开关，冻结在最后值）',
     sOff.get() === '' && !(so.emits ?? []).some((x) => x[0] === 'settings/document-updated'), String(sOff.get()).slice(0, 40))
+
+  // ── 臂 R2/R3：泡数据完整性两修（遥测里抓到的真 bug 的回归锁）──────────────────
+  // R2 越界：图谱/zg 都是工作区级的，path 指到工作区外的 grep 被替换=伪造坐标
+  //     （实测遥测：path=AppData\… 的 grep 换成了本仓命中）。
+  const r2Calls = []
+  const r2 = await mount({ enforce: 'replace', dirtyTracking: false, telemetry: false }, makeStubProxy(r2Calls, { project: `stub-${process.pid}-rscope` }))
+  await r2.tools.get('code_setup').execute({}, withSignal(REPO))
+  const postR2 = (r2.events['tools/post-execute'] ?? [])[0]
+  const agentR2 = fakeAgent(`sess-${process.pid}-rscope`, REPO)
+  const outSwap = await postR2(grepExec(agentR2, 'usageSection', { path: ADAPTER_DIR }), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  record('R2 搜工作区之外的 grep 原样保留（不查两层、不换）',
+    outSwap?.kind === 'accept' && outSwap?.content === undefined && !r2Calls.some((x) => x.tool === 'cbm_search_graph'),
+    `${JSON.stringify(outSwap).slice(0, 50)} calls=${r2Calls.map((x) => x.tool).join(',') || '(无)'}`)
+  const inSwap = await postR2(grepExec(agentR2, 'usageSection', { path: join(REPO, 'index.js') }), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  record('R2 工作区内指定文件的 grep 照换（作用域门不误伤正路）', /stubSymbol/.test(inSwap?.content?.[0]?.text ?? ''), JSON.stringify(inSwap).slice(0, 60))
+  // R3 错误文本：代理把底层 MCP 错误包成普通文本返回（isError 假），错误被当命中
+  //     替换了原输出（实测遥测 source=zg）。且「查询失败」与「无命中」分开计数——
+  //     泡数据时这两个占比含义相反。
+  const r3Ref = mkVolRef('')
+  const r3 = await mount({ enforce: 'replace', dirtyTracking: false, stats: r3Ref }, makeStubProxy([], { project: `stub-${process.pid}-rerr`, errorSearch: true }))
+  await r3.tools.get('code_setup').execute({}, withSignal(REPO))
+  const r3Swap = await (r3.events['tools/post-execute'] ?? [])[0](grepExec(fakeAgent(`sess-${process.pid}-rerr`, REPO), 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  let r3Stats = null
+  try { r3Stats = JSON.parse(String(r3Ref.get())) } catch { /* 下一条断言报出来 */ }
+  record('R3 Error 文本判为失败：不替换，且计成 passFailed 而非 noHit',
+    r3Swap?.content === undefined && (r3Stats?.replace?.passFailed ?? 0) === 1 && (r3Stats?.replace?.hit ?? 0) === 0 && (r3Stats?.replace?.passNoHit ?? 1) === 0,
+    String(r3Ref.get()).slice(0, 170))
+
+  // ── 臂 S2：累计计数跨重启（「跑几天看占比」不能每次重启归零）─────────────────
+  const seedFile = join(countsDir, 's2-shared.json')
+  writeFileSync(seedFile, JSON.stringify({ 'intercept-replace': 7, 'intercept-replace:graph': 5 }))
+  const s2Ref = mkVolRef('')
+  const s2 = await mount({ enforce: 'replace', dirtyTracking: false, stats: s2Ref }, makeStubProxy([], { project: `stub-${process.pid}-s2` }), null, seedFile)
+  let s2Boot = null
+  try { s2Boot = JSON.parse(String(s2Ref.get())) } catch { /* 下一条断言报出来 */ }
+  record('S2 重启不归零：开机从累计文件播种，第一帧读数就带历史数',
+    (s2Boot?.replace?.hit ?? 0) === 7 && (s2Boot?.replace?.graph ?? 0) === 5, String(s2Ref.get()).slice(0, 120))
+  await s2.tools.get('code_setup').execute({}, withSignal(REPO))
+  await (s2.events['tools/post-execute'] ?? [])[0](grepExec(fakeAgent(`sess-${process.pid}-s2`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
+  const s2File = JSON.parse(String(readFileSync(seedFile, 'utf8')))
+  record('S2 新事件落盘：与文件 max 合并（7→8），不是覆盖也不是只留内存',
+    (s2File['intercept-replace'] ?? 0) === 8 && (s2File['intercept-replace:graph'] ?? 0) === 6, JSON.stringify(s2File).slice(0, 170))
 
   rmSync(tRepo, { recursive: true, force: true })
 

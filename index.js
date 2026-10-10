@@ -24,7 +24,7 @@ import z from '@deepseek-ai/schemastery'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const name = 'dsh-codebase-memory'
@@ -505,7 +505,7 @@ function report(cfg, state) {
     `语义层(zg): ${state.zg}  toolset=${cfg.zgToolset}  ${cfg.zgCli}`,
     // 只说 UI 真的能改的东西：volatile 是必要条件，页面只画了 enforce / telemetry。
     '热改: enforce / telemetry → 设置 → 插件 → dsh-codebase-memory → codebase-memory 行「配置」（不用重启）；interceptBudgetMs 也是 volatile，但只能改配置文件',
-    `遥测计数: ${Object.entries(state.counts).map(([k, v]) => `${k}=${v}`).join(' ') || '(无事件)'}`,
+    `遥测计数(跨重启累计): ${Object.entries(state.counts).map(([k, v]) => `${k}=${v}`).join(' ') || '(无事件)'}`,
     `auto_index: ${state.autoIndex || '(未设置)'}（期望 ${cfg.autoIndex ? 'true' : 'false'}；机器级共享配置，只补"无索引的新项目"，不刷新陈旧坐标）`,
     syncStatusLine(),
   ]
@@ -727,6 +727,21 @@ export function normPath(p, cwd = '') {
   return /^[a-z]:\//.test(s) ? s[0].toLowerCase() + s.slice(1) : s
 }
 
+/**
+ * 搜索目标是否落在本工作区内：没有 path 参数 = 全仓搜索（属工作区）；给了 path
+ * 只有解析后仍在工作区内才算。图谱与 zg 都是**工作区级**的，越界的 grep（比如
+ * 去搜宿主依赖目录）它们答不了——替换=拿本仓的命中伪造越界文件的坐标（实测
+ * 遥测：path=AppData\… 的 grep 被换成本仓图谱命中）。导出以便验收直接证伪。
+ */
+export function coversWorkspace(args, cwd) {
+  const raw = String(args?.path ?? '').trim()
+  if (!raw) return true
+  const norm = (p) => String(p).replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase()
+  const target = norm(resolve(String(cwd ?? ''), raw))
+  const base = norm(cwd)
+  return !!base && (target === base || target.startsWith(base + '/'))
+}
+
 /** 会话键：优先 session id（resume/多标签下 cwd 可能相同），退回 cwd。 */
 const sessionKey = (agent) => agent?.session?.header?.id ?? agent?.session?.header?.cwd ?? ''
 
@@ -782,7 +797,13 @@ async function cbmCall(ctx, exec, tool, args, budgetMs, namePrefix = 'cbm') {
   const outcome = await withBudget(budgetMs, () => ctx.tools.execute(input))
   if (!outcome) return { ok: false, text: '', timeout: true }
   if (outcome.isError) return { ok: false, text: resultText(outcome) }
-  return { ok: true, text: resultText(outcome) }
+  const text = resultText(outcome)
+  // 代理工具会把**底层 MCP 工具的错误包成普通文本**返回（outcome.isError 仍是 false）：
+  // 实测 zg 守护打不开 collection 时返回 "Error: Failed to open zvec collection storage…"，
+  // 若不识别，错误文本会被当成命中去替换原始输出（遥测里 source=zg 的 intercept-replace）。
+  // Error 开头的文本 = 失败，由调用方放行；图谱树以 project:/total:/rows 或 JSON 开头，安全。
+  if (/^\s*error\b/i.test(text)) return { ok: false, text }
+  return { ok: true, text }
 }
 
 /** 从 list_projects 的文本表里按 root_path 找 project 名（不自己重算引擎的命名规则）。 */
@@ -826,6 +847,22 @@ const ledgerStale = (sess) => (sess.dirty.size > 0 ? 'stale' : 'fresh')
 const TELEMETRY_MAX_BYTES = 512 * 1024
 
 /**
+ * 累计计数文件 = telemetry.log 同目录的 telemetry.counts.json。「开 replace 跑几天
+ * 看占比」要熬得过宿主重启：启动播种、每次推送与文件 max 合并。
+ * DSH_CBM_COUNTS_FILE 是测试缝——验收 harness 必须把它指到临时文件，否则会污染
+ * 用户的真实累计数；宿主不会设置这个变量。
+ */
+const countsPath = (cfg) => process.env.DSH_CBM_COUNTS_FILE || join(cfg.adapterDir, 'telemetry.counts.json')
+function loadCounts(cfg) {
+  try {
+    const parsed = JSON.parse(readFileSync(countsPath(cfg), 'utf8'))
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+/**
  * state.counts → 设置页读数（JSON 字符串）。**每次全量重建**：用户任何一次配置写
  * 都会让 loader 把这个 volatile 字段复位成 schema 默认（_commitVolatile 只认文档
  * 层），下一个事件回填，所以绝不能做增量。键名是面板的契约，改键要同步 lib/client.js。
@@ -834,7 +871,7 @@ function renderStats(state) {
   const n = (k) => state.counts[k] ?? 0
   return JSON.stringify({
     at: Date.now(),
-    replace: { hit: n('intercept-replace'), graph: n('intercept-replace:graph'), zg: n('intercept-replace:zg'), passDirty: n('replace-pass-dirty'), passNoHit: n('replace-pass-no-hit'), error: n('replace-error') },
+    replace: { hit: n('intercept-replace'), graph: n('intercept-replace:graph'), zg: n('intercept-replace:zg'), passDirty: n('replace-pass-dirty'), passNoHit: n('replace-pass-no-hit'), passFailed: n('replace-pass-failed'), error: n('replace-error') },
     deny: { blocked: n('intercept-deny'), passDirty: n('intercept-pass-dirty'), passNoHit: n('intercept-pass-no-hit'), passQueryFailed: n('intercept-pass-query-failed'), skipSeen: n('intercept-skip-seen'), error: n('intercept-error') },
     dirty: { record: n('dirty-record'), refreshScheduled: n('dirty-refresh-scheduled'), refreshDone: n('dirty-refresh-done'), refreshFail: n('dirty-refresh-fail') },
     lever: { wrapperCalls: n('wrapper-call'), hintInjected: n('hint-injected') },
@@ -1025,6 +1062,7 @@ function interceptPremises(exec, cfg, state) {
   const key = sessionKey(exec?.agent)
   const cwd = exec?.agent?.session?.header?.cwd
   if (!key || !cwd || !state.ok) return null
+  if (!coversWorkspace(exec?.arguments, cwd)) return null
   return { q, key, cwd, sess: sessionOf(state, key) }
 }
 
@@ -1064,6 +1102,9 @@ export async function apply(ctx, config) {
     zg: 'off',
     sessions: new Map(), projectsByCwd: new Map(), counts: {}, indexJobs: new Map(),
   }
+  // 开机播种累计计数：重启不是归零（写侧与文件 max 合并，见 pushStats）。
+  // 遥测关着就不播种——否则 code_setup 的计数行会报上一轮的旧数，像还在记。
+  if (cfg.telemetry) for (const [k, v] of Object.entries(loadCounts(cfg))) if (typeof v === 'number') state.counts[k] = v
 
   const ac = new AbortController()
   state.abortSignal = ac.signal
@@ -1077,10 +1118,25 @@ export async function apply(ctx, config) {
   // （ns），否则 cordis dispatch 会把它当 thisArg 过滤掉监听器。
   state.statsRef = config.stats
   let statsTimer = null
+  let statsWritten = ''
   const doStatsEmit = () => { try { ctx.emit('settings/document-updated', 'codebase-memory', Date.now()) } catch { /* 没有转发器就算了 */ } }
   state.pushStats = () => {
     const ref = state.statsRef
     if (isVolRef(ref)) { try { ref[VOL_WRITE](renderStats(state)) } catch { /* 绝不影响会话 */ } }
+    // 累计落盘：只在计数变了时写；先与文件 max 合并再写——tauri/web 两宿主并跑时
+    // 各自只见自己的增量，max 是最接近跨进程总数的廉价做法（真总数要 per-pid 文件+读侧聚合，不值）。
+    if (cfg.telemetry) {
+      const snap = JSON.stringify(state.counts)
+      if (snap !== statsWritten) {
+        statsWritten = snap
+        try {
+          const f = loadCounts(cfg)
+          for (const [k, v] of Object.entries(state.counts)) if (typeof v === 'number' && v > (typeof f[k] === 'number' ? f[k] : 0)) f[k] = v
+          if (!process.env.DSH_CBM_COUNTS_FILE) mkdirSync(cfg.adapterDir, { recursive: true })
+          writeFileSync(countsPath(cfg), JSON.stringify(f))
+        } catch { /* 绝不影响会话 */ }
+      }
+    }
     if (statsTimer) return // 合并窗口内：只等尾随那一次，页面拿到窗口末的最新值
     doStatsEmit()
     statsTimer = setTimeout(() => { statsTimer = null; doStatsEmit() }, STATS_PUSH_MS)
@@ -1346,6 +1402,7 @@ export async function apply(ctx, config) {
         const key = sessionKey(exec.agent)
         const cwd = exec.agent?.session?.header?.cwd
         if (!key || !cwd || !state.ok) return next()
+        if (!coversWorkspace(exec.arguments, cwd)) return next() // 越界搜索：图谱答不了，拦了就是伪造坐标
         const sess = sessionOf(state, key)
         if (cfg.enforce === 'deny-once' && sess.blocked.has(q.symbol)) {
           telemetry(cfg, state, 'intercept-skip-seen', { session: key, symbol: q.symbol })
@@ -1422,9 +1479,13 @@ export async function apply(ctx, config) {
         const project = await projectFor(ctx, exec, cfg, state, sess, cwd)
         let source = ''
         let text = ''
+        // 区分"索引本来没答案"与"层查询失败"（超时/底层错误文本）：前者 grep 才是对的
+        // 工具，后者是基础设施问题——泡数据时这两个占比的含义相反，不能混一个计数。
+        let failed = false
         if (project) {
           const hits = await cbmCall(ctx, exec, 'search_graph', { project, query: q.symbol, limit: 5 }, cfg.interceptBudgetMs)
           if (hits.ok && !noHits(hits.text)) { source = 'graph'; text = hits.text }
+          else if (!hits.ok) failed = true
         }
         // 图谱没答案才轮到 zg 语义层；root 由钩子补上——模型忘填必填参数的坑就此消掉。
         // ponytail: zg 冷启动实测 3.3s，超过默认 2500ms 预算 ⇒ 会话里第一条被换的
@@ -1433,9 +1494,10 @@ export async function apply(ctx, config) {
         if (!text && state.zg === 'ready') {
           const z = await cbmCall(ctx, exec, 'zvec_grep_search', { query: q.symbol, root: cwd, limit: 5 }, cfg.interceptBudgetMs, 'zg')
           if (z.ok && !noHits(z.text)) { source = 'zg'; text = z.text }
+          else if (!z.ok) failed = true
         }
         if (!text) {
-          telemetry(cfg, state, 'replace-pass-no-hit', { session: key, symbol: q.symbol })
+          telemetry(cfg, state, failed ? 'replace-pass-failed' : 'replace-pass-no-hit', { session: key, symbol: q.symbol })
           return next() // 索引本来没答案 ⇒ grep 才是对的工具
         }
         telemetry(cfg, state, 'intercept-replace', { session: key, symbol: q.symbol, source })
