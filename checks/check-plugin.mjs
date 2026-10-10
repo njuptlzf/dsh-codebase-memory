@@ -691,8 +691,8 @@ async function verify(profile) {
   sHint?.text({ agent: fakeAgent(`sess-${process.pid}-stats`, REPO, codeAsk) })
   let sp = null
   try { sp = JSON.parse(String(sRef.get())) } catch { /* 下一行断言会把它报出来 */ }
-  record('S 替换事件把全量读数推进 volatile stats 引用（hit + graph 拆分 + at）',
-    sp?.replace?.hit === 1 && sp?.replace?.graph === 1 && typeof sp?.at === 'number', String(sRef.get()).slice(0, 170))
+  record('S 替换事件把全量读数推进 volatile stats 引用（hit + graph 拆分 + zg 状态 + at）',
+    sp?.replace?.hit === 1 && sp?.replace?.graph === 1 && sp?.zg === 'off' && typeof sp?.at === 'number', String(sRef.get()).slice(0, 170))
   const sEmit = (s.emits ?? []).find((x) => x[0] === 'settings/document-updated')
   record('S 推送后 emit settings/document-updated（首参是字符串 ns，cordis 才不会把它当 thisArg 过滤）',
     !!sEmit && sEmit[1] === 'codebase-memory' && typeof sEmit[2] === 'number', JSON.stringify(sEmit ?? null))

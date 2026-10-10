@@ -155,16 +155,22 @@ ok(!!dictEntry, '注册了 locale 字典')
 ok(!!dictEntry && dictEntry.ns === panel?.locale, 'locale 字典的 NS 与 register({locale}) 一致', `${dictEntry?.ns} vs ${panel?.locale}`)
 for (const lang of ['zh', 'en']) ok(!!dictEntry?.dict?.[lang], `字典有 ${lang}`)
 const keys = Object.keys(dictEntry?.dict?.zh || {})
-for (const key of ['title', 'summary', 'loading', 'unavailable', 'enforce.label', 'telemetry.label', 'reset', 'saveFailed', 'foot',
+for (const key of ['title', 'summary', 'loading', 'unavailable', 'enforce.label', 'telemetry.label', 'resetField', 'saveFailed', 'foot',
   'stats.label', 'stats.empty', 'stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index', 'stats.updated',
   'stats.r.graph', 'stats.r.zg',
   'hint.label', 'hint.hint', 'dirty.label', 'dirty.hint', 'interceptBudgetMs.label', 'interceptBudgetMs.hint',
-  'interceptTools.label', 'interceptTools.hint']) {
+  'interceptTools.label', 'interceptTools.hint',
+  'sec.soft', 'sec.soft.hint', 'sec.hard', 'sec.hard.hint', 'sec.layers', 'sec.layers.hint',
+  'sec.aux', 'sec.aux.hint', 'sec.params', 'sec.params.hint',
+  'layer.graph', 'layer.graph.on', 'layer.zg', 'layer.zg.off', 'layer.zg.ready', 'layer.zg.missing', 'layer.zg.unknown']) {
   ok(keys.includes(key), `字典有 key ${key}`)
 }
-for (const key of ['hint.label', 'dirty.label', 'interceptBudgetMs.label', 'interceptTools.label']) {
+for (const key of ['hint.label', 'dirty.label', 'interceptBudgetMs.label', 'interceptTools.label', 'resetField',
+  'sec.soft', 'sec.hard', 'sec.layers', 'sec.aux', 'sec.params',
+  'layer.graph', 'layer.zg', 'layer.zg.off', 'layer.zg.ready', 'layer.zg.missing', 'layer.zg.unknown']) {
   ok(Object.keys(dictEntry?.dict?.en || {}).includes(key), `en 字典有 key ${key}`)
 }
+ok(!keys.includes('reset'), '没有裸「恢复默认」key——每个字段的恢复按钮必须叫「恢复此项」', keys.filter((k) => k.startsWith('reset')).join('|'))
 for (const mode of modes) {
   ok(keys.includes(`enforce.${mode}`) && keys.includes(`enforce.${mode}.hint`), `字典覆盖模式 ${mode}`)
   ok(Object.keys(dictEntry?.dict?.en || {}).includes(`enforce.${mode}`), `en 字典同样覆盖 ${mode}`)
@@ -192,21 +198,28 @@ ok(JSON.stringify(segValues) === JSON.stringify(modes), '分段控件的选项 =
 ok(seg?.props?.value === 'deny-once', '分段控件当前值取自主机快照', seg?.props?.value)
 ok(seg?.props?.disabled === false, 'writable 时控件可用')
 const switches = flatten(tree).filter((n) => n.type === primitives.Switch)
-ok(switches.length === 3, '渲染出 3 个 Switch（telemetry / contextHint / dirtyTracking）', String(switches.length))
-ok(switches[0]?.props?.checked === true, 'telemetry=true → checked', String(switches[0]?.props?.checked))
-ok(switches[1]?.props?.checked === true && switches[2]?.props?.checked === true,
-  'contextHint / dirtyTracking 缺省即开（!== false 判定）', `${switches[1]?.props?.checked}|${switches[2]?.props?.checked}`)
+ok(switches.length === 3, '渲染出 3 个 Switch（contextHint / dirtyTracking / telemetry——按层排布）', String(switches.length))
+const texts185 = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
+ok(['sec.soft', 'sec.hard', 'sec.layers', 'sec.aux', 'sec.params'].every((k) => texts185.includes(k)),
+  '五个分层标题按序在场（软引导→硬拦截→检索两层→记账遥测→参数）', texts185.filter((t) => t.startsWith('sec.')).join('|'))
+ok(texts185.includes('layer.graph.on') && texts185.includes('layer.zg.unknown'),
+  '检索两层状态行常驻；没数时语义层明说「状态未知」', texts185.filter((t) => t.startsWith('layer.')).join('|'))
+ok(switches[2]?.props?.checked === true, 'telemetry=true → checked', String(switches[2]?.props?.checked))
+ok(switches[0]?.props?.checked === true && switches[1]?.props?.checked === true,
+  'contextHint / dirtyTracking 缺省即开（!== false 判定）', `${switches[0]?.props?.checked}|${switches[1]?.props?.checked}`)
+ok(flatten(tree).some((n) => n.type === 'span' && n.props?.children === 'telemetry.label'),
+  '开关标签与控件同行（span 自铺，不依赖 Switch 的 label prop 渲染）')
 
 // 点击：改写宿主表单，而不是本地状态。
 seg.props.onChange('deny')
-switches[0].props.onChange(false)
+switches[2].props.onChange(false)
 ok(JSON.stringify(calls.set) === JSON.stringify([['enforce', 'deny'], ['telemetry', false]]), 'onChange 直接 form.set(字段, 值)', JSON.stringify(calls.set))
-ok(findType(tree, (n) => n.type === primitives.Button) === undefined, 'user 层为空 → 不显示「恢复默认」')
+ok(findType(tree, (n) => n.type === primitives.Button) === undefined, 'user 层为空 → 不显示任何「恢复此项」')
 
 storeSnapshot = { status: 'ready', value: { enforce: 'deny', telemetry: true }, base: {}, user: { enforce: 'deny' }, writable: true, revision: 8 }
 tree = panel.component({ ...props })
 const buttons = flatten(tree).filter((n) => n.props && typeof n.props.onClick === 'function')
-ok(buttons.length >= 1, 'user 层有 enforce → 出现「恢复默认」按钮', String(buttons.length))
+ok(buttons.length >= 1, 'user 层有 enforce → 出现「恢复此项」按钮', String(buttons.length))
 buttons[0].props.onClick()
 ok(JSON.stringify(calls.unset) === JSON.stringify(['enforce']), '按钮走 form.unset（回到 bundle 默认值）', JSON.stringify(calls.unset))
 
@@ -219,8 +232,8 @@ storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, con
 tree = panel.component({ ...props })
 const sw2 = flatten(tree).filter((n) => n.type === primitives.Switch)
 calls.set.length = 0
-sw2[1].props.onChange(true)
-ok(sw2[1].props.checked === false, 'contextHint=false → 开关显示关（缺省开只属于 !== false）', String(sw2[1].props.checked))
+sw2[0].props.onChange(true)
+ok(sw2[0].props.checked === false, 'contextHint=false → 开关显示关（缺省开只属于 !== false）', String(sw2[0].props.checked))
 const inputs = flatten(tree).filter((n) => n.type === primitives.Input)
 ok(inputs.length === 2, '两个输入框（interceptBudgetMs / interceptTools）', String(inputs.length))
 ok(inputs[0]?.props?.type === 'number' && inputs[0]?.props?.defaultValue === 2500
@@ -241,7 +254,7 @@ inputs[1].props.onKeyDown({ key: 'a', currentTarget: fakeTarget })
 ok(blurred === 1, '回车即提交（走 blur），普通按键不打扰表单', String(blurred))
 calls.unset.length = 0
 const btns2 = flatten(tree).filter((n) => n.props && typeof n.props.onClick === 'function')
-ok(btns2.length === 1, 'user 层只有 contextHint ⇒ 恰一个「恢复默认」', String(btns2.length))
+ok(btns2.length === 1, 'user 层只有 contextHint ⇒ 恰一个「恢复此项」', String(btns2.length))
 btns2[0].props.onClick()
 ok(JSON.stringify(calls.unset) === JSON.stringify(['contextHint']), '新字段的恢复默认同样走 form.unset', JSON.stringify(calls.unset))
 
@@ -258,6 +271,7 @@ ok(panel.component({ ...props, view: 'summary' }) === 'summary', 'summary 态返
 /* ---- 6. 读数卡片（stats 只读，样式参考 dsh-mneme 状态页）---- */
 const statsJson = JSON.stringify({
   at: 1791531188925,
+  zg: 'ready',
   replace: { hit: 8, graph: 6, zg: 2, passDirty: 2, passNoHit: 0, error: 0 },
   deny: { blocked: 3, passDirty: 1, passNoHit: 2, passQueryFailed: 0, skipSeen: 4, error: 0 },
   dirty: { record: 9, refreshScheduled: 5, refreshDone: 4, refreshFail: 1 },
@@ -272,6 +286,7 @@ ok(texts.includes('80%'), '命中率大数字 = hit/(hit+让路+无命中+出错
 ok(texts.includes('8/10'), '被替换行 = hit/den', texts.filter((t) => /^\d+\/\d+$/.test(t)).join('|'))
 ok(['stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index'].every((k) => texts.includes(k)), '五张卡片都在')
 ok(texts.includes('stats.r.graph') && texts.includes('stats.r.zg'), '占比条题注区分结构层/语义层（两层并存，不是二选一）')
+ok(texts.includes('layer.zg.ready'), '状态行的语义层取自 stats.zg（有数时用实测状态，不再「未知」）', texts.filter((t) => t.startsWith('layer.')).join('|'))
 ok(flatten(tree).filter((n) => n.type === primitives.SegmentedControl).length === 1
   && flatten(tree).filter((n) => n.props && typeof n.props.onClick === 'function').length === 0, '读数块不新增交互件（卡片全只读）')
 storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, stats: '{坏' }, base: {}, user: {}, writable: true, revision: 12 }

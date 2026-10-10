@@ -298,10 +298,15 @@ async function resolveCbm(ctx, cfg, state) {
  * 那是用户的一次显式决定（`npm run install:zg`），后台 bootstrap 不许替用户花带宽。
  */
 function resolveZg(cfg, state) {
-  if (!cfg.zgEnabled) { state.zg = 'off'; return }
-  if (existsSync(cfg.zgCli)) { state.zg = 'ready'; return }
-  state.zg = 'missing'
-  push(state, `zgEnabled=true 但找不到 ${cfg.zgCli}——先跑 npm run install:zg`)
+  if (!cfg.zgEnabled) { state.zg = 'off' }
+  else if (existsSync(cfg.zgCli)) { state.zg = 'ready' }
+  else {
+    state.zg = 'missing'
+    push(state, `zgEnabled=true 但找不到 ${cfg.zgCli}——先跑 npm run install:zg`)
+  }
+  // 页面「检索两层」状态行消费这个字段：探测完立刻推一帧，别等下一个遥测事件。
+  // 遥测关时一帧都不推——「关了就冻结」是 S 臂锁住的契约（页面与日志同一开关）。
+  if (cfg.telemetry && state.pushStats) state.pushStats()
 }
 
 /** 写 adapter 的服务器清单。二进制用绝对 .exe，绕开 .cmd shim。 */
@@ -879,6 +884,7 @@ function renderStats(state) {
   const n = (k) => state.counts[k] ?? 0
   return JSON.stringify({
     at: Date.now(),
+    zg: state.zg,
     replace: { hit: n('intercept-replace'), graph: n('intercept-replace:graph'), zg: n('intercept-replace:zg'), passDirty: n('replace-pass-dirty'), passNoHit: n('replace-pass-no-hit'), passFailed: n('replace-pass-failed'), error: n('replace-error') },
     deny: { blocked: n('intercept-deny'), passDirty: n('intercept-pass-dirty'), passNoHit: n('intercept-pass-no-hit'), passQueryFailed: n('intercept-pass-query-failed'), skipSeen: n('intercept-skip-seen'), error: n('intercept-error') },
     dirty: { record: n('dirty-record'), refreshScheduled: n('dirty-refresh-scheduled'), refreshDone: n('dirty-refresh-done'), refreshFail: n('dirty-refresh-fail') },
