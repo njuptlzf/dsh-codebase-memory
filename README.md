@@ -24,14 +24,18 @@ A [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) host
 DSH host composition (two rows inserted by this bundle's cordis.patch.yml)
 ├─ ④ dsh-codebase-memory          this plugin: bootstraps dependencies, pins the indexed
 │                                 workspace to the session, and tells the model how to use it
-└─ ③ @deepseek-ai/dsh-mcp-client  the official MCP bridge → the model sees exactly one proxy tool
-      └─ ② @njuptlzf/mcp-adapter  token-compression layer: 17 tool schemas → 1 proxy tool
-            │                     (auto-bootstrapped by the plugin, version-pinned)
-            └─ ① codebase-memory-mcp  the engine: 162-language tree-sitter + Hybrid LSP + knowledge graph
-                                      (installed manually)
+└─ ③ @deepseek-ai/dsh-mcp-client  the official MCP bridge
+      └─ ② @njuptlzf/mcp-adapter  token-compression layer: the model sees ONE gateway tool
+            │                     that reaches every server in the manifest (cbm: 17 tool
+            │                     schemas, zg: 1) — auto-bootstrapped, version-pinned
+            ├─ ① codebase-memory-mcp   the engine: 162-language tree-sitter + Hybrid LSP +
+            │                          knowledge graph (installed manually)
+            └─ ①b zvec-grep [optional]  the semantic-search layer: rg + BM25 + vectors,
+                                        exposed through the same gateway as one tool,
+                                        `zg_zvec_grep_search` (see §1b, off by default)
 ```
 
-All four are existing components — **none of them is forked or modified**. The plugin only bootstraps ②, writes ③'s server manifest, and pins ①'s entry point to the session workspace.
+All five are existing components — **none of them is forked or modified**. The plugin only bootstraps ②, writes ③'s server manifest, and pins ①'s entry point to the session workspace. Registering a second MCP server costs no second proxy tool — both ride the same gateway, and the model addresses them by server key (`cbm_…`, `zg_…`). ①b is gated by `zgEnabled` and lives in the same manifest as ①.
 
 ## Why this plugin exists
 
@@ -79,6 +83,16 @@ npm run install:zg          # manual: npm install + prune (drops inference backe
 Once enabled, `code_setup` gains a `语义层(zg): ready  包=已装  页面开关=on` line, the manifest registers the `zg` server (lifecycle `lazy`: the local daemon starts on first use, ~2.2s, then warm queries run 1.4s), and the model sees exactly one tool: **`zg_zvec_grep_search`** (the `agent` toolset — rg passthrough, indexing and server admin stay CLI-side; **proxied tool names carry the mcpServers key as a prefix** — direct it is `zvec_grep_search`, through this manifest it is `zg_zvec_grep_search`). Calls **must pass `root`** (the absolute workspace path); omitting it fails validation with `root: Invalid input`. Index artifacts land in `.zvec-grep/` inside the indexed repo (**add it to gitignore** — both the confirm dialog and the `install-zg` result say so; this repo already does). The prune is gate-checked: `install:zg` ends with a `--version` self-test; freshness reuses the dirty ledger — with `dirtyTracking` on, the background refresh also runs `zg index` (incremental, ~2s).
 
 ### 2. Mount the bundle into a profile (②③④ are fully automatic)
+
+There is no npm package and no `dsh install` command — plugin installation *is* `dsh plugin <args>`, which runs pnpm in the profile directory. So install from the GitHub release directly:
+
+```powershell
+dsh plugin --profile <your-profile> add github:njuptlzf/dsh-codebase-memory#v0.11.1
+```
+
+Keep the `#<tag>` pin: a tag resolves to one commit, so a later `pnpm install` does not silently move under you. Bump the tag (or drop it to follow `main`) when you want a newer release.
+
+Developing the plugin from a local checkout instead:
 
 ```powershell
 git clone https://github.com/njuptlzf/dsh-codebase-memory

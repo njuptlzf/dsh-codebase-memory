@@ -23,12 +23,16 @@
 ```
 DSH host 组合（本 bundle 的 cordis.patch.yml 插两行）
 ├─ ④ dsh-codebase-memory          本插件：依赖自举 + 把会话工作区钉死 + 给模型写使用说明
-└─ ③ @deepseek-ai/dsh-mcp-client  官方 MCP 桥 → 模型只看到一个 mcp__cbm__mcp
-      └─ ② @njuptlzf/mcp-adapter  token 压缩层：17 份 schema 压成 1 个代理工具（插件自举，钉死版本）
-            └─ ① codebase-memory-mcp  索引引擎：162 语言 tree-sitter + Hybrid LSP + 知识图谱（手动安装）
+└─ ③ @deepseek-ai/dsh-mcp-client  官方 MCP 桥
+      └─ ② @njuptlzf/mcp-adapter  token 压缩层：模型只看到一个网关工具，
+            │                     网关背后的每个 server 都能到（cbm 17 份 schema、
+            │                     zg 1 份）——插件自举，钉死版本
+            ├─ ① codebase-memory-mcp   索引引擎：162 语言 tree-sitter + Hybrid LSP + 知识图谱（手动安装）
+            └─ ①b zvec-grep [可选]      语义检索层：rg + BM25 + 向量，同一个网关切只露一个工具
+                                        `zg_zvec_grep_search`（见 §①b，默认关）
 ```
 
-四个都是既有件，**没有任何一个被 fork 或修改**。本插件只做三件事：自举②、给③配好清单、把①的入口按会话工作区钉死。
+五个都是既有件，**没有任何一个被 fork 或修改**。本插件只做三件事：自举②、给③配好清单、把①的入口按会话工作区钉死。多注册一个 MCP server 并不多出一个代理工具——两个 server 共用同一个网关，模型按 server 键寻址（`cbm_…`、`zg_…`）。①b 由 `zgEnabled` 门控，与①同处一份清单。
 
 ## 为什么需要它（这个插件存在的全部理由）
 
@@ -77,6 +81,16 @@ npm run install:zg          # 手动：npm 安装并裁剪（删 transformers.js
 
 
 ### ② 把 bundle 挂进 profile（②③④全自动）
+
+本插件没有 npm 包，也没有 `dsh install` 命令——装插件就是 `dsh plugin <args>`，本质是在 profile 目录里跑 pnpm。所以直接从 GitHub 装：
+
+```powershell
+dsh plugin --profile <你的profile> add github:njuptlzf/dsh-codebase-memory#v0.11.1
+```
+
+`#<tag>` 要留着：tag 钉死一个 commit，之后 `pnpm install` 不会悄悄漂移。要更新时改 tag（或去掉 tag 跟随 `main`）。
+
+在本地 checkout 里开发这个插件时：
 
 ```powershell
 git clone https://github.com/njuptlzf/dsh-codebase-memory
