@@ -10,6 +10,10 @@
  *   dsh plugin --profile <p> add file:<repo>
  * 之后每次改完代码跑这个脚本，再重启 profile 才生效。
  *
+ * 这是**开发者路线**的工具：profile 若按 README 用 `github:...#<tag>` 装发布版，
+ * 跑 sync 会用工作区覆盖已发布拷贝（本地调试可以，pnpm install 即恢复）；
+ * 发布版用户的升级路径是 `dsh plugin add github:...#<新tag>`，不是 sync。
+ *
  * 不用 pnpm 做同步：实测在依赖较多的 profile 里 `dsh plugin add` 会长时间不返回
  * （10 分钟被超时杀掉），而插件只需要"文件在 node_modules 里 + 名字在
  * dsh.profile.bundles 里"，直接拷贝更可控。

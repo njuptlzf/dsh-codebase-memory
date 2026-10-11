@@ -559,6 +559,18 @@ v0.8.0 验收截图（m02738）：措辞已生效，但运行读数仍是一行"
 
 ---
 
+## 6.12 发布版安装路线与文案返工（v0.11.1）
+
+用户验收 v0.11.0 后提了两件事：README 要说明"整合了 zg 检索层"（开头只讲图谱，两层关系没立起来——这也是"UI 像非 A 即 B"错觉的根）；本机 profile 从 `file:` 本地装法切到 `dsh plugin add github:...#<tag>` 发布版装法。切完顺带收了三条文案批评（1230MB 是实现细节不该要用户点头、动作指令要放第一句、zg 行的「恢复此项」冗余）。
+
+- **缺包纠正句走杠杆③，不走事件注入**。"开启后缺包，插件自动请求 agent 代装"这个诉求（m05382 链路的最后一环）落在 `contextHint` 注入通道：`cfg.zgEnabled && !existsSync(cfg.zgCli)` 时，注入文本尾部搭车一句「问用户是否同意执行 code_setup {action:"install-zg"}」。它是**一次性纠正动作**——装好或关掉即自动消失，不是常驻播报（播报归状态行）；受 contextHint 开关与 CODE_QUESTION 条件双重约束，遥测 `hint-zg-missing` 单独计数。**刻意不恢复** v0.5.0 被验收删掉的 post-execute 事件注入：被否的是通道不是诉求。
+- **文案的门禁契约跟着翻**：确认面板正文必须 `code_setup` 出现在 `430MB` 之前（动作前置）、含 32MiB/`.zvec-grep`/gitignore/重启、**不得出现 1230**（全装体积是裁剪实现的细节，用户点头的对象是净开销）。zg 行**永不渲染**「恢复此项」——布尔关掉即默认，check-client 用"user 显式含 zgEnabled 也不出按钮"的行为臂钉死。
+- **`zgCli` 不是配置键**（从 `zgVendorDir` 推导），测试臂传 `zgCli` 会被 zod 剥掉而**静默**测到真机包——第一版 G8.5 三条臂全绿在错误前提上（真机 vendor 恰好有包时 missing 臂假绿/真红皆可能）。臂必须传 `zgVendorDir` 表达缺包/有包，且临时 `adapterDir` 防写脏真机 `cbm.json`。
+- **pnpm 11.7 的锁文件验证路径无视排除名单**（`ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`；解析路径生效、验证路径是 bug，临时目录对照实测）。与本插件无关（零运行时依赖），但会挡住 `dsh plugin` 的 pnpm 通道——README 排错表收录 `--trust-lockfile` 逃生口。`skills/` 不随 github: 安装落 `~/.dsh/skills`（bundle 清单无声明位），文档写明两条补法。
+- 臂 G8.5 +3（缺包注入/关不注入/装好消失），两 profile 合计 224→230。
+
+---
+
 ## 7. 参考链接
 
 **DSH**

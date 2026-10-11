@@ -654,6 +654,33 @@ async function verify(profile) {
     typeof hintText === 'string' && hintText.includes(`stub-${process.pid}-adv`), hintText.slice(0, 80))
   record('G 条件注入：不像时返回空串（宿主按空串跳过）', hintEmpty === '', JSON.stringify(hintEmpty))
   record('G 注入文本不含宿主会插值的 {{var}}', !/[{]{2}[a-z][a-z0-9_]*[}]{2}/.test(hintPlanted + hintText), '')
+  // G8.5 语义层缺包注入句（v0.11.1）：只在「开关已开 + 包没装」这一具体状态注入，
+  // 任一条件变化自动消失——它是纠正动作不是状态播报（播报归设置页状态行）。
+  // 三臂都传临时 adapterDir + zgVendorDir：bootstrap 会写 cbm.json / 找 vendor 包，绝不许碰真机目录。
+  const zgmDir = join(tmpdir(), `cbm-zgm-${process.pid}`)
+  mkdirSync(zgmDir, { recursive: true })
+  // 缺包/有包用 zgVendorDir 表达（zgCli 是派生值，不是可配置字段——传了会被 zod 剥掉）。
+  const zgmAbsent = join(zgmDir, 'no-such-vendor')
+  const zgmVendor = join(zgmDir, 'vendor')
+  mkdirSync(join(zgmVendor, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli'), { recursive: true })
+  writeFileSync(join(zgmVendor, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli', 'index.js'), '', 'utf8')
+  const zgmCalls = []
+  const zHintOf = (m) => (m.contexts ?? []).find((c) => c.name === 'codebase-memory:hint')
+  const zm = await mount({ telemetry: false, adapterDir: zgmDir, zgEnabled: true, zgVendorDir: zgmAbsent }, makeStubProxy(zgmCalls, { project: `stub-${process.pid}-zgm` }))
+  const zgmSetup = await zm.tools.get('code_setup').execute({}, withSignal(REPO))
+  const zTextMissing = zHintOf(zm)?.text?.({ agent: fakeAgent(`sess-${process.pid}-zgm1`, REPO, codeAsk) }) ?? 'x'
+  record('G zg 缺包+开关开 ⇒ 注入句让 agent 征求同意后时代装（写明体积与重启）',
+    typeof zTextMissing === 'string' && /code_setup \{action:"install-zg"\}/.test(zTextMissing) && /430MB/.test(zTextMissing) && /重启/.test(zTextMissing),
+    `setup=${String(zgmSetup).split('\n').filter((l) => /语义层|status|热改/.test(l)).join(' | ').slice(0, 220)}  hint=${zTextMissing.slice(-110)}`)
+  const zo = await mount({ telemetry: false, adapterDir: zgmDir, zgEnabled: false, zgVendorDir: zgmAbsent }, makeStubProxy(zgmCalls, { project: `stub-${process.pid}-zgm` }))
+  await zo.tools.get('code_setup').execute({}, withSignal(REPO))
+  const zTextOff = zHintOf(zo)?.text?.({ agent: fakeAgent(`sess-${process.pid}-zgm2`, REPO, codeAsk) }) ?? 'x'
+  record('G zg 开关关 ⇒ 不注入缺包句（包真缺也不越权）', typeof zTextOff === 'string' && !/install-zg/.test(zTextOff), zTextOff.slice(-80))
+  const zi = await mount({ telemetry: false, adapterDir: zgmDir, zgEnabled: true, zgVendorDir: zgmVendor }, makeStubProxy(zgmCalls, { project: `stub-${process.pid}-zgm` }))
+  await zi.tools.get('code_setup').execute({}, withSignal(REPO))
+  const zTextReady = zHintOf(zi)?.text?.({ agent: fakeAgent(`sess-${process.pid}-zgm3`, REPO, codeAsk) }) ?? 'x'
+  record('G zg 包已装 ⇒ 注入句自动消失（不留常驻唠叨）', typeof zTextReady === 'string' && !/install-zg/.test(zTextReady), zTextReady.slice(-80))
+  rmSync(zgmDir, { recursive: true, force: true })
   // G9 索引任务串行化 + 被并发中止后重试（这条臂来自一次真实失败：后台补刷与
   // code_index 撞上引擎 watcher ⇒ 退出码 1 + aborted_previous_preserved）。
   const telemetryPath = join(ADAPTER_DIR, 'telemetry.log')

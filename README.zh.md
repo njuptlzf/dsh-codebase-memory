@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-把 [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) 接进 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 的 host bundle：**为当前会话的工作区建代码知识图谱，让模型按图检索代码，而不是逐文件 grep/read**。
+把 [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) 接进 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 的 host bundle：**为当前会话的工作区建代码知识图谱，让模型按图检索代码，而不是逐文件 grep/read**。插件整合了**两层互补检索**：结构层（codebase-memory 图谱：符号、调用链、行号坐标，常开）+ 语义层（[zvec-grep](https://github.com/zvec-ai/zvec-grep) 向量检索：自然语言问代码/文档，opt-in，~430MB 才要装包）——两层并存，图谱没答案时语义层补位，互不替代。
 
 ## 目录
 
@@ -23,16 +23,12 @@
 ```
 DSH host 组合（本 bundle 的 cordis.patch.yml 插两行）
 ├─ ④ dsh-codebase-memory          本插件：依赖自举 + 把会话工作区钉死 + 给模型写使用说明
-└─ ③ @deepseek-ai/dsh-mcp-client  官方 MCP 桥
-      └─ ② @njuptlzf/mcp-adapter  token 压缩层：模型只看到一个网关工具，
-            │                     网关背后的每个 server 都能到（cbm 17 份 schema、
-            │                     zg 1 份）——插件自举，钉死版本
-            ├─ ① codebase-memory-mcp   索引引擎：162 语言 tree-sitter + Hybrid LSP + 知识图谱（手动安装）
-            └─ ①b zvec-grep [可选]      语义检索层：rg + BM25 + 向量，同一个网关切只露一个工具
-                                        `zg_zvec_grep_search`（见 §①b，默认关）
+└─ ③ @deepseek-ai/dsh-mcp-client  官方 MCP 桥 → 模型只看到一个 mcp__cbm__mcp
+      └─ ② @njuptlzf/mcp-adapter  token 压缩层：17 份 schema 压成 1 个代理工具（插件自举，钉死版本）
+            └─ ① codebase-memory-mcp  索引引擎：162 语言 tree-sitter + Hybrid LSP + 知识图谱（手动安装）
 ```
 
-五个都是既有件，**没有任何一个被 fork 或修改**。本插件只做三件事：自举②、给③配好清单、把①的入口按会话工作区钉死。多注册一个 MCP server 并不多出一个代理工具——两个 server 共用同一个网关，模型按 server 键寻址（`cbm_…`、`zg_…`）。①b 由 `zgEnabled` 门控，与①同处一份清单。
+四个都是既有件，**没有任何一个被 fork 或修改**。本插件只做三件事：自举②、给③配好清单、把①的入口按会话工作区钉死。
 
 ## 为什么需要它（这个插件存在的全部理由）
 
@@ -82,31 +78,33 @@ npm run install:zg          # 手动：npm 安装并裁剪（删 transformers.js
 
 ### ② 把 bundle 挂进 profile（②③④全自动）
 
-本插件没有 npm 包，也没有 `dsh install` 命令——装插件就是 `dsh plugin <args>`，本质是在 profile 目录里跑 pnpm。所以直接从 GitHub 装：
+**普通用户：直接装发布版**（不需要 clone，装到哪个 tag 就是哪个版本）：
 
 ```powershell
-dsh plugin --profile <你的profile> add github:njuptlzf/dsh-codebase-memory#v0.11.2
+dsh plugin --profile <你的profile> add github:njuptlzf/dsh-codebase-memory#v0.11.1
 ```
 
-`#<tag>` 要留着：tag 钉死一个 commit，之后 `pnpm install` 不会悄悄漂移。要更新时改 tag（或去掉 tag 跟随 `main`）。
-
-在本地 checkout 里开发这个插件时：
+**开发者（要改插件代码）：本地 file: 装法**，配合仓库里的 `npm run sync` 把改动推给 profile：
 
 ```powershell
 git clone https://github.com/njuptlzf/dsh-codebase-memory
 dsh plugin --profile <你的profile> add file:<clone 出来的绝对路径>
 ```
 
+> 升级/换装：`dsh plugin --profile <p> add github:njuptlzf/dsh-codebase-memory#<新tag>` 直接覆盖依赖声明；卸载 `dsh plugin --profile <p> remove dsh-codebase-memory`。
+> 注意 **`skills/` 不随 github: 安装自动落进 `~/.dsh/skills`**——bundle 清单没有 skills 声明位，要手工从 `node_modules/dsh-codebase-memory/skills/` 复制，或在开发者装法下跑仓库的 `npm run sync`（它带 syncSkills）。
+
 > **先确认目标 profile。** profile 是随 app 走的——桌面端跑自己的（官方桌面包叫 `tauri`），web 跑另一个（`web`）；桌面安装不认识的 profile 名会被直接拒绝。不确定就 `dsh --profile <name> --dump-config` 搜 `codebase-memory`。
 >
 > `dsh plugin` 的本质是在 profile 目录里跑 pnpm，随后**自动对账 `dsh.profile.bundles`——但仅在 pnpm 干净退出之后**：声明了 `dsh.bundle` 的依赖进层栈，被移除的出层栈。插件生效 = "文件在 node_modules 里 + 名字在 bundles 里"。
 >
-> CLI 的四个行为值得提前知道：
+> CLI 的五个行为值得提前知道：
 >
 > - **`add .` 是坑**——相对路径按**调用目录**解析，在别的目录跑 `add .` 会静默链到那个目录。在 clone 的仓库目录里执行、或直接传绝对 `file:` 路径才是安全的。
 > - **git 装法会触发构建**——pnpm 默认拦截 `prepare` 脚本：把它打印的那个键加进 profile 的 `pnpm-workspace.yaml` 的 `allowBuilds` 再跑一遍。
 > - **首次执行可能要几分钟**——插件多的 profile 里 pnpm 解析慢，是等待不是卡死。
 > - **别在 Windows PowerShell 5.1 里带 stderr 重定向地脚本化调用**——启动 shim（`$ErrorActionPreference='Stop'`）会把任何一行 stderr（pnpm 进度、node 警告）升级成终止错误，死在 pnpm 启动之前：exit 1、日志空、状态半吊子。用交互终端（或 PowerShell 7）执行；之后刷新代码用插件自带的 sync 脚本。
+> - **`ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` 多半不是本插件的锅**——pnpm 11 的新包冷却策略（默认 24h）会在**锁文件验证路径**上无视 `pnpm-workspace.yaml` 的排除名单（解析路径生效，验证路径是 pnpm 11.7 实测 bug）。被无关依赖的新版本卡住时加 `--trust-lockfile` 绕过；本插件零运行时依赖，不会是触发者。
 
 ### ③ 重启，然后验证
 
@@ -316,8 +314,8 @@ npm run check   # = check:patch + check:client + check:plugin + check:chain + ch
 | 检查 | 证明什么 |
 |---|---|
 | `check-patch.mjs` | `cordis.patch.yml` 里 3 个 `!!js` 表达式按 Loader 原语义能求值，且指向真实文件；`DSH_HOME` 缺失时的回退同值 |
-| `check-client.mjs` | 不开浏览器也验设置页：在 `node:vm` 里用桩 `__ModuleLoader__` / react / primitives / ctx 加载 `lib/client.js`，断言 package.json 里 `dsh.client`、`exports["./client"]`、`files` 三处声明齐全，**槽 key = `<包名>#<row id>` 是从 `cordis.patch.yml` 反解出来的**（改行 id 忘了改 key，按钮就不出现，而且 GUI 一声不响），served namespace 等于宿主 entry id，`require` 的名字全在宿主 baseline 内（名字打错同样是不出现，不是报错），中英词典覆盖 `ENFORCE_MODES` 的每个模式，五种快照态（ready / writable:false / loading / unavailable / summary）渲染正确，点一下真的落到 `form.set('enforce', …)` / `form.unset(…)`；**运行读数**渲染 dsh-mneme 式卡片栅格（每卡一个大数字 + 指标行，命中率卡带结构层/语义层占比条）；遥测开着时**卡片常驻**——开机先推零值快照，坏 JSON / 缺值按零渲染，空态只属于关了遥测；除既有开关外不新增任何交互件（读数只读）；v0.9.0 起另有三个开关（contextHint/dirtyTracking/telemetry）与两个 blur 输入框（interceptBudgetMs/interceptTools）：非法/空值一个字节都不写、输入框拨回当前值，回车即提交；v0.10.0 布局契约也被断言：五个分层标题按序在场（软引导→硬拦截→检索两层→记账遥测→参数）、开关标签与控件同行（span 自铺，不依赖 primitives.Switch 的 label prop——它在宿主上不渲染可见文字）、「检索两层」状态行常驻且语义层取自 `stats.zg`（没数说「状态未知」）、「恢复此项」按 user 层逐字段行内出现（字典里禁止裸「恢复默认」key）；v0.11.0 起语义层开关也在页上：开启走**两步确认**——确认文案必须写全代价（1230MB→净 430MB、约 3 分钟、32MiB 模型、`.zvec-grep/`→gitignore、装包不随开关走而是 `install-zg`、要重启），确认面板在场时一个字节都不写、点「确认开启」才落 `form.set('zgEnabled', true)`、点取消零写入、关闭不经确认直接写；状态行由三轴推导，`pending-on`/`pending-off`/`installed`/`installing` 各有独立文案 |
-| `check-plugin.mjs` | 假 ctx（镜像真实服务的前提校验，含 `tools.execute` 与 `systemPrompt.section/context`）真实跑 `apply` 与**每一条触发层**：链路就绪、工作区来自会话 cwd、不同工作区→不同 project、cbm 缺失时 throw 并给出安装命令；`classifyPattern` 用 12 个符号类 + 21 个字面量类正反例证伪（**误拦必须为 0**）；`deny-once` 拦一次后放行；超预算 / 未索引 / 坐标过期一律 **fail-open**；post-execute 不再追加任何上下文（advise 注入已撤回，臂 G7 断言的就是这一点）；脏路径惰性记账且工作区外不入集合；条件注入命中给一行、不命中给 `""`；**臂 Z**：默认清单**不含** `zg`、prompt 不含 zvec 路由，`zgEnabled` 后临时清单里 `zg` 以 `lazy` 注册且 prompt 出现 `zg_zvec_grep_search`，vendor 缺失只报表提示 `install:zg`（**绝不自动装**——430MB 是人的决定），非法 `zgToolset` 回落 `agent` 并留 note；v0.11.0 起再加三条：报表与 stats 载荷按**三轴**分开报（清单事实 `zg` / 包实测 `zgInstalled` / 页面开关 `zgEnabled`，轴间差必须在报表行写出「重启后生效」的 ⚠，页面与报表都不许把"想开"演成"已开"），`code_setup {action:"install-zg"}` 与 `install:zg` 同版本同裁剪（包已在位**不重复下载**并计 `zg-install-skip`，结果文案必须带重启与 `.zvec-grep`→gitignore 提醒，未知 action 直接抛错），且 `index.js` 与 `scripts/install-zg.mjs` 的包名/版本/裁剪清单被**静态比对钉死**——两条安装路线不许漂移；**臂 R**（`enforce=replace`）：符号形 grep 照常执行成功、模型看到的输出被整体换成两层检索的命中（结构层=代码图谱先答、语义层=zvec-grep 补位，文案不得写成二选一；无 `additionalContexts`、查询走代理不 spawn CLI），字面量 / 失败结果 / 图谱语义都无命中 / 脏台账会话一律**原样放行**，volatile 开关热翻立即开合替换通道，报表计数 `intercept-replace` 可见；**臂 S**（设置页读数通道）：替换事件后 volatile `stats` 引用里是**从计数全量重建**的 JSON（`replace.hit`/`graph` 拆分 + 顶层 `zg` 状态 + `at` 时间戳），恰好 emit `settings/document-updated`（字符串 ns 首参——cordis 才不会把它当 thisArg 过滤；浏览器端参数被忽略，事件本身即刷新扳机），封装调用与提示注入也进读数，**开机遥测开即先推一帧快照**（刚重启的页面也是卡片），**遥测关时既不推也不 emit（含开机）**；**臂 R2**（作用域，v0.8.2）：`path` 指向工作区**之外**的 grep 原样保留且**不查两层**（图谱/语义都是工作区级的，替换=拿别的仓库坐标伪造答案），工作区内指定文件的 grep 照换不误；**臂 R3**（错误文本，v0.8.2）：代理把底层 MCP 错误包成普通文本返回（`isError` 不置真）时判为**查询失败**——不替换，且计成 `replace-pass-failed` 而非 no-hit（泡数据时这两个占比含义相反）；**臂 S2**（累计计数，v0.8.2）：开机从累计文件播种（文件里 7 ⇒ 第一帧读数就是 7），新事件与文件 **max 合并**落盘（7→8，不是覆盖）——harness 用 `DSH_CBM_COUNTS_FILE` 测试缝给每次 mount 换独立文件，精确数字断言才不被历史污染；**热改契约**：可改字段加读数通道共八个标了 volatile（六个即时热改 + `zgEnabled` 可写但延迟生效 + `stats` 反向通道；且没有多余字段被标——标错等于把需要重启的东西伪装成热改），拦截钩子在 `enforce: off` 时**照样注册但直接放行**，把 volatile 引用在已挂载的插件上从 `off` 翻到 `deny` 再翻回来，判定立刻跟着变；**臂 T**（v0.9.0 新字段的热翻契约）：不重挂载，翻 `dirtyTracking` 引用 ⇒ 记账当场开合（关了新会话的 edit 不入册、替换不再为脏让路），翻 `contextHint` ⇒ 提示回调当场从一行变 `''`，翻 `interceptTools`（`['grep']`→`'grep,glob'`）⇒ glob 调用当场从放行变被替换——**监听器常驻、字段在决策点现读**是这三条成立的前提；**臂 W**（v0.10.1 冷启动契约）：bootstrap 在会话外恰好预热一发 `list_projects`（重复 code_setup 不叠加，报告行可见 `warm=`），且 `projectFor` 查不到 project 时错误消息必须区分**"项目表里没有"**（指向 code_index）与**"查询失败"**（带出代理原文）——引擎冷启动不再谎称工作区没索引 |
+| `check-client.mjs` | 不开浏览器也验设置页：在 `node:vm` 里用桩 `__ModuleLoader__` / react / primitives / ctx 加载 `lib/client.js`，断言 package.json 里 `dsh.client`、`exports["./client"]`、`files` 三处声明齐全，**槽 key = `<包名>#<row id>` 是从 `cordis.patch.yml` 反解出来的**（改行 id 忘了改 key，按钮就不出现，而且 GUI 一声不响），served namespace 等于宿主 entry id，`require` 的名字全在宿主 baseline 内（名字打错同样是不出现，不是报错），中英词典覆盖 `ENFORCE_MODES` 的每个模式，五种快照态（ready / writable:false / loading / unavailable / summary）渲染正确，点一下真的落到 `form.set('enforce', …)` / `form.unset(…)`；**运行读数**渲染 dsh-mneme 式卡片栅格（每卡一个大数字 + 指标行，命中率卡带结构层/语义层占比条）；遥测开着时**卡片常驻**——开机先推零值快照，坏 JSON / 缺值按零渲染，空态只属于关了遥测；除既有开关外不新增任何交互件（读数只读）；v0.9.0 起另有三个开关（contextHint/dirtyTracking/telemetry）与两个 blur 输入框（interceptBudgetMs/interceptTools）：非法/空值一个字节都不写、输入框拨回当前值，回车即提交；v0.10.0 布局契约也被断言：五个分层标题按序在场（软引导→硬拦截→检索两层→记账遥测→参数）、开关标签与控件同行（span 自铺，不依赖 primitives.Switch 的 label prop——它在宿主上不渲染可见文字）、「检索两层」状态行常驻且语义层取自 `stats.zg`（没数说「状态未知」）、「恢复此项」按 user 层逐字段行内出现（字典里禁止裸「恢复默认」key）；v0.11.0 起语义层开关也在页上：开启走**两步确认**——确认文案**动作前置**（第一句就指路：开关不装包，装包对 agent 说「装语义检索层」走 `code_setup {action:"install-zg"}` 或终端 `npm run install:zg`；门禁断言 `code_setup` 必须出现在 `430MB` 之前，且**禁止出现 1230**——全装体积是实现细节，用户点头的对象是净开销）、含 32MiB 模型 / `.zvec-grep/`→gitignore / 重启提醒；确认面板在场时一个字节都不写、点「确认开启」才落 `form.set('zgEnabled', true)`、点取消零写入、关闭不经确认直接写；**zg 行永不渲染「恢复此项」**（布尔关掉即默认，user 显式含 zgEnabled 也不出按钮的行为臂钉死）；状态行由三轴推导，`pending-on`/`pending-off`/`installed`/`installing` 各有独立文案 |
+| `check-plugin.mjs` | 假 ctx（镜像真实服务的前提校验，含 `tools.execute` 与 `systemPrompt.section/context`）真实跑 `apply` 与**每一条触发层**：链路就绪、工作区来自会话 cwd、不同工作区→不同 project、cbm 缺失时 throw 并给出安装命令；`classifyPattern` 用 12 个符号类 + 21 个字面量类正反例证伪（**误拦必须为 0**）；`deny-once` 拦一次后放行；超预算 / 未索引 / 坐标过期一律 **fail-open**；post-execute 不再追加任何上下文（advise 注入已撤回，臂 G7 断言的就是这一点）；脏路径惰性记账且工作区外不入集合；条件注入命中给一行、不命中给 `""`；**臂 Z**：默认清单**不含** `zg`、prompt 不含 zvec 路由，`zgEnabled` 后临时清单里 `zg` 以 `lazy` 注册且 prompt 出现 `zg_zvec_grep_search`，vendor 缺失只报表提示 `install:zg`（**绝不自动装**——430MB 是人的决定），非法 `zgToolset` 回落 `agent` 并留 note；v0.11.0 起再加三条：报表与 stats 载荷按**三轴**分开报（清单事实 `zg` / 包实测 `zgInstalled` / 页面开关 `zgEnabled`，轴间差必须在报表行写出「重启后生效」的 ⚠，页面与报表都不许把"想开"演成"已开"），`code_setup {action:"install-zg"}` 与 `install:zg` 同版本同裁剪（包已在位**不重复下载**并计 `zg-install-skip`，结果文案必须带重启与 `.zvec-grep`→gitignore 提醒，未知 action 直接抛错），且 `index.js` 与 `scripts/install-zg.mjs` 的包名/版本/裁剪清单被**静态比对钉死**——两条安装路线不许漂移；**臂 G8.5**（v0.11.1）：语义层已开启但缺包时，contextHint 注入行必须带上「问用户是否同意执行 `code_setup {action:"install-zg"}`」的纠正句（命中计 `hint-zg-missing`），开关关着或包在位时必须消失——纠正走既有注入杠杆，不恢复事件注入；**臂 R**（`enforce=replace`）：符号形 grep 照常执行成功、模型看到的输出被整体换成两层检索的命中（结构层=代码图谱先答、语义层=zvec-grep 补位，文案不得写成二选一；无 `additionalContexts`、查询走代理不 spawn CLI），字面量 / 失败结果 / 图谱语义都无命中 / 脏台账会话一律**原样放行**，volatile 开关热翻立即开合替换通道，报表计数 `intercept-replace` 可见；**臂 S**（设置页读数通道）：替换事件后 volatile `stats` 引用里是**从计数全量重建**的 JSON（`replace.hit`/`graph` 拆分 + 顶层 `zg` 状态 + `at` 时间戳），恰好 emit `settings/document-updated`（字符串 ns 首参——cordis 才不会把它当 thisArg 过滤；浏览器端参数被忽略，事件本身即刷新扳机），封装调用与提示注入也进读数，**开机遥测开即先推一帧快照**（刚重启的页面也是卡片），**遥测关时既不推也不 emit（含开机）**；**臂 R2**（作用域，v0.8.2）：`path` 指向工作区**之外**的 grep 原样保留且**不查两层**（图谱/语义都是工作区级的，替换=拿别的仓库坐标伪造答案），工作区内指定文件的 grep 照换不误；**臂 R3**（错误文本，v0.8.2）：代理把底层 MCP 错误包成普通文本返回（`isError` 不置真）时判为**查询失败**——不替换，且计成 `replace-pass-failed` 而非 no-hit（泡数据时这两个占比含义相反）；**臂 S2**（累计计数，v0.8.2）：开机从累计文件播种（文件里 7 ⇒ 第一帧读数就是 7），新事件与文件 **max 合并**落盘（7→8，不是覆盖）——harness 用 `DSH_CBM_COUNTS_FILE` 测试缝给每次 mount 换独立文件，精确数字断言才不被历史污染；**热改契约**：可改字段加读数通道共八个标了 volatile（六个即时热改 + `zgEnabled` 可写但延迟生效 + `stats` 反向通道；且没有多余字段被标——标错等于把需要重启的东西伪装成热改），拦截钩子在 `enforce: off` 时**照样注册但直接放行**，把 volatile 引用在已挂载的插件上从 `off` 翻到 `deny` 再翻回来，判定立刻跟着变；**臂 T**（v0.9.0 新字段的热翻契约）：不重挂载，翻 `dirtyTracking` 引用 ⇒ 记账当场开合（关了新会话的 edit 不入册、替换不再为脏让路），翻 `contextHint` ⇒ 提示回调当场从一行变 `''`，翻 `interceptTools`（`['grep']`→`'grep,glob'`）⇒ glob 调用当场从放行变被替换——**监听器常驻、字段在决策点现读**是这三条成立的前提；**臂 W**（v0.10.1 冷启动契约）：bootstrap 在会话外恰好预热一发 `list_projects`（重复 code_setup 不叠加，报告行可见 `warm=`），且 `projectFor` 查不到 project 时错误消息必须区分**"项目表里没有"**（指向 code_index）与**"查询失败"**（带出代理原文）——引擎冷启动不再谎称工作区没索引 |
 | `check-chain.mjs` | 真拉起 adapter → cbm 做 MCP 握手：代理工具就位、懒连接被唤醒、`search_graph` 返回真实行、**阶段 3.5 实测钩子的时间预算**，最后 `describe` 出 prompt 承诺的参数形状 |
 | `check-tokens.mjs` | **消融臂**：直连 cbm vs 经代理的 `tools/list` 实际体积；代理不比直连小就 throw |
 
@@ -325,7 +323,7 @@ npm run check   # = check:patch + check:client + check:plugin + check:chain + ch
 
 ```
 PATCH OK
-224/224 臂通过（tauri + web 两个 profile）   PLUGIN OK
+230/230 臂通过（tauri + web 两个 profile）   PLUGIN OK
 CHAIN OK — 阶段3.5 代理链路延迟 ms: min=28 中位=32 max=34；配了 zg 的临时清单另跑 阶段2b：桥接 + 语义检索返回真实结果
 臂A 直连 cbm            : 17 工具, 17308 B ≈ 4327 tokens
 臂B 代理·冷缓存         :  2 工具,  4278 B ≈ 1070 tokens  （省 4.0x）
@@ -360,6 +358,7 @@ cbm CLI 同一台机器单次 search_graph        : 5491 / 6526 / 8280 ms  ← �
 | 桌面端装了但没生效 | 大概率装错了 profile。`--dump-config` 里搜 `codebase-memory` 确认进没进组合 |
 | `dsh plugin add .` 装出来的不是你的 clone | 相对路径按**调用目录**解析——在别的目录跑 `add .` 链的就是那个目录。回到仓库目录里执行，或传绝对路径 |
 | `dsh plugin …` 秒退、日志为空 | Windows PowerShell 5.1 + stderr 重定向 + `$ErrorActionPreference='Stop'` 把 shim 在 pnpm 启动前打死。换交互终端（或 PowerShell 7）执行 |
+| `dsh plugin add` 报 `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` | 与插件无关：pnpm 11 的新包 24h 冷却在**锁文件验证路径**上无视排除名单（pnpm 11.7 实测 bug；解析路径生效）。报错里点名的是 profile 里别的依赖（如 `billion-context`）时，加 `--trust-lockfile` 重跑即可；本插件零运行时依赖且发布已久，不会是被告 |
 
 ## 工程备注（给要改它的人）
 
