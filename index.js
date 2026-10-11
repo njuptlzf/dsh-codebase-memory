@@ -96,7 +96,8 @@ export const Config = z.object({
   // ── 语义检索层（zvec-grep，可选，docs/design-v2.md 第 9 节）─────────────────
   // zgEnabled 标 volatile：设置页的开关写它（v0.11.0）。诚实靠状态机而不是藏开关——
   // cbm.json 清单仍是 bootstrap 时写的、adapter 进程只在启动时读，所以热改只翻转
-  // 页面开关轴（stats.zgWant），清单轴（stats.zg）要等重启；两轴的差在页面上明说。
+  // 页面开关轴（stats.zgWant），清单轴（stats.zg）要等清单重拉——v0.12.0 起用
+  // code_setup {action:"restart-adapter"}（秒级）即可，重启宿主是等价重办法；两轴的差在页面上明说。
   zgEnabled: z.boolean().default(false).volatile(),
   zgToolset: z.string().default('agent'),
   zgVendorDir: z.string().default(''),
@@ -326,6 +327,111 @@ async function installZgLayer(ctx, cfg, state, signal) {
   }
 }
 
+/**
+ * ── 进程轴（v0.12.0）：清单写了 ≠ 进程加载了 ─────────────────────────────────
+ * 事故复盘（6 小时卡死）：宿主先把 adapter 拉起来，插件后台 14 分钟后才写 cbm.json；
+ * adapter 只在进程启动时读一次清单、没有文件监听 ⇒ 活进程里 0 个 server，且旧报表
+ * 只查磁盘不查进程，全线报绿。三条兜底都放这里：枚举进程、比对新鲜度、一键重启。
+ * 宿主是监督器（dsh-mcp-client：断连即重启，无限重试），所以 kill 就够了，
+ * 不必「重启宿主」——文档里那剂猛药开高了。
+ */
+const RESTART_WAIT_MS = 15_000
+const ADAPTER_FRESH_CACHE_MS = 30_000
+
+/** Windows CIM 输出：`pid|ISO时间` 每行一条。 */
+export function parseAdapterProcsWin(text) {
+  const procs = []
+  for (const line of String(text ?? '').split('\n')) {
+    const m = /^\s*(\d+)\|(.+?)\s*$/.exec(line)
+    if (!m) continue
+    const startMs = Date.parse(m[2])
+    if (Number.isFinite(startMs)) procs.push({ pid: Number(m[1]), startMs })
+  }
+  return procs
+}
+
+/** POSIX `ps -eo pid=,etime=,args=` 输出：etime=[[dd-]hh:]mm:ss，args 含空格。与 Windows 侧对称：命令行必须同时有 mcp-server.mjs 和 cbm.json。 */
+export function parseAdapterProcsPosix(text, nowMs = Date.now()) {
+  const procs = []
+  for (const line of String(text ?? '').split('\n')) {
+    const m = /^\s*(\d+)\s+(\S+)\s+.*mcp-server\.mjs\S*.*cbm\.json/.exec(line)
+    if (!m) continue
+    const em = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(m[2])
+    if (!em) continue
+    const ms = ((Number(em[1] || 0) * 24 * 60 + Number(em[2] || 0) * 60 + Number(em[3])) * 60 + Number(em[4])) * 1000
+    procs.push({ pid: Number(m[1]), startMs: nowMs - ms })
+  }
+  return procs
+}
+
+/** 枚举正在跑我们这份清单的 adapter 进程。只枚举，不杀。 */
+async function listAdapterProcs(ctx, cfg, signal) {
+  if (process.platform === 'win32') {
+    // -like 用通配而非正则：命令行里是绝对路径，反斜杠转义在两种引号里都容易翻车。
+    const ps = "$ErrorActionPreference='SilentlyContinue'; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*mcp-server.mjs*' -and $_.CommandLine -like '*cbm.json*' } | ForEach-Object { \"$($_.ProcessId)|$($_.CreationDate.ToString('o'))\" }"
+    const r = await run(ctx, ['powershell.exe', '-NoProfile', '-Command', ps], { maxBytes: 256 * 1024, graceMs: 20_000, signal })
+    return parseAdapterProcsWin(r.stdout)
+  }
+  const r = await run(ctx, ['ps', '-eo', 'pid=,etime=,args='], { maxBytes: 256 * 1024, signal })
+  return parseAdapterProcsPosix(r.stdout)
+}
+
+/** 测试缝 DSH_CBM_KILL_STUB_FILE：设了它，kill 只往该文件追加 pid，不真杀进程（check-plugin 臂 X 用）。 */
+function killAdapterProc(pid) {
+  const seam = process.env.DSH_CBM_KILL_STUB_FILE
+  if (seam) { try { writeFileSync(seam, `${pid}\n`, { flag: 'a' }) } catch { /* 臂断言会暴露写不进去 */ } ; return }
+  process.kill(pid)
+}
+
+/**
+ * 清单 mtime vs 进程启动时间：fresh（有进程在清单写成之后启动）/ stale（全都更老，
+ * 即"写了没加载"）/ no-process / no-manifest。30s 缓存——这是诊断面，不进拦截热路径。
+ */
+async function adapterFreshness(ctx, cfg, state, signal, { force = false } = {}) {
+  const cached = state.adapterFresh
+  if (!force && cached && Date.now() - cached.at < ADAPTER_FRESH_CACHE_MS) return cached
+  let manifestMs = 0
+  try { manifestMs = statSync(cfg.adapterConfig).mtimeMs } catch { /* 清单还没写 */ }
+  let procs = []
+  try { procs = await listAdapterProcs(ctx, cfg, signal) } catch { procs = [] }
+  const verdict = !manifestMs ? 'no-manifest'
+    : !procs.length ? 'no-process'
+      : procs.some((p) => p.startMs >= manifestMs - 2000) ? 'fresh' : 'stale'
+  const result = { verdict, at: Date.now(), manifestMs, pids: procs.map((p) => p.pid), newestStartMs: procs.reduce((m, p) => Math.max(m, p.startMs), 0) }
+  state.adapterFresh = result
+  if (cfg.telemetry && state.pushStats) state.pushStats() // 面板的 adapter 轴跟着刷新
+  return result
+}
+
+/** 杀掉现有 adapter 进程并等监督器重拉。宿主监督器断连即重启，所以 kill 即重启。 */
+async function restartAdapter(ctx, cfg, state, signal) {
+  const before = await listAdapterProcs(ctx, cfg, signal)
+  if (!before.length) {
+    telemetry(cfg, state, 'restart-adapter', { killed: 0 })
+    return { killed: 0, oldPids: [], newPids: [], note: '没有在跑的 adapter 进程——宿主会在会话启动时拉起，新进程读的就是当前清单' }
+  }
+  for (const proc of before) killAdapterProc(proc.pid)
+  state.adapterFresh = null // 旧结论作废
+  const deadline = Date.now() + RESTART_WAIT_MS
+  let newPids = []
+  while (Date.now() < deadline) {
+    // 不 unref：这段等待被调用方 await 着，unref 反而让空闲进程（harness、CLI）
+    // 在轮询中途直接退出——"unsettled top-level await" 就是这么来的。
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    const after = await listAdapterProcs(ctx, cfg, signal)
+    newPids = after.filter((p) => !before.some((b) => b.pid === p.pid)).map((p) => p.pid)
+    if (newPids.length) break
+  }
+  state.adapterFresh = null
+  telemetry(cfg, state, 'restart-adapter', { killed: before.length, respawned: newPids.length })
+  return {
+    killed: before.length,
+    oldPids: before.map((p) => p.pid),
+    newPids,
+    note: newPids.length ? '' : `已杀但 ${RESTART_WAIT_MS / 1000}s 内没等到新进程——宿主监督器可能没接回，重启宿主`,
+  }
+}
+
 /** 探测索引引擎。二进制不自动下载：可执行文件的安全水位高于包。 */
 async function resolveCbm(ctx, cfg, state) {
   const candidates = [
@@ -465,6 +571,10 @@ async function bootstrap(ctx, cfg, state, signal, { force = false } = {}) {
       .then((r) => { state.warmOk = r.ok; telemetry(cfg, state, 'cbm-warm', { ok: r.ok }) })
       .catch(() => { state.warmOk = false; telemetry(cfg, state, 'cbm-warm', { ok: false }) })
   }
+  // 进程轴（v0.12.0）：清单写了 ≠ 活进程加载了。bootstrap 里量一次新鲜度（await——
+  // 枚举进程秒级，报表第一次就要有结论，不能"待测"），结果进报表和 stats（设置页 stale 行）。
+  // 失败静默——这是诊断面，不能反过来弄坏启动。
+  if (state.ok) await adapterFreshness(ctx, cfg, state, signal).catch(() => {})
   return state
 }
 
@@ -577,14 +687,28 @@ function syncStatusLine() {
   return `同步状态: ⚠ ${drift.join(' / ')} 与仓库不一致——通常是改完仓库没跑 sync（node scripts/sync.mjs）；sync 后**仍需重启 host** 才生效`
 }
 
+/** 进程轴结论的人话版（报表与 code_setup 共用）。 */
+const ADAPTER_VERDICT_TEXT = {
+  fresh: 'fresh  活进程在清单写成之后启动，清单已加载',
+  stale: '⚠ stale  清单被重写过、活进程还是老的没加载——code_setup {action:"restart-adapter"}（几秒，宿主监督器自动重拉）',
+  'no-process': '⚠ 没有在跑的 adapter 进程——宿主会在会话启动时拉起；若宿主正开着，用 restart-adapter 兜底',
+  'no-manifest': '(清单未写：bootstrap 没跑完)',
+}
+function adapterLine(state) {
+  const f = state.adapterFresh
+  if (!f) return '(待测：下次 code_setup / 启动后台量取)'
+  const pids = f.pids.length ? `  pid=${f.pids.join(',')}` : ''
+  return `${ADAPTER_VERDICT_TEXT[f.verdict] ?? f.verdict}${pids}`
+}
+
 function report(cfg, state) {
   // 语义层三轴（清单事实 / 包实测 / 页面开关）不一致时把待办动作写进后缀，别让用户猜。
   const zgInstalled = existsSync(cfg.zgCli)
   const zgSuffix = state.zgInstalling ? '  [install-zg 安装中]'
     : cfg.zgEnabled && state.zg === 'off'
-      ? '  ⚠ 页面已开启，重启后清单才生效' + (zgInstalled ? '' : '（包未装：code_setup {action:"install-zg"}）')
+      ? '  ⚠ 页面已开启，清单重拉（restart-adapter）后才生效' + (zgInstalled ? '' : '（包未装：code_setup {action:"install-zg"}）')
       : !cfg.zgEnabled && state.zg !== 'off'
-        ? '  ⚠ 页面已关闭，重启后清单才移除'
+        ? '  ⚠ 页面已关闭，清单重拉（restart-adapter）后才移除'
         : ''
   const lines = [
     `status: ${state.ok ? 'OK' : 'NOT READY'}`,
@@ -593,10 +717,12 @@ function report(cfg, state) {
     `引擎实测: 实测通过 ${testedEngine() || '(未声明)'}；当前 ${state.cbmVersion || '(未探测)'}${engineVerdict(state.cbmVersion) === 'untested' ? '  ⚠ 超出实测范围——工具面可能已变，跑 npm run check' : ''}`,
     `清单: ${state.configPath ?? '(未写)'}  exclude=${JSON.stringify(EXCLUDE_TOOLS)}`,
     `代理工具: ${PROXY_TOOL}  bootstrap=${cfg.bootstrap}  adapterVersion=${cfg.adapterVersion}  warm=${state.warm ? (state.warmOk === true ? 'ok' : state.warmOk === false ? 'failed' : 'pending') : 'off'}`,
+    `适配层进程: ${adapterLine(state)}`,
     `触发层: wrapper=${cfg.wrapperTools ? 'on' : 'off'}  enforce=${cfg.enforce}  intercept=${cfg.interceptTools.join('+') || '(无)'}  budget=${cfg.interceptBudgetMs}ms  dirty=${cfg.dirtyTracking ? 'on' : 'off'}(冷却 ${cfg.dirtyRefreshCooldownSec}s)  context=${cfg.contextHint ? 'on' : 'off'}`,
     `语义层(zg): ${state.zgInstalling ? 'installing' : state.zg}  包=${zgInstalled ? '已装' : '未装'}  页面开关=${cfg.zgEnabled ? 'on' : 'off'}  toolset=${cfg.zgToolset}  ${cfg.zgCli}${zgSuffix}`,
-    // 六个即时热字段 + zgEnabled（v0.11.0 起页面可写，但清单重启才重建）；volatile 是必要条件，页面画的是全集。
-    '热改: enforce / telemetry / contextHint / dirtyTracking / interceptBudgetMs / interceptTools → 设置 → 插件 → dsh-codebase-memory → codebase-memory 行「配置」（不用重启）；zgEnabled 也在页面上改，但要重启宿主才进清单；其余字段改 profile 的 cordis.patch.yml 并重启',
+    // 六个即时热字段 + zgEnabled（v0.11.0 起页面可写）；清单重建不用重启宿主——
+    // code_setup {action:"restart-adapter"} 重拉适配层即可（宿主监督器自动重生进程）。
+    '热改: enforce / telemetry / contextHint / dirtyTracking / interceptBudgetMs / interceptTools → 设置 → 插件 → dsh-codebase-memory → codebase-memory 行「配置」（不用重启）；zgEnabled 也在页面上改，重启适配层进程（restart-adapter）或重启宿主后进清单；其余字段改 profile 的 cordis.patch.yml 并重启',
     `遥测计数(跨重启累计): ${Object.entries(state.counts).map(([k, v]) => `${k}=${v}`).join(' ') || '(无事件)'}`,
     `auto_index: ${state.autoIndex || '(未设置)'}（期望 ${cfg.autoIndex ? 'true' : 'false'}；机器级共享配置，只补"无索引的新项目"，不刷新陈旧坐标）`,
     syncStatusLine(),
@@ -894,7 +1020,11 @@ async function cbmCall(ctx, exec, tool, args, budgetMs, namePrefix = 'cbm') {
   // 实测 zg 守护打不开 collection 时返回 "Error: Failed to open zvec collection storage…"，
   // 若不识别，错误文本会被当成命中去替换原始输出（遥测里 source=zg 的 intercept-replace）。
   // Error 开头的文本 = 失败，由调用方放行；图谱树以 project:/total:/rows 或 JSON 开头，安全。
-  if (/^\s*error\b/i.test(text)) return { ok: false, text }
+  // v0.12.0 补第二种失败形态：清单里 0 个 server 时 adapter 回的是
+  // `Tool "cbm_list_projects" not found. Use mcp({ server: … })…`——以 Tool 开头不以 Error
+  // 开头，旧嗅探放过它 ⇒ warm=ok 撒谎（事故复盘：进程先于清单启动，整条链路死透而
+  // 报表全绿）。not-found 同样是失败。
+  if (/^\s*(error\b|tool\s+"[^"]*"\s+not found)/i.test(text)) return { ok: false, text }
   return { ok: true, text }
 }
 
@@ -921,7 +1051,14 @@ async function projectFor(ctx, exec, cfg, state, session, cwd, budgetMs = cfg.in
   if (cached) { session.project = cached; return { project: cached, reason: '' } }
   const r = await cbmCall(ctx, exec, 'list_projects', {}, budgetMs)
   if (!r.ok) {
-    return { project: '', reason: `list_projects 查询失败（${r.timeout ? '超时' : '代理报错'}）：${(r.text || '').trim().slice(0, 120) || '(空输出)'}` }
+    // 事故教训（v0.12.0）：not-found 是"清单没被活进程加载"的签名，不是查询失败——
+    // 判词直接给到 restart-adapter，别让 agent 在"重试/重建索引"里空转。用缓存的
+    // 进程轴结论，绝不在拦截热路径上现枚举进程（那是 code_setup 的活）。
+    const notFound = /tool\s+"[^"]*"\s+not found/i.test(r.text || '')
+    const axis = notFound
+      ? `——代理工具不在活进程里（清单未加载，进程判定=${state.adapterFresh?.verdict ?? '待测'}）：code_setup {action:"restart-adapter"}`
+      : ''
+    return { project: '', reason: `list_projects 查询失败（${r.timeout ? '超时' : '代理报错'}）：${(r.text || '').trim().slice(0, 120) || '(空输出)'}${axis}` }
   }
   const found = projectFromListing(r.text, cwd)
   if (found) { session.project = found; state.projectsByCwd.set(cwd, found); return { project: found, reason: '' } }
@@ -977,6 +1114,8 @@ function renderStats(cfg, state) {
     zg: state.zgInstalling ? 'installing' : state.zg,
     zgWant: cfg.zgEnabled === true,
     zgInstalled: existsSync(cfg.zgCli),
+    // 进程轴（v0.12.0）：面板 stale 行靠它——清单写了 ≠ 活进程加载了。null=还没量过。
+    adapter: state.adapterFresh ? state.adapterFresh.verdict : null,
     replace: { hit: n('intercept-replace'), graph: n('intercept-replace:graph'), zg: n('intercept-replace:zg'), passDirty: n('replace-pass-dirty'), passNoHit: n('replace-pass-no-hit'), passFailed: n('replace-pass-failed'), error: n('replace-error') },
     deny: { blocked: n('intercept-deny'), passDirty: n('intercept-pass-dirty'), passNoHit: n('intercept-pass-no-hit'), passQueryFailed: n('intercept-pass-query-failed'), skipSeen: n('intercept-skip-seen'), error: n('intercept-error') },
     dirty: { record: n('dirty-record'), refreshScheduled: n('dirty-refresh-scheduled'), refreshDone: n('dirty-refresh-done'), refreshFail: n('dirty-refresh-fail') },
@@ -1210,6 +1349,7 @@ export async function apply(ctx, config) {
     zg: 'off', zgInstalling: false,
     sessions: new Map(), projectsByCwd: new Map(), counts: {}, indexJobs: new Map(),
     warm: false, warmOk: null, // 冷启动预热（v0.10.1）：warm=打过一次，warmOk=那次的结果
+    adapterFresh: null, // 进程轴（v0.12.0）：{verdict,at,manifestMs,pids,newestStartMs}，30s 缓存
   }
   // 开机播种累计计数：重启不是归零（写侧与文件 max 合并，见 pushStats）。
   // 遥测关着就不播种——否则 code_setup 的计数行会报上一轮的旧数，像还在记。
@@ -1290,11 +1430,11 @@ export async function apply(ctx, config) {
 
   ctx.tools.register(defineTool({
     name: 'code_setup',
-    description: 'Check and repair the codebase-memory code-index chain for this DSH host: the pinned mcp-adapter token-compression layer (auto-bootstrapped) and the codebase-memory-mcp binary (manual install). Reports exact paths, versions and a copy-pasteable install command when something is missing. Only side effect is installing the pinned adapter package when it is absent. Pass action "install-zg" to install the optional semantic retrieval layer (~430MB after pruning) — explicit opt-in only, never automatic, and the running adapter picks it up after a host restart.',
+    description: 'Check and repair the codebase-memory code-index chain for this DSH host: the pinned mcp-adapter token-compression layer (auto-bootstrapped) and the codebase-memory-mcp binary (manual install). Reports exact paths, versions, the adapter-process freshness axis (manifest written vs actually loaded by the running process) and a copy-pasteable install command when something is missing. Only side effect is installing the pinned adapter package when it is absent. Pass action "install-zg" to install the optional semantic retrieval layer (~430MB after pruning) — explicit opt-in only, never automatic. Pass action "restart-adapter" to reload the MCP server manifest without a host restart: kills the adapter process and lets the host supervisor respawn it (seconds; use when the report says stale / tools report "not found" although the manifest is on disk).',
     parameters: {
       action: {
         type: 'string',
-        description: 'Optional. "install-zg" = download and prune the pinned @zvec/zvec-grep into the vendor dir (long-running, hundreds of MB; ask the user first). Omit to just check and report the chain.',
+        description: 'Optional. "install-zg" = download and prune the pinned @zvec/zvec-grep into the vendor dir (long-running, hundreds of MB; ask the user first). "restart-adapter" = kill the adapter process so the host supervisor respawns it with the current manifest (use after install-zg or a zgEnabled toggle instead of restarting the whole host). Omit to just check and report the chain.',
       },
     },
     output: {
@@ -1306,7 +1446,7 @@ export async function apply(ctx, config) {
       const action = String(args?.action ?? '').trim()
       if (action === 'install-zg') {
         // 不跑 bootstrap：state.zg 是清单事实，进程启动前不会变——装完就改它，
-        // usageSection 会对着还没加载 zg 的 adapter 撒谎。重启后 bootstrap 自己会探到。
+        // usageSection 会对着还没加载 zg 的 adapter 撒谎。重拉进程后 bootstrap 会探到。
         const r = await installZgLayer(ctx, cfg, state, ac.signal)
         const head = r.status === 'already'
           ? `zvec-grep ${r.version} 已就位（${cfg.zgCli}），没有重复下载。`
@@ -1314,14 +1454,29 @@ export async function apply(ctx, config) {
         return [
           head,
           cfg.zgEnabled
-            ? '下一步：重启宿主——清单会加入 zg server，语义层生效。'
-            : '下一步：设置 → 插件 → dsh-codebase-memory → 配置里打开语义层开关，再重启宿主。',
+            ? '下一步：code_setup {action:"restart-adapter"} 重拉适配层（几秒），清单会加入 zg server，语义层生效；重启宿主是等价的重办法。'
+            : '下一步：设置 → 插件 → dsh-codebase-memory → 配置里打开语义层开关，再 code_setup {action:"restart-adapter"}（或重启宿主）。',
           '提醒：zg 的索引产物 .zvec-grep/ 会落进每个被索引仓库——把它加进 .gitignore。',
           '',
           report(cfg, state),
         ].join('\n')
       }
-      if (action) throw new Error(`未知 action "${action}"（可选：install-zg；留空 = 只检查并汇报链路）`)
+      if (action === 'restart-adapter') {
+        // 杀进程 → 宿主监督器（dsh-mcp-client 断连即重启）自动重拉 → 新进程读当前清单。
+        // 等完新进程再 force 量一次新鲜度：报表里的适配层进程行必须是重启后的实况。
+        const r = await restartAdapter(ctx, cfg, state, ac.signal)
+        const fresh = await adapterFreshness(ctx, cfg, state, ac.signal, { force: true })
+        return [
+          r.oldPids.length
+            ? `已重启适配层：杀掉 pid=${r.oldPids.join(',')} → 新进程 pid=${r.newPids.join(',') || '(还没冒出来)'}`
+            : `没有需要重启的适配层进程。${r.note}`,
+          r.note,
+          `清单加载: ${adapterLine(state)}（freshness=${fresh.verdict}）`,
+          '',
+          report(cfg, state),
+        ].filter(Boolean).join('\n')
+      }
+      if (action) throw new Error(`未知 action "${action}"（可选：install-zg / restart-adapter；留空 = 只检查并汇报链路）`)
       await bootstrap(ctx, cfg, state, ac.signal).catch((error) => {
         state.lastError = String(error?.message ?? error)
         state.ok = false
@@ -1671,7 +1826,7 @@ export async function apply(ctx, config) {
           // 语义层缺包（页面开关已开、包没装）：让 agent 主动征求用户同意后时代装——
           // 一次性纠正动作而非状态播报：装好或关掉即自动消失，走已验收的注入通道（v0.11.3）。
           const zgFix = cfg.zgEnabled && !existsSync(cfg.zgCli)
-            ? ' 语义层已开启但缺包——问用户是否同意执行 code_setup {action:"install-zg"}（约 430MB）安装；装完需重启宿主。'
+            ? ' 语义层已开启但缺包——问用户是否同意执行 code_setup {action:"install-zg"}（约 430MB）安装；装完 code_setup {action:"restart-adapter"} 重拉清单（秒级，不必重启宿主）。'
             : ''
           if (zgFix) bumpCount(cfg, state, 'hint-zg-missing')
           // 只数真正注入的那一次（每轮装配都调这个回调，注入与否是 ③ 的有效性读数）。

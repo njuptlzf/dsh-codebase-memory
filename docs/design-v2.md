@@ -572,6 +572,20 @@ v0.8.0 验收截图（m02738）：措辞已生效，但运行读数仍是一行"
 
 ---
 
+## 6.13 六小时 0-server 死锁：磁盘就绪 ≠ 进程加载（v0.12.0）
+
+外部机器（`D:\deepSeekHarness` 部署）交来一份完整归因报告：工具链路卡死约 6 小时，代理工具始终 `Tool "cbm_*" not found`，而 `code_setup` 一路报"全部就绪、warm=ok"。核对本机源码后报告成立，且比报告多挖出一层根因。
+
+- **时序竞态**：宿主 18:07:21 拉起 adapter 进程，插件后台 bootstrap 18:21:45 才写出 `cbm.json`——适配层**只在进程启动时读一次清单、无文件监听**，于是活进程注册了 0 个 server；此后引擎装好也无法自愈（清单里没有 server，重连循环无事可连）。致命点是"进程先于清单出生"，不是引擎、不是二进制（直连 stdio 探针全过）。
+- **`warm=ok` 为什么撒谎（报告没挖到的那层）**：v0.10.1 的预热确实发了 `list_projects`，但 `cbmCall` 的错误嗅探是 `/^\s*error\b/i`——适配层的 not-found 文案以 **`Tool`** 开头，被判成功，`warmOk=true` 进报表。"就绪"由此拼出三条互相印证的假话（报表 ready、warm=ok、代理只说 not found 不说 0-server），agent 在无效重试里烧了 6 小时。**错误嗅探是链路的地基：新接一个上游，先拿它的真实失败文本喂嗅探器**（§6.10 同一课的第二种撒谎姿势——那次是把查询失败说成没索引，这次是把进程没加载说成热好了）。
+- **杀进程 = 重启，宿主是监督器**：`@deepseek-ai/dsh-mcp-client` 对 stdio server「connection drops → restarts forever」，所以文档里"重启宿主"是药方开重了。落地 P0 三件：① `code_setup {action:"restart-adapter"}`（杀匹配进程、轮询 ≤15s 等新 pid 复活、遥测 `restart-adapter`；测试缝 `DSH_CBM_KILL_STUB_FILE` 只记账不真杀）；② **进程轴**——`cbm.json` mtime vs 活进程启动时刻（slack 2s）→ `fresh/stale/no-process/no-manifest`，进报表行、`stats.adapter`、设置页警示行（fresh 沉默），30s 缓存，热路径只读缓存；③ 嗅探扩到 `tool "…" not found`，`projectFor` 错误文本追加"不在活进程里（进程判定=…）：restart-adapter"。
+- **gitignore 提示常驻**（用户点名）：`.zvec-grep/`→gitignore 从一次性确认弹窗改为 zg 开启期间设置页**常驻**行——装包的那个工作区可能根本不是 git 仓库、仓库多是以后才来，弹窗等于没人看见。
+- 顺带两个 harness 教训：**被 await 的等待不许 unref**（restart 轮询的 `setTimeout.unref()` 让测试进程在空事件循环上"unsettled top-level await"猝死——unref 只属于 fire-and-forget）；harness 里进程枚举一律罐头（`opts.procTable`），绝不在开发机上真起 powershell 数别人的进程。
+- P1（上游）：给 `njuptlzf/mcp-adapter` 提 issue——`--config` 文件监听（mtime 防抖自动补注册）+ `mcp({})` 在"配置 N 个、连接 0 个"时如实报。插件侧的①②③只是把失真变成可见，热加载的正解在适配层。
+- 臂 X +9，两 profile 合计 239→248（含 Z 臂文案断言跟着"重拉"改词）。
+
+---
+
 ## 7. 参考链接
 
 **DSH**

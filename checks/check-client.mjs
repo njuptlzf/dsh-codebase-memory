@@ -164,6 +164,7 @@ for (const key of ['title', 'summary', 'loading', 'unavailable', 'enforce.label'
   'sec.aux', 'sec.aux.hint', 'sec.params', 'sec.params.hint',
   'layer.graph', 'layer.graph.on', 'layer.zg', 'layer.zg.off', 'layer.zg.ready', 'layer.zg.missing', 'layer.zg.unknown',
   'layer.zg.installed', 'layer.zg.installing', 'layer.zg.pending-on', 'layer.zg.pending-off',
+  'layer.zg.gitignore', 'layer.adapter.stale', 'layer.adapter.noproc',
   'zg.label', 'zg.hint', 'zg.confirm.title', 'zg.confirm.body', 'zg.confirm.yes', 'zg.confirm.no']) {
   ok(keys.includes(key), `字典有 key ${key}`)
 }
@@ -171,6 +172,7 @@ for (const key of ['hint.label', 'dirty.label', 'interceptBudgetMs.label', 'inte
   'sec.soft', 'sec.hard', 'sec.layers', 'sec.aux', 'sec.params',
   'layer.graph', 'layer.zg', 'layer.zg.off', 'layer.zg.ready', 'layer.zg.missing', 'layer.zg.unknown',
   'layer.zg.installed', 'layer.zg.installing', 'layer.zg.pending-on', 'layer.zg.pending-off',
+  'layer.zg.gitignore', 'layer.adapter.stale', 'layer.adapter.noproc',
   'zg.label', 'zg.hint', 'zg.confirm.title', 'zg.confirm.body', 'zg.confirm.yes', 'zg.confirm.no']) {
   ok(Object.keys(dictEntry?.dict?.en || {}).includes(key), `en 字典有 key ${key}`)
 }
@@ -287,6 +289,26 @@ ok(layerText({ zgEnabled: true, stats: JSON.stringify({ zg: 'missing', zgInstall
   '清单说 missing 但包实测在 ⇒ installed 待重启（两轴分开报，不合成一个谎）')
 ok(layerText({ zgEnabled: true, stats: JSON.stringify({ zg: 'installing' }) }).includes('layer.zg.installing'),
   'agent 正在装（volatile 推帧）⇒ installing')
+
+/* ---- 5c2. v0.12.0：gitignore 提示常驻 + 适配层进程轴警示行 ---- */
+// 用户验收要求：.zvec-grep/ 的 gitignore 提醒不能只活在确认弹窗里——装 zg 的
+// 工作区可能根本不是仓库，仓库也多是以后才来，开了 zg 就要一直看得见。
+ok(layerText({ zgEnabled: true, stats: JSON.stringify({ zg: 'ready' }) }).includes('layer.zg.gitignore'),
+  'zg 开启 ⇒ gitignore 提示常驻（不随确认面板消失）')
+ok(!layerText({ zgEnabled: false, stats: JSON.stringify({ zg: 'off' }) }).includes('layer.zg.gitignore'),
+  'zg 未开 ⇒ 不出现无关提示')
+ok(layerText({ zgEnabled: false, stats: JSON.stringify({ zg: 'off', adapter: 'stale' }) }).includes('layer.adapter.stale'),
+  '进程轴 stale ⇒ 警示行（数据来自 stats.adapter，与 zg 开关无关）')
+ok(layerText({ zgEnabled: false, stats: JSON.stringify({ zg: 'off', adapter: 'no-process' }) }).includes('layer.adapter.noproc'),
+  'no-process ⇒ 另一句人话（宿主没起不是故障，别拿警示吓人的 stale 文案）')
+ok(!layerText({ zgEnabled: false, stats: JSON.stringify({ zg: 'off', adapter: 'fresh' }) }).some((t) => String(t).startsWith('layer.adapter.')),
+  'fresh ⇒ 一行都不加（没病别呻吟）')
+for (const lang of ['zh', 'en']) {
+  const gi = dictEntry?.dict?.[lang]?.['layer.zg.gitignore'] || ''
+  ok(/\.zvec-grep/.test(gi) && /gitignore/i.test(gi), `${lang} gitignore 常驻提示含 .zvec-grep + gitignore`, gi.slice(0, 50))
+  const st = dictEntry?.dict?.[lang]?.['layer.adapter.stale'] || ''
+  ok(/restart-adapter/.test(st), `${lang} stale 警示行指路 restart-adapter（不是只会喊重启宿主）`, st.slice(0, 60))
+}
 
 // v0.11.2：五态文字必须分三档色，否则「开关已开、清单未重建」看起来和「已启用」
 // 一模一样，用户看不出待重启。断言取 zg 那行的 RVAL span 的 color 表达式。

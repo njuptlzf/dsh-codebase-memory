@@ -85,6 +85,8 @@ function makeStubProxy(calls, opts = {}) {
         case 'cbm_list_projects':
           // v0.10.1 臂 W：代理把底层失败包成 Error 文本（isError 不置真）的样子。
           if (opts.listError) return { content: [{ type: 'text', text: 'Error: MCP server not running' }] }
+          // v0.12.0 臂 X：0-server 活进程的真实返回形态——以 Tool 开头，不是 Error。
+          if (opts.listNotFound) return { content: [{ type: 'text', text: 'Tool "cbm_list_projects" not found. Use mcp({ server: "name" }) to list tools, mcp({ search: "..." }) to search' }] }
           return { content: [{ type: 'text', text: `projects: 1  (cols: name root_path branch)\n  ${project} ${root.replace(/\\/g, '/')} main` }] }
         case 'cbm_search_graph':
           // 代理工具会把底层 MCP 错误包成**普通文本**（isError 不置真）——实测
@@ -155,6 +157,19 @@ function makeCtx(tools, sections, events = {}, contexts = [], proxy = null, opts
         request.argv.forEach((value) => value.includes('\0'))
         request.cwd.includes('\0')
         for (const value of Object.values(request.env ?? {})) value.includes('\0')
+        // v0.12.0 臂 X：进程枚举走罐头数据。绝不真起 powershell/ps——真起既慢，又会
+        // 枚举到开发机/CI 上的真 adapter 进程，断言就成了看机器脸色的薛定谔结论。
+        // opts.procTable 可为字符串或 () => string（restart 臂要按调用次序换答案）。
+        if (file === 'powershell.exe' || file === 'ps') {
+          const text = String(typeof opts.procTable === 'function' ? opts.procTable() : (opts.procTable ?? ''))
+          return {
+            done: Promise.resolve({ exitCode: 0, signal: null }),
+            collected: {
+              stdout: { readFrom: () => ({ text, nextOffset: text.length, lossy: false }) },
+              stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+            },
+          }
+        }
         if (opts.abortOnce && !abortedOnce && request.argv.some((a) => String(a).includes('index_repository'))) {
           abortedOnce = true
           const payload = `{"project":"x","status":"aborted_previous_preserved","hint":"Indexing aborted before publication; the previous index is intact and still serving. Retry; if it repeats, check the run log."}`
@@ -207,7 +222,7 @@ async function verify(profile) {
   console.log(`\n[${profile}] ${installed}`)
 
   const mod = await import(pathToFileURL(installed).href)
-  const { apply, name, inject, engineVerdict, fileDrift, classifyPattern, truncateCodepoints, isGrepLike, normPath, projectFromListing, Config } = mod
+  const { apply, name, inject, engineVerdict, fileDrift, classifyPattern, truncateCodepoints, isGrepLike, normPath, projectFromListing, Config, parseAdapterProcsWin, parseAdapterProcsPosix } = mod
   if (name !== 'dsh-codebase-memory') throw new Error(`unexpected plugin name: ${name}`)
   record('装载', true, `name=${name}  inject=${inject.join(',')}`)
 
@@ -365,8 +380,8 @@ async function verify(profile) {
   await zPend.tools.get('code_setup').execute({}, withSignal(REPO)) // 先跑一次：清单按"开关=关"定成 off
   zWantRef[Symbol.for('cosmokit.volatile.write')](true) // 再模拟页面开关：loader 把新值推进同一引用
   const zPendSetup = await zPend.tools.get('code_setup').execute({}, withSignal(REPO))
-  record('Z 开关已开而清单未重建 ⇒ 报表明说「重启后生效」并指路 install-zg',
-    /页面已开启.*重启/.test(zPendSetup) && /install-zg/.test(zPendSetup) && /包=未装  页面开关=on/.test(zPendSetup),
+  record('Z 开关已开而清单未重建 ⇒ 报表明说「重拉清单后才生效」并指路 install-zg',
+    /页面已开启.*(重拉|重启)/.test(zPendSetup) && /restart-adapter/.test(zPendSetup) && /install-zg/.test(zPendSetup) && /包=未装  页面开关=on/.test(zPendSetup),
     /^语义层\(zg\):.*$/m.exec(zPendSetup)?.[0]?.slice(0, 150) ?? '(没有 zg 行)')
   const zgVendor2 = join(zgHome, 'vendor2')
   mkdirSync(join(zgVendor2, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli'), { recursive: true })
@@ -885,6 +900,75 @@ async function verify(profile) {
   let wfErr = '(未抛错)'
   try { await wf.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: fakeAgent(`sess-${process.pid}-fail`, REPO), signal: sig() }) } catch (error) { wfErr = String(error?.message ?? error) }
   record('W 查询失败时报"查询失败"并带出代理原文（冷启动不再谎称没索引）', /查询失败/.test(wfErr) && /MCP server not running/.test(wfErr), wfErr.slice(0, 130))
+
+  // ── 臂 X：v0.12.0 进程轴（清单写了 ≠ 活进程加载了）+ restart-adapter ────────
+  // 事故原型：宿主开机拉起 adapter 时 cbm.json 还没出生 → 活进程 0-server，
+  // 引擎装好后也不自愈；code_setup 只看盘报"就绪"，warm=ok 跟着撒谎。契约：
+  // ① 报表有进程轴（fresh/stale/no-process 三判词，stale 指路 restart-adapter）；
+  // ② restart-action 杀进程等新进程复活（监督器重拉），杀的是枚举到的那批 pid；
+  // ③ not-found 错误文本（以 Tool 开头，旧嗅探放过当成功）判失败并指路；
+  // ④ stats 载荷带 adapter 轴。进程枚举走 makeCtx 罐头（opts.procTable），绝不真起 powershell。
+  const procLine = (pid, ageMs) => {
+    if (process.platform === 'win32') return `${pid}|${new Date(Date.now() - ageMs).toISOString()}`
+    const s = Math.max(1, Math.floor(ageMs / 1000))
+    const pad = (n) => String(n).padStart(2, '0')
+    const et = s >= 86400
+      ? `${Math.floor(s / 86400)}-${pad(Math.floor((s % 86400) / 3600))}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`
+      : `${pad(Math.floor(s / 3600))}:${pad(Math.floor(s % 60))}:${pad(s % 60)}`
+    return `${String(pid).padStart(6)} ${et} node /tmp/vendor/mcp-adapter/node_modules/@njuptlzf/mcp-adapter/mcp-server.mjs --config /tmp/vendor/mcp-adapter/cbm.json`
+  }
+  const xWin = parseAdapterProcsWin(`7|${new Date(Date.parse('2020-01-01T00:00:00Z')).toISOString()}\n垃圾行\n`)
+  record('X Windows 枚举解析：pid|ISO 提取，垃圾行跳过',
+    xWin?.length === 1 && xWin[0].pid === 7 && xWin[0].startMs === Date.parse('2020-01-01T00:00:00Z'), JSON.stringify(xWin))
+  const xPosix = parseAdapterProcsPosix('  12 01:23:45 node /a/mcp-server.mjs --config /a/cbm.json\n  13 00:00:10 node /a/mcp-server.mjs --config /a/other.json\n', 1_000_000_000_000)
+  record('X POSIX 枚举解析：etime 换算启动时刻，非 cbm.json 进程滤掉',
+    xPosix?.length === 1 && xPosix[0].pid === 12 && xPosix[0].startMs === 1_000_000_000_000 - 5_025_000, JSON.stringify(xPosix))
+  const xStale = await mount({ telemetry: false }, null, { procTable: () => procLine(41001, 10 * 60 * 1000) })
+  const xStaleReport = await xStale.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('X 清单新于活进程 ⇒ 报表进程轴报 stale 并指路 restart-adapter',
+    /适配层进程: ⚠ stale/.test(xStaleReport) && /restart-adapter/.test(xStaleReport),
+    /适配层进程:.*$/m.exec(xStaleReport)?.[0]?.slice(0, 150) ?? '(没有适配层进程行)')
+  const xFresh = await mount({ telemetry: false }, null, { procTable: () => procLine(41002, 0) })
+  const xFreshReport = await xFresh.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('X 进程在清单之后启动 ⇒ fresh（不吓唬人）', /适配层进程: fresh/.test(xFreshReport),
+    /适配层进程:.*$/m.exec(xFreshReport)?.[0]?.slice(0, 100) ?? '(没有适配层进程行)')
+  const xNone = await mount({ telemetry: false }, null, { procTable: '' })
+  const xNoneReport = await xNone.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('X 没有在跑的进程 ⇒ 报 no-process（宿主未起不算 stale）', /适配层进程: ⚠ 没有在跑的 adapter 进程/.test(xNoneReport),
+    /适配层进程:.*$/m.exec(xNoneReport)?.[0]?.slice(0, 100) ?? '(没有适配层进程行)')
+  const killFile = join(tmpdir(), `cbm-kill-${process.pid}-x.txt`)
+  rmSync(killFile, { force: true })
+  process.env.DSH_CBM_KILL_STUB_FILE = killFile
+  try {
+    // procTable 以"杀没杀过"为轴换答案：枚举次数多一发少一发都不影响结论
+    // （后台 bootstrap 也会枚举一次，纯计数器会被它错位）。
+    const xR = await mount({ telemetry: true }, null, { procTable: () => existsSync(killFile) ? procLine(42002, 0) : procLine(41001, 10 * 60 * 1000) })
+    await xR.tools.get('code_setup').execute({}, withSignal(REPO)) // 先走一次常规 bootstrap：进程轴应为 stale
+    const xRestart = await xR.tools.get('code_setup').execute({ action: 'restart-adapter' }, withSignal(REPO))
+    const killed = existsSync(killFile) ? readFileSync(killFile, 'utf8') : '(没写杀进程)'
+    record('X restart-adapter：杀掉老 pid、等到新进程、报表转 fresh',
+      /已重启适配层/.test(xRestart) && /41001/.test(killed) && /42002/.test(xRestart) && /适配层进程: fresh/.test(xRestart),
+      `${xRestart.split('\n')[0]?.slice(0, 90)} | killed=${killed.trim()}`)
+    record('X restart-adapter 记遥测计数（restart-adapter=1）', /restart-adapter=1/.test(xRestart),
+      /遥测计数.*$/m.exec(xRestart)?.[0]?.slice(0, 120) ?? '(没有遥测计数行)')
+  } finally {
+    delete process.env.DSH_CBM_KILL_STUB_FILE
+    rmSync(killFile, { force: true })
+  }
+  const xnf = await mount({ enforce: 'off', dirtyTracking: false, telemetry: false },
+    makeStubProxy([], { project: `stub-${process.pid}-nf`, listNotFound: true }))
+  await xnf.tools.get('code_setup').execute({}, withSignal(REPO))
+  let xnfErr = '(未抛错)'
+  try { await xnf.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: fakeAgent(`sess-${process.pid}-nf`, REPO), signal: sig() }) } catch (error) { xnfErr = String(error?.message ?? error) }
+  record('X not-found 签名判失败（warm 不再睁眼说 ok），错误文本指路 restart-adapter',
+    /不在活进程里/.test(xnfErr) && /restart-adapter/.test(xnfErr), xnfErr.slice(0, 150))
+  const xStatsRef = mkVolRef('')
+  const xStats = await mount({ telemetry: true, stats: xStatsRef }, null, { procTable: () => procLine(41001, 10 * 60 * 1000) })
+  await xStats.tools.get('code_setup').execute({}, withSignal(REPO))
+  let xStatsJson = null
+  try { xStatsJson = JSON.parse(String(xStatsRef.get())) } catch { /* 下一条断言报 */ }
+  record('X stats 载荷带 adapter 进程轴（设置页 stale 行的数据源）',
+    xStatsJson?.adapter === 'stale', String(xStatsRef.get()).slice(0, 140))
 
   rmSync(tRepo, { recursive: true, force: true })
 
