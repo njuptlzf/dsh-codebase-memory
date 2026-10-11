@@ -1669,7 +1669,7 @@ export async function apply(ctx, config) {
             ? '找定义/调用关系用 code_find / code_callers；字符串、日志、配置值仍用 grep。'
             : '第一步：code_index。'
           // 语义层缺包（页面开关已开、包没装）：让 agent 主动征求用户同意后时代装——
-          // 一次性纠正动作而非状态播报：装好或关掉即自动消失，走已验收的注入通道（v0.11.1）。
+          // 一次性纠正动作而非状态播报：装好或关掉即自动消失，走已验收的注入通道（v0.11.3）。
           const zgFix = cfg.zgEnabled && !existsSync(cfg.zgCli)
             ? ' 语义层已开启但缺包——问用户是否同意执行 code_setup {action:"install-zg"}（约 430MB）安装；装完需重启宿主。'
             : ''

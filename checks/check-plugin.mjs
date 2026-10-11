@@ -654,7 +654,7 @@ async function verify(profile) {
     typeof hintText === 'string' && hintText.includes(`stub-${process.pid}-adv`), hintText.slice(0, 80))
   record('G 条件注入：不像时返回空串（宿主按空串跳过）', hintEmpty === '', JSON.stringify(hintEmpty))
   record('G 注入文本不含宿主会插值的 {{var}}', !/[{]{2}[a-z][a-z0-9_]*[}]{2}/.test(hintPlanted + hintText), '')
-  // G8.5 语义层缺包注入句（v0.11.1）：只在「开关已开 + 包没装」这一具体状态注入，
+  // G8.5 语义层缺包注入句（v0.11.3）：只在「开关已开 + 包没装」这一具体状态注入，
   // 任一条件变化自动消失——它是纠正动作不是状态播报（播报归设置页状态行）。
   // 三臂都传临时 adapterDir + zgVendorDir：bootstrap 会写 cbm.json / 找 vendor 包，绝不许碰真机目录。
   const zgmDir = join(tmpdir(), `cbm-zgm-${process.pid}`)

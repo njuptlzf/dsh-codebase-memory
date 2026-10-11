@@ -174,15 +174,14 @@ for (const key of ['hint.label', 'dirty.label', 'interceptBudgetMs.label', 'inte
   'zg.label', 'zg.hint', 'zg.confirm.title', 'zg.confirm.body', 'zg.confirm.yes', 'zg.confirm.no']) {
   ok(Object.keys(dictEntry?.dict?.en || {}).includes(key), `en 字典有 key ${key}`)
 }
-// 确认面板是"人点头"的那一环：文案必须动作在前（第一句就告诉用户找谁装）、
-// 净开销诚实（~430MB，不写全装 1230MB 这种实现细节——v0.11.1 验收），
-// 且写全副作用（32MiB 模型 / .zvec-grep→gitignore / 重启，含 gitignore 提醒是 v0.11.0 验收要求）。
+// 确认面板是"人点头"的那一环：文案动作前置（v0.11.x 验收）——第一句就指路装包，
+// 净开销 430MB 是用户点头的对象，全装 1230MB 是实现细节、禁止出现在页面上。
 for (const lang of ['zh', 'en']) {
   const body = dictEntry?.dict?.[lang]?.['zg.confirm.body'] || ''
   ok(!/1230/.test(body) && /430MB/.test(body) && /32MiB/.test(body) && /\.zvec-grep\//.test(body) && /gitignore/i.test(body)
     && /install-zg/.test(body) && /code_setup/.test(body) && body.indexOf('code_setup') < body.indexOf('430MB')
     && /重启|restart/.test(body),
-    `${lang} 确认文案动作前置、只报净开销、写足副作用`, body.slice(0, 60))
+    `${lang} 确认文案动作前置（code_setup 先于 430MB、禁 1230、含模型/gitignore/重启）`, body.slice(0, 60))
 }
 ok(!keys.includes('reset'), '没有裸「恢复默认」key——每个字段的恢复按钮必须叫「恢复此项」', keys.filter((k) => k.startsWith('reset')).join('|'))
 for (const mode of modes) {
@@ -289,6 +288,36 @@ ok(layerText({ zgEnabled: true, stats: JSON.stringify({ zg: 'missing', zgInstall
 ok(layerText({ zgEnabled: true, stats: JSON.stringify({ zg: 'installing' }) }).includes('layer.zg.installing'),
   'agent 正在装（volatile 推帧）⇒ installing')
 
+// v0.11.2：五态文字必须分三档色，否则「开关已开、清单未重建」看起来和「已启用」
+// 一模一样，用户看不出待重启。断言取 zg 那行的 RVAL span 的 color 表达式。
+const zgColor = (v) => {
+  storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, ...v }, base: {}, user: {}, writable: true, revision: 16 }
+  return flatten(panel.component({ ...props }))
+    .filter((n) => typeof n.props?.children === 'string' && n.props.children.startsWith('layer.zg.'))
+    .map((n) => n.props.style?.color)
+    .filter(Boolean)
+    .pop() ?? null
+}
+const C_DEFAULT = 'var(--dsw-alias-label-secondary)'
+const C_WARN = 'var(--dsw-alias-warning, #d97706)'
+const C_ERROR = 'var(--dsw-alias-error, crimson)'
+ok(zgColor({ zgEnabled: false, stats: JSON.stringify({ zg: 'off' }) }) === C_DEFAULT,
+  'off ⇒ 常态灰（不是警示色，避免误报）', String(zgColor({ zgEnabled: false, stats: JSON.stringify({ zg: 'off' }) })))
+ok(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'ready' }) }) === C_DEFAULT,
+  'ready ⇒ 常态灰', String(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'ready' }) })))
+ok(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'off' }) }) === C_ERROR,
+  'pending-on ⇒ 报错红（zgEnabled:true 但清单没生效，用户配置没落地，真异常）', String(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'off' }) })))
+ok(zgColor({ zgEnabled: false, stats: JSON.stringify({ zg: 'ready' }) }) === C_WARN,
+  'pending-off ⇒ 警示橙', String(zgColor({ zgEnabled: false, stats: JSON.stringify({ zg: 'ready' }) })))
+ok(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'missing', zgInstalled: true }) }) === C_WARN,
+  'installed（包在、清单未重建）⇒ 警示橙', String(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'missing', zgInstalled: true }) })))
+ok(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'installing' }) }) === C_WARN,
+  'installing ⇒ 警示橙', String(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'installing' }) })))
+ok(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'missing' }) }) === C_ERROR,
+  'missing（包没装）⇒ 报错红', String(zgColor({ zgEnabled: true, stats: JSON.stringify({zg: 'missing' }) })))
+ok(zgColor({ zgEnabled: true }) === C_ERROR,
+  'unknown（遥测未推帧）⇒ 报错红', String(zgColor({ zgEnabled: true })))
+
 storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, zgEnabled: false, stats: JSON.stringify({ zg: 'off' }) }, base: {}, user: {}, writable: true, revision: 17 }
 tree = panel.component({ ...props })
 const zgEl = findType(tree, (n) => typeof n.type === 'function' && n.type.name === 'ZgToggle')
@@ -315,12 +344,13 @@ reactStub.useState = (init) => [init, () => {}]
 writes.length = 0
 flatten(zgEl.type(zgProps)).find((n) => n.type === primitives.Switch)?.props.onChange(false)
 ok(JSON.stringify(writes) === JSON.stringify([false]), '关闭不经过确认，直接写（关没有开销）', JSON.stringify(writes))
-// v0.11.1 验收：zg 行刻意没有「恢复此项」——即使用户显式写过 zgEnabled 也不出现（布尔关掉即默认，按钮只会指错地方）。
-storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, zgEnabled: true, stats: JSON.stringify({ zg: 'off' }) }, base: { zgEnabled: false }, user: { zgEnabled: true }, writable: true, revision: 18 }
+// zg 行刻意没有「恢复此项」：布尔关掉即默认，多一个按钮只会暗示开关背后还有状态。
+storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, zgEnabled: true, stats: JSON.stringify({ zg: 'off' }) }, base: {}, user: { zgEnabled: true }, writable: true, revision: 18 }
 tree = panel.component({ ...props })
-const zgUserEl = findType(tree, (n) => typeof n.type === 'function' && n.type.name === 'ZgToggle')
-const uTexts = flatten(zgUserEl.type({ ...zgUserEl.props })).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
-ok(!uTexts.includes('resetField'), 'zg 行无「恢复此项」按钮（user 显式含 zgEnabled 也不渲染）')
+{
+  const uTexts = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
+  ok(!uTexts.includes('resetField'), 'user 显式写了 zgEnabled，zg 行也不渲染「恢复此项」', String(uTexts.filter((x) => x.includes('reset')).join('|')))
+}
 
 storeSnapshot = { status: 'loading', value: {}, base: {}, user: {}, writable: false, revision: 0 }
 tree = panel.component({ ...props })
