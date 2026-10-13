@@ -22,6 +22,8 @@
  *     不替换、底层错误文本不算命中（失败与无命中分开计数）、累计计数跨重启播种+落盘。
  *   W 冷启动契约（v0.10.1）：bootstrap 会话外预热恰好一发；projectFor 查不到时
  *     错误消息区分"不在表里/查询失败"并带出代理原文。
+ *   V 适配层版本对账（v0.13.0）：实装 ≠ 钉 ⇒ 自动重装并带 note + adapter-upgrade
+ *     计数；= 钉 ⇒ 零安装；manual ⇒ 不碰网络只记差距；清单写 settings.scriptMode。
  */
 import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -170,6 +172,20 @@ function makeCtx(tools, sections, events = {}, contexts = [], proxy = null, opts
             },
           }
         }
+        // 臂 V（v0.13.0）：适配层安装的罐头版。真 npm install 依赖网络且十秒起步，
+        // 钉死对账臂要断言的是"取了哪个版本"这一确定性动作；opts.npmInstall(cwd, version)
+        // 由臂写假包并记账，返回形状与真分支完全一致。
+        if (opts.npmInstall && String(request.argv[1] ?? '').endsWith('npm-cli.js') && request.argv.includes('install')) {
+          const spec = String(request.argv[request.argv.length - 1])
+          opts.npmInstall(request.cwd, spec.slice(spec.lastIndexOf('@') + 1))
+          return {
+            done: Promise.resolve({ exitCode: 0, signal: null }),
+            collected: {
+              stdout: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+              stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+            },
+          }
+        }
         if (opts.abortOnce && !abortedOnce && request.argv.some((a) => String(a).includes('index_repository'))) {
           abortedOnce = true
           const payload = `{"project":"x","status":"aborted_previous_preserved","hint":"Indexing aborted before publication; the previous index is intact and still serving. Retry; if it repeats, check the run log."}`
@@ -222,7 +238,7 @@ async function verify(profile) {
   console.log(`\n[${profile}] ${installed}`)
 
   const mod = await import(pathToFileURL(installed).href)
-  const { apply, name, inject, engineVerdict, fileDrift, classifyPattern, truncateCodepoints, isGrepLike, normPath, projectFromListing, Config, parseAdapterProcsWin, parseAdapterProcsPosix } = mod
+  const { apply, name, inject, engineVerdict, fileDrift, classifyPattern, truncateCodepoints, isGrepLike, normPath, projectFromListing, Config, parseAdapterProcsWin, parseAdapterProcsPosix, DEFAULT_ADAPTER_VERSION } = mod
   if (name !== 'dsh-codebase-memory') throw new Error(`unexpected plugin name: ${name}`)
   record('装载', true, `name=${name}  inject=${inject.join(',')}`)
 
@@ -304,6 +320,10 @@ async function verify(profile) {
   const manifest = JSON.parse(readFileSync(join(ADAPTER_DIR, 'cbm.json'), 'utf8'))
   record('E 清单用 keep-alive（启动即连接，消除会话启动竞态）',
     manifest.mcpServers?.cbm?.lifecycle === 'keep-alive', String(manifest.mcpServers?.cbm?.lifecycle))
+  // v0.13.0：臂 A 的 bootstrap 就在真 vendor 上跑过——真清单必须带上 scriptMode 显式准入
+  // （上游 #744：5.x 起 mcpScript 不再默认注册，插件的 usageSection 却把它当事实）。
+  record('E 真清单带 settings.scriptMode（缺席 ⇒ 臂 A bootstrap 没按新代码重写清单）',
+    manifest.settings?.scriptMode === true, `实际=${JSON.stringify(manifest.settings ?? null)}`)
 
   const startHandlers = a.events['agent/session-start'] ?? []
   record('E 注册了 agent/session-start 监听', startHandlers.length === 1, `handlers=${startHandlers.length}`)
@@ -340,6 +360,10 @@ async function verify(profile) {
   mkdirSync(join(zgAdapter, 'node_modules', '@njuptlzf', 'mcp-adapter'), { recursive: true })
   mkdirSync(join(zgVendor, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli'), { recursive: true })
   writeFileSync(join(zgAdapter, 'node_modules', '@njuptlzf', 'mcp-adapter', 'mcp-server.mjs'), '', 'utf8')
+  // v0.13.0：版本对账看的是包元数据——没有这份 package.json，固件会被当成"实装 ''"
+  // 而触发真 npm install（依赖网络，还把它覆盖成实包）。钉版本从插件导出取，升 pin 不改这里。
+  writeFileSync(join(zgAdapter, 'node_modules', '@njuptlzf', 'mcp-adapter', 'package.json'),
+    `{"name":"@njuptlzf/mcp-adapter","version":"${DEFAULT_ADAPTER_VERSION}"}`, 'utf8')
   writeFileSync(join(zgVendor, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli', 'index.js'), '', 'utf8')
   // cbm 探测只验 existsSync，但 bootstrap 会真的 spawn 它——0 字节假 exe 会让
   // --version 当场抛错、清单永远写不出来。cmd.exe 是"存在的合法可执行文件"的最小
@@ -356,6 +380,8 @@ async function verify(profile) {
     && zDoc.mcpServers?.zg?.args?.includes('server') === true, JSON.stringify(zDoc.mcpServers?.zg?.args ?? null))
   record('Z zg 用 lazy（无启动竞态，daemon 按需起）', zDoc.mcpServers?.zg?.lifecycle === 'lazy'
     && zDoc.mcpServers?.cbm?.lifecycle === 'keep-alive', `zg=${zDoc.mcpServers?.zg?.lifecycle} cbm=${zDoc.mcpServers?.cbm?.lifecycle}`)
+  record('Z 清单写 settings.scriptMode（mcpScript 显式准入，与真清单同源同构）',
+    zDoc.settings?.scriptMode === true, `实际=${JSON.stringify(zDoc.settings ?? null)}`)
   const zOff = await mount({ ...zgBase })
   await zOff.tools.get('code_setup').execute({}, withSignal(REPO)) // bootstrap 是惰性的：不跑一次工具，清单还是上一条写的
   const zOffDoc = JSON.parse(readFileSync(join(zgAdapter, 'cbm.json'), 'utf8'))
@@ -406,6 +432,43 @@ async function verify(profile) {
     idxPkg === scrPkg && idxVer === scrVer && idxPrune === scrPrune,
     `index=${idxPkg}@${idxVer} script=${scrPkg}@${scrVer} prune 一致=${idxPrune === scrPrune}`)
   rmSync(zgHome, { recursive: true, force: true })
+
+  // ── 臂 V（v0.13.0）：适配层版本对账——"唯一升级入口"必须真的生效 ──────────────
+  // 升 pin 后若只看 bundle 存在，机器会停在旧包（没有 watcher、没有 scriptMode）而
+  // 报表报 ready——那是 6 小时卡死的另一面：状态没撒谎，只是不知道。三臂锁死对账。
+  const vAdapter = join(tmpdir(), `cbm-check-vpin-${process.pid}`)
+  rmSync(vAdapter, { recursive: true, force: true })
+  const vPkgDir = join(vAdapter, 'node_modules', '@njuptlzf', 'mcp-adapter')
+  mkdirSync(vPkgDir, { recursive: true })
+  writeFileSync(join(vPkgDir, 'mcp-server.mjs'), '', 'utf8')
+  writeFileSync(join(vPkgDir, 'package.json'), '{"name":"@njuptlzf/mcp-adapter","version":"0.0.1-fake"}', 'utf8')
+  const vInstalls = []
+  const npmStub = (cwd, version) => {
+    vInstalls.push(version)
+    const dir = join(cwd, 'node_modules', '@njuptlzf', 'mcp-adapter')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'mcp-server.mjs'), '', 'utf8')
+    writeFileSync(join(dir, 'package.json'), `{"name":"@njuptlzf/mcp-adapter","version":"${version}"}`, 'utf8')
+  }
+  const vUp = await mount({ adapterDir: vAdapter, cbmPath: fakeExe }, null, { npmInstall: npmStub })
+  const vSetup = await vUp.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('V 实装 ≠ 钉 ⇒ 自动重装到钉版本（note 说破重拉 + adapter-upgrade 计数）',
+    vInstalls.length === 1 && vInstalls[0] === DEFAULT_ADAPTER_VERSION
+      && /适配层已从 0\.0\.1-fake 升到/.test(vSetup) && /adapter-upgrade=1/.test(vSetup),
+    `installs=${JSON.stringify(vInstalls)}  ${(/notes: .*/.exec(vSetup)?.[0] ?? '(没有 note)').slice(0, 130)}`)
+  vInstalls.length = 0
+  const vSame = await mount({ adapterDir: vAdapter, cbmPath: fakeExe }, null, { npmInstall: npmStub })
+  const vSameSetup = await vSame.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('V 实装 = 钉 ⇒ 零安装（幂等，不重复拉包）',
+    vInstalls.length === 0 && /压缩层\(②\): ready/.test(vSameSetup) && !/升到/.test(vSameSetup),
+    `installs=${JSON.stringify(vInstalls)}`)
+  writeFileSync(join(vPkgDir, 'package.json'), '{"name":"@njuptlzf/mcp-adapter","version":"0.0.1-fake"}', 'utf8')
+  const vMan = await mount({ adapterDir: vAdapter, cbmPath: fakeExe, bootstrap: 'manual' }, null, { npmInstall: npmStub })
+  const vManSetup = await vMan.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('V manual + 旧实装 ⇒ 不碰网络：保留 ready，差距只进 note',
+    vInstalls.length === 0 && /压缩层\(②\): ready/.test(vManSetup) && /bootstrap=manual 不自动升级/.test(vManSetup),
+    `installs=${JSON.stringify(vInstalls)}  ${(/notes: .*/.exec(vManSetup)?.[0] ?? '(没有 note)').slice(0, 110)}`)
+  rmSync(vAdapter, { recursive: true, force: true })
 
   // ── 臂 F（可选，CBM_CHECK_REFRESH=1）：H2 的**正向**路径真的会刷新 ────────────
   // 默认不跑：它要建 git 仓库、真跑一次 index_repository（约 20–40s）。但它是这条链上
@@ -681,7 +744,7 @@ async function verify(profile) {
   writeFileSync(join(zgmVendor, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli', 'index.js'), '', 'utf8')
   const zgmCalls = []
   const zHintOf = (m) => (m.contexts ?? []).find((c) => c.name === 'codebase-memory:hint')
-  const zm = await mount({ telemetry: false, adapterDir: zgmDir, zgEnabled: true, zgVendorDir: zgmAbsent }, makeStubProxy(zgmCalls, { project: `stub-${process.pid}-zgm` }))
+  const zm = await mount({ telemetry: false, adapterDir: zgmDir, zgEnabled: true, zgVendorDir: zgmAbsent }, makeStubProxy(zgmCalls, { project: `stub-${process.pid}-zgm` }), { npmInstall: npmStub })
   const zgmSetup = await zm.tools.get('code_setup').execute({}, withSignal(REPO))
   const zTextMissing = zHintOf(zm)?.text?.({ agent: fakeAgent(`sess-${process.pid}-zgm1`, REPO, codeAsk) }) ?? 'x'
   record('G zg 缺包+开关开 ⇒ 注入句让 agent 征求同意后时代装（写明体积与重启）',

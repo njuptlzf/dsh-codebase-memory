@@ -30,8 +30,12 @@ import { fileURLToPath } from 'node:url'
 export const name = 'dsh-codebase-memory'
 export const inject = ['tools', 'subprocess', 'systemPrompt']
 
-/** 钉死的压缩层版本；升级只改这里（也是唯一升级入口）。 */
-const DEFAULT_ADAPTER_VERSION = '2.29.0-0.0.4'
+/** 钉死的压缩层版本；升级只改这里（也是唯一升级入口）。导出给 check-plugin，
+ *  harness 的假 bundle 固件与断言都引用它，升 pin 不再需要改第二处。
+ *  5.2.0-0.0.6 = 上游 issue #34 修复版：内置清单 watcher（sha256 轮询 3s，漂移即
+ *  exit(0) 交给宿主监督器重拉），stale 从"永不自愈"变"几秒自愈"；restart-adapter
+ *  降级为兜底（老进程/关监听时）。同版起 mcpScript 默认不注册，需 settings.scriptMode。 */
+export const DEFAULT_ADAPTER_VERSION = '5.2.0-0.0.6'
 const ADAPTER_PKG = '@njuptlzf/mcp-adapter'
 const CBM_EXE = 'codebase-memory-mcp.exe'
 const BOOTSTRAP_MODES = ['blocking', 'background', 'manual']
@@ -95,7 +99,7 @@ export const Config = z.object({
   dirtyRefreshCooldownSec: z.number().default(120),
   // ── 语义检索层（zvec-grep，可选，docs/design-v2.md 第 9 节）─────────────────
   // zgEnabled 标 volatile：设置页的开关写它（v0.11.0）。诚实靠状态机而不是藏开关——
-  // cbm.json 清单仍是 bootstrap 时写的、adapter 进程只在启动时读，所以热改只翻转
+  // cbm.json 清单仍是 bootstrap 时写的、adapter 进程加载清单要重拉（钉的 ≥0.0.6 有 watcher 秒级自愈；老进程靠 restart-adapter），所以热改只翻转
   // 页面开关轴（stats.zgWant），清单轴（stats.zg）要等清单重拉——v0.12.0 起用
   // code_setup {action:"restart-adapter"}（秒级）即可，重启宿主是等价重办法；两轴的差在页面上明说。
   zgEnabled: z.boolean().default(false).volatile(),
@@ -243,21 +247,43 @@ async function run(ctx, argv, opts = {}) {
   }
 }
 
-/** 幂等地把钉死版本的压缩层装进 vendor 目录。 */
+/** 已装适配层的版本号；读不到（缺 package.json / 坏 JSON / 老固件）返回 ''。 */
+function installedAdapterVersion(cfg) {
+  try {
+    return String(JSON.parse(readFileSync(join(dirname(cfg.adapterMjs), 'package.json'), 'utf8')).version ?? '')
+  } catch { return '' }
+}
+
+/**
+ * 幂等地把**钉死版本**的压缩层装进 vendor 目录。
+ * v0.13.0 起这不再只看 bundle 存在与否：升 pin 后旧 bundle 会被静默保留，
+ * 全机停在旧版（没有 watcher、没有 scriptMode），而报表照样报 ready——
+ * 所以版本对不上就重装；装失败则保留旧包继续跑（存在 > 新鲜），notes 里说清楚。
+ */
 async function ensureAdapter(ctx, cfg, state, signal) {
-  if (existsSync(cfg.adapterMjs)) {
+  const have = existsSync(cfg.adapterMjs) ? installedAdapterVersion(cfg) : ''
+  if (have === cfg.adapterVersion && have) {
     state.adapter = 'ready'
     return
   }
   if (cfg.bootstrap === 'manual') {
+    // manual 一律不碰网络；盘上有旧包就照常 ready，只把差距记进 notes。
+    if (existsSync(cfg.adapterMjs)) {
+      state.adapter = 'ready'
+      push(state, `适配层实装 ${have || '?'}、钉的是 ${cfg.adapterVersion}；bootstrap=manual 不自动升级`)
+      return
+    }
     state.adapter = 'missing'
     push(state, 'bootstrap=manual，未自动下载压缩层')
     return
   }
+  const upgrading = existsSync(cfg.adapterMjs)
   const npm = npmCliEntry()
   if (!npm) {
-    state.adapter = 'missing'
-    push(state, `找不到 npm-cli.js，无法自举；请手动安装 ${ADAPTER_PKG}`)
+    state.adapter = upgrading ? 'ready' : 'missing'
+    push(state, upgrading
+      ? `找不到 npm-cli.js，保留现有适配层 ${have || '?'}（钉的是 ${cfg.adapterVersion}）`
+      : `找不到 npm-cli.js，无法自举；请手动安装 ${ADAPTER_PKG}`)
     return
   }
   mkdirSync(cfg.adapterDir, { recursive: true })
@@ -273,6 +299,17 @@ async function ensureAdapter(ctx, cfg, state, signal) {
     return
   }
   state.adapter = 'ready'
+  const now = installedAdapterVersion(cfg)
+  if (upgrading) {
+    if (now === cfg.adapterVersion) {
+      // 磁盘换了 ≠ 进程换了：watcher（≥0.0.5）会把活进程秒级重拉；老包不监听，
+      // restart-adapter 兜底。这句 note 必须把"新进程才加载新包"说破。
+      push(state, `适配层已从 ${have || '?'} 升到 ${now}——新进程由清单 watcher 自动重拉（老包不监听则 restart-adapter）`)
+      telemetry(cfg, state, 'adapter-upgrade', { from: have, to: now })
+    } else {
+      push(state, `适配层升级未成功：仍是 ${now || '?'}（钉的是 ${cfg.adapterVersion}，退出码 ${r.exitCode}）——保留旧包继续跑`)
+    }
+  }
 }
 
 /** 语义层 CLI 的实测版本；跑不起来/没装返回 ''。 */
@@ -286,7 +323,7 @@ async function zgVersion(ctx, cfg, signal) {
  * 全装 → 裁掉 onnxruntime-node 路线永不加载的推理后端（~833MB）→ `--version` 自检当门禁。
  * 设置页开关**不**触发这里（client 没有执行通道）；只有 code_setup {action:'install-zg'}
  * 显式调用才装，绝不自发——430MB 是要人点头的开销。state.zg 一律不动：清单才是
- * 事实（adapter 只在进程启动时读 cbm.json），装完提示重启。并发调用直接抛，不排队。
+ * 事实（进程加载新清单要重拉：≥0.0.6 的 watcher 秒级自愈，否则 restart-adapter），装完提示重拉。并发调用直接抛，不排队。
  */
 async function installZgLayer(ctx, cfg, state, signal) {
   if (state.zgInstalling) throw new Error('zg 安装已在进行中（同一时刻只允许一个 install-zg）')
@@ -334,6 +371,8 @@ async function installZgLayer(ctx, cfg, state, signal) {
  * 只查磁盘不查进程，全线报绿。三条兜底都放这里：枚举进程、比对新鲜度、一键重启。
  * 宿主是监督器（dsh-mcp-client：断连即重启，无限重试），所以 kill 就够了，
  * 不必「重启宿主」——文档里那剂猛药开高了。
+ * v0.13.0 更新：钉到 5.2.0-0.0.6（上游 #34 修复版）后清单自带 watcher，漂移秒级
+ * 自愈；本节三条兜底不撤——老进程/关监听（MCP_CONFIG_WATCH=0）时仍是唯一手段。
  */
 const RESTART_WAIT_MS = 15_000
 const ADAPTER_FRESH_CACHE_MS = 30_000
@@ -478,6 +517,10 @@ function resolveZg(cfg, state) {
 /** 写 adapter 的服务器清单。二进制用绝对 .exe，绕开 .cmd shim。 */
 function writeAdapterConfig(cfg, state) {
   const doc = {
+    // 上游 #744（5.x 起）：mcpScript 从默认注册改为显式准入。本插件的 usageSection
+    // 与 README 把「多步用 mcpScript 一趟跑完」当事实（code_find/callers 之外的长尾
+    // 流程都走它），脚本关了那些指引就落空；老 2.29 进程无视未知顶层键，先写无害。
+    settings: { scriptMode: true },
     mcpServers: {
       cbm: {
         command: state.cbmPath,
@@ -690,7 +733,7 @@ function syncStatusLine() {
 /** 进程轴结论的人话版（报表与 code_setup 共用）。 */
 const ADAPTER_VERDICT_TEXT = {
   fresh: 'fresh  活进程在清单写成之后启动，清单已加载',
-  stale: '⚠ stale  清单被重写过、活进程还是老的没加载——code_setup {action:"restart-adapter"}（几秒，宿主监督器自动重拉）',
+  stale: '⚠ stale  清单被重写过、活进程还没加载——≥0.0.6 的进程自带 watcher 会在几秒内自愈；没自愈或老包就 code_setup {action:"restart-adapter"}（几秒，宿主监督器自动重拉）',
   'no-process': '⚠ 没有在跑的 adapter 进程——宿主会在会话启动时拉起；若宿主正开着，用 restart-adapter 兜底',
   'no-manifest': '(清单未写：bootstrap 没跑完)',
 }

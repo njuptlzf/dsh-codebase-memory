@@ -290,7 +290,7 @@ code_index（建索引 / 改完代码后刷新）
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `bootstrap` | `background` | `blocking` / `background` / `manual`（manual = 只探测不下载） |
-| `adapterVersion` | `2.29.0-0.0.4` | 钉死；**唯一升级入口** |
+| `adapterVersion` | `5.2.0-0.0.6` | 钉死；**唯一升级入口**。bootstrap 会比对实装版本：不一致自动重装到钉版本（`manual` 只记 note 不碰网络；安装失败保留旧包继续跑）。0.0.6 起清单自带 watcher（漂移秒级自愈）、mcpScript 需 `settings.scriptMode` 显式准入（清单由插件写好） |
 | `adapterDir` | `$DSH_HOME/vendor/mcp-adapter` | 压缩层与 `cbm.json` 的落点 |
 | `cbmPath` | 自动探测 | 留空则按 官方安装位 → vendor → PATH 探测 |
 | `autoIndex` | `true` | 自举时把引擎的 `auto_index` 对齐到该值（先读后写，值相同不重复写）。**作用域警告**：它落在机器级共享的 `~/.cache/codebase-memory-mcp/_config.db`，同机所有 MCP client 共用——不想让本插件替你决定就设成 `false`。实测语义：只给**尚无索引**的项目在会话启动时补一次全量，**不刷新陈旧坐标**，所以它不是防漂移手段（防漂移仍是 `code_index` + `check_index_coverage`） |
@@ -330,7 +330,7 @@ npm run check   # = check:patch + check:client + check:plugin + check:chain + ch
 
 ```
 PATCH OK
-248/248 臂通过（tauri + web 两个 profile）   PLUGIN OK
+258/258 臂通过（tauri + web 两个 profile）   PLUGIN OK
 CHAIN OK — 阶段3.5 代理链路延迟 ms: min=28 中位=32 max=34；配了 zg 的临时清单另跑 阶段2b：桥接 + 语义检索返回真实结果
 臂A 直连 cbm            : 17 工具, 17308 B ≈ 4327 tokens
 臂B 代理·冷缓存         :  2 工具,  4278 B ≈ 1070 tokens  （省 4.0x）
@@ -354,7 +354,7 @@ cbm CLI 同一台机器单次 search_graph        : 5491 / 6526 / 8280 ms  ← �
 | `codebase-memory` 行**没有「配置」按钮**（设置 → 插件） | 按钮由 `lib/client.js` 注册，且三个条件同时成立才出现——**每一个失败都不报错**，所以这条单独列出：① 宿主只有在 `describe()` 发现该 entry 有 volatile 字段时才 serve 命名空间，装进去的 `index.js` 若没有 `.volatile()` 就没有按钮（`node scripts/sync.mjs` 后重启）；② 槽 key 必须严格等于 `<包名>#<row id>`（本包是 `dsh-codebase-memory#codebase-memory`），只改 `cordis.patch.yml` 的行 id 不改 key，按钮就消失——所以 `npm run check:client` 从 patch 反解 key，不信 bundle 里的常量；③ bundle 必须是开着的（`@deepseek-ai/dsh-client-ui-plugin-manager` README：“The bundle's patch must declare the row under that id, and the registration exists while the bundle is on”）。客户端副本装歪会被 `code_setup` 的 `fileDrift` 报出来（`lib/client.js` 在 `RUNTIME_FILES` 里），但它不会告诉你按钮不见了。**页面上没有的字段**（`wrapperTools`/`sessionRefresh`/`autoIndex`/`bootstrap`/`dirtyRefreshCooldownSec`/`zgToolset`/`zgVendorDir`）仍是 composition 级：改 patch，重启宿主——`wrapperTools` 与 `zg*` 是**结构上没法热改**（工具注册无注销、清单在适配层进程启动时才读），不是没做；`zgEnabled` 自 v0.11.0 起在页上可写，但正因如此它显示的是 pending 状态机而非"即时生效" |
 | `code_find` 提示"坐标很可能已过期" | 层 ⑤ 的自检生效了：返回的源码里没有那个符号名（上游 issue #1750 的静默错位）。跑一次 `code_index`；插件已经在后台补刷，但**别在补刷完成前信这些行号** |
 | 启动后头几次 `code_find` 报"查不到 project（list_projects 查询失败）" | 引擎冷启动：第一发要等 MCP server 进程起来（加载全部 project 的图谱库）。v0.10.1 起 bootstrap 已在会话外恰好预热一发（`code_setup` 报告看 `warm=ok`），撞上重试即可。**注意和"项目表里没有"区分**——那半句才是真没索引，先 `code_index` |
-| 代理工具报 `Tool "cbm_*" not found`，`code_setup` 报 `适配层进程: ⚠ stale` | 清单被重写过、活着的适配层进程还是老的——它只在启动时读清单，没有文件监听，所以引擎后来装好也**不自愈**（v0.12.0 事故的 0-server 死锁；`warm=failed` 同因）。对 agent 说「重启适配层」：`code_setup {action:"restart-adapter"}`，杀老进程、宿主监督器几秒内自动重拉，**不必重启宿主**；报表转 `fresh` 即恢复 |
+| 代理工具报 `Tool "cbm_*" not found`，`code_setup` 报 `适配层进程: ⚠ stale` | 清单被重写过、活着的适配层进程还没加载它。v0.13.0 钉的适配层（≥0.0.6）自带清单监听，**几秒内自愈**；持续 stale 说明是老进程/老包（或 `MCP_CONFIG_WATCH` 关了）——对 agent 说「重启适配层」：`code_setup {action:"restart-adapter"}`，杀老进程、宿主监督器几秒内自动重拉，**不必重启宿主**；报表转 `fresh` 即恢复（v0.12.0 事故的 0-server 死锁；`warm=failed` 同因） |
 | 当前会话工具清单里没有 `code_index`/`code_setup`，但 `code_setup` 能调通 | 工具清单是**会话级快照**：新开的对话才看得到。"没列出"≠"没注册" |
 | `code_setup` 报 `status: NOT READY` | 看它给的缺失项与安装命令，照做后再调一次（它会重试自举，不用重启） |
 | `清单: (未写)` | bootstrap 在写 `cbm.json` 前抛错了——把 `error:` 行原样报给维护者 |

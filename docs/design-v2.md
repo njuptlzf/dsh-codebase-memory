@@ -584,6 +584,15 @@ v0.8.0 验收截图（m02738）：措辞已生效，但运行读数仍是一行"
 - P1（上游）：给 `njuptlzf/mcp-adapter` 提 issue——`--config` 文件监听（mtime 防抖自动补注册）+ `mcp({})` 在"配置 N 个、连接 0 个"时如实报。插件侧的①②③只是把失真变成可见，热加载的正解在适配层。
 - 臂 X +9，两 profile 合计 239→248（含 Z 臂文案断言跟着"重拉"改词）。
 
+### 6.14 适配层升钉 5.2.0-0.0.6：watcher 自愈 + scriptMode 显式准入 + 版本对账（v0.13.0）
+
+上游按 §6.13 的 P1 发布了修复版（[#34](https://github.com/njuptlzf/mcp-adapter/issues/34)），同时 5.x 有一处行为收紧（[#744](https://github.com/njuptlzf/mcp-adapter)）。插件侧三件：
+
+- **升 pin + 清单 watcher**：5.2.0-0.0.6 内置清单监听（sha256 轮询 3s，漂移 → `exit(0)` → 宿主监督器重拉）——§6.13 的 stale 死锁在新进程上从"永不自愈"变"几秒自愈"；`restart-adapter` 与进程轴三条兜底**不撤**，降级为老进程/`MCP_CONFIG_WATCH=0` 时的兜底。报表 stale 行、设置页状态行、排错表同步改词（历史叙述在 §6.13 原文保留，决策记录不改史）。
+- **settings.scriptMode 写进清单**：5.x 起 `mcpScript` 不再默认注册，需清单顶层 `settings: {scriptMode: true}` 显式准入。本插件的 usageSection 与 README 把"多步用 mcpScript 一趟跑完"当事实（长尾编排全靠它），不开就是画饼；老 2.29 进程无视未知顶层键，先写无害。Z/E 两臂各锁一条断言。
+- **版本对账——"唯一升级入口"要真的生效**：`ensureAdapter` 原本只看 bundle 存在；升 pin 后所有机器会停在旧包而报表照报 ready（没 watcher、没 scriptMode），那是 §6.13 那课的第二种姿势——状态没撒谎，只是不知道。改为：实装版本 ≠ 钉 ⇒ 自动重装；装失败保留旧包继续跑（存在 > 新鲜，note 说破）；`manual` 不碰网络只记差距；note 必须讲清"磁盘换了 ≠ 进程换了，新进程才加载新包"。`DEFAULT_ADAPTER_VERSION` 改为导出，harness 固件/断言与插件同源，升 pin 不再需要改第二处；`mcpInstall` 罐头进 makeCtx（臂 V 三态对账 + G8.5 zgm 挂载从此不触网，顺手拔掉 gate 慢源头之一）。
+- 臂 V +3，E/Z 各 +1，两 profile 合计 248→258（数字以门禁输出为准）。
+
 ---
 
 ## 7. 参考链接
