@@ -180,6 +180,8 @@ For multi-step lookups, run them in one `mcp__cbm__mcpScript` call instead of ro
 
 #### Choosing a layer (the human cheat-sheet; the model gets its own version only when zg is ready)
 
+**There is no sequencing between the layers.** They are independent entries — pick by question shape, not by order. The one place with a fixed sequence is *inside* `enforce=replace`: the graph is tried first, and zg fires only when the graph had no answer (and the layer is ready **and** this workspace has `.zvec-grep/` — a graph hit never costs a zg call). Write-side refresh fans out to both layers in parallel; neither layer replaces the other.
+
 | Question shape | Reach for | What it costs |
 |---|---|---|
 | Where is X defined / who calls Y | `code_find` / `code_callers` (structure layer) | one `code_index` up front; the write ledger's background refresh keeps it roughly warm |
