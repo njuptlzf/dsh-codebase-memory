@@ -815,7 +815,13 @@ function usageSection(state) {
     ].join('\n')
   }
   const lines = [
-    '本工作区已接入 codebase-memory 代码索引（经 mcp-adapter 压成单个代理工具）。',
+    // 首句是 agent 每会话第一眼读到的锚定文案：zg ready 时报双层组成并写明归属
+    // （ruankao 案：agent 说"zg 不是 dsh-codebase-memory 插件，是独立 MCP server"，
+    // 窄化判词就漏在这句只报 code 索引 + zg 段不讲归属）。zg 没就绪一个字不提——
+    // 不画饼纪律不变（:838 注释 + 断言「Z 默认 prompt 不提 zg」）。
+    (state.zg === 'ready'
+      ? '本工作区已接入两层代码检索——结构层 cbm（codebase-memory 图谱）+ 语义层 zg（zvec-grep，server 由本插件清单注册）——都经 mcp-adapter 压成单个代理工具。'
+      : '本工作区已接入 codebase-memory 代码索引（经 mcp-adapter 压成单个代理工具）。'),
     '',
     '**首选封装动词**（project 与参数形状由插件填，你只管说要找什么）：',
     '- `code_find("符号")` → qualified_name + 文件 + 行范围 + 源码，代替"用 grep 猜定义在哪"。',

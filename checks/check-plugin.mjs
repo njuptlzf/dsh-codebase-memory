@@ -362,6 +362,8 @@ async function verify(profile) {
   record('Z 默认（真实清单）没有 zg server', manifest.mcpServers?.zg === undefined,
     `实际: ${JSON.stringify(manifest.mcpServers?.zg ?? null)}`)
   record('Z 默认 prompt 不提 zg（未装不画饼）', !prompt.includes('zvec_grep_search'))
+  // v0.13.5 回归锁：两层组成句只在 zg ready 时出现——默认路径若带上"两层"就是画饼。
+  record('Z 默认 prompt 不提两层组成（画饼回归锁）', !prompt.includes('两层代码检索'))
   const zgHome = join(tmpdir(), `cbm-check-zg-${process.pid}`)
   rmSync(zgHome, { recursive: true, force: true })
   const zgAdapter = join(zgHome, 'adapter')
@@ -384,6 +386,12 @@ async function verify(profile) {
   record('Z 就绪报表列出语义层状态', /语义层\(zg\): ready/.test(zSetup), /^语义层\(zg\):.*$/m.exec(zSetup)?.[0]?.slice(0, 120) ?? '(没有 zg 行)')
   record('Z 就绪报表三轴齐全（清单事实 / 包实测 / 页面开关）', /ready  包=已装  页面开关=on/.test(zSetup), /^语义层\(zg\):.*$/m.exec(zSetup)?.[0]?.slice(0, 140) ?? '(没有 zg 行)')
   record('Z 就绪 prompt 给出 zvec_grep_search 路由', /zvec_grep_search/.test(zReady.sections.map((s) => s.text?.()).join('\n')))
+  // v0.13.5：zg 就绪时首句必须报双层组成 + 归属（ruankao 案：agent 把 zg 当成
+  // "独立的 MCP server"而非本插件的一部分，病根是首句只报 codebase-memory）。
+  const zPromptText = zReady.sections.map((s) => s.text?.()).join('\n')
+  record('Z 就绪 prompt 首句报双层组成与归属',
+    /两层代码检索[\s\S]*结构层 cbm[\s\S]*语义层 zg[\s\S]*本插件清单注册/.test(zPromptText),
+    zPromptText.slice(0, 90))
   const zDoc = JSON.parse(readFileSync(join(zgAdapter, 'cbm.json'), 'utf8'))
   record('Z 清单第二 server 走自带 stdio 桥', zDoc.mcpServers?.zg?.args?.includes('--stdio') === true
     && zDoc.mcpServers?.zg?.args?.includes('server') === true, JSON.stringify(zDoc.mcpServers?.zg?.args ?? null))
