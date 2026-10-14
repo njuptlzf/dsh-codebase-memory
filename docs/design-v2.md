@@ -593,6 +593,16 @@ v0.8.0 验收截图（m02738）：措辞已生效，但运行读数仍是一行"
 - **版本对账——"唯一升级入口"要真的生效**：`ensureAdapter` 原本只看 bundle 存在；升 pin 后所有机器会停在旧包而报表照报 ready（没 watcher、没 scriptMode），那是 §6.13 那课的第二种姿势——状态没撒谎，只是不知道。改为：实装版本 ≠ 钉 ⇒ 自动重装；装失败保留旧包继续跑（存在 > 新鲜，note 说破）；`manual` 不碰网络只记差距；note 必须讲清"磁盘换了 ≠ 进程换了，新进程才加载新包"。`DEFAULT_ADAPTER_VERSION` 改为导出，harness 固件/断言与插件同源，升 pin 不再需要改第二处；`mcpInstall` 罐头进 makeCtx（臂 V 三态对账 + G8.5 zgm 挂载从此不触网，顺手拔掉 gate 慢源头之一）。
 - 臂 V +3，E/Z 各 +1，两 profile 合计 248→258（数字以门禁输出为准）。
 
+### 6.15 报表面兑现承诺：现量、年龄、容错、读侧 lift（v0.13.1）
+
+v0.13.0 的验收现场自查翻出同一族的第三、第四种姿势：**报表文案的承诺，读路径上必须可证伪**。三个症状、三个根因，全部实测定位（argv 直调复刻枚举命令返回干净 ⇒ 引擎和上游都没撒谎）：
+
+- **进程轴冻结**：code_setup 连打九分钟报同一个已死三元组。根因不是"30s 缓存不刷新"——是 `adapterFreshness` 只在 bootstrap 量取一次（`state.ok` 早退），**code_setup 读路径压根没有重量**，TTL 从未被这条路径消费。修法：execute 里自带一次 `adapterFreshness`（同一个 TTL 自然限流，多宿主并跑也不炸进程）；快照 ≥2s 时报表行标 `(量取 Ns 前)`——缓存结论从此带年龄，不再长得像实时。
+- **restart-adapter 崩在 ESRCH**：枚举与 kill 之间进程合法死亡（监督器级联重启是常态），`kill ESRCH` 抛出点在 `state.adapterFresh = null` **之前**，崩溃跳过快照作废，报表从此锁死旧值。修法：作废挪到最前（早退路径也作废）；逐 pid 容错 ESRCH——已死即达成目标，计入 killed。
+- **计数「跨重启累计」语义不闭环**：单实例内存增量从不与文件对账（max-merge 只在写侧），日志行不带发出 pid，多宿主并跑时 log 与 counts 对不上账且无法归因。修法：报表渲染前 `liftCounts`（文件大值抬进内存，读侧兑现文案）；telemetry 行加 `pid: process.pid`。
+
+可测性缝一起进代码：`DSH_CBM_FRESH_TTL_MS`（**调用时**读取，设 0 让门禁确定性重量——模块加载时读会让 harness 的中途 setEnv 失效）、`DSH_CBM_KILL_ESRCH_PIDS`（强制容错路径）。臂 U 五条：连打两报 pid 跟着变 / 年龄后缀 / ESRCH 不崩且作废 / 外部写大值在报表可见 / telemetry 行 pid=本进程。harness 顺手一课：mount() 无 dispose，bootstrap 后台收尾与临时目录删除是真竞态，重试等不到——清理改尽力而为（目录名带 pid，弃尸无害）；以及 `check:plugin` 从 **profile 安装副本**加载插件，**先 `npm run sync` 再跑门禁**，否则测的是旧模块、PASS/FAIL 都不证明仓库状态。臂 U +5，两 profile 合计 258→268（数字以门禁输出为准）。
+
 ---
 
 ## 7. 参考链接

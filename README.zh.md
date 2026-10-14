@@ -305,7 +305,7 @@ code_index（建索引 / 改完代码后刷新）
 | `zgEnabled` | `false` | 语义检索层（①b）。`true` 时清单多注册一个 `zg` server（lifecycle `lazy`），prompt 多三行工具路由。**页面可写但延迟生效**：v0.11.0 起标了 volatile，设置页「检索两层」段有它的开关（开启走两步确认，写明体积/时长/`.zvec-grep/`→gitignore 的全部代价）；但 `cbm.json` 在适配层进程启动时才读，所以开关只改"下次清单长什么样"——差的那一步由状态行的 `pending-on`/`pending-off` 诚实报出，`code_setup {action:"restart-adapter"}` 重拉适配层（或重启宿主）才重建清单。前置：包已装（`code_setup {action:"install-zg"}` 或 `npm run install:zg`），否则报表 `语义层(zg): missing` 并指路装它（**绝不自动装**——430MB 是人的决定） |
 | `zgToolset` | `agent` | 传给 `zg server --mcp-toolset` 的工具集：`agent`（只露 `zvec_grep_search`，索引检索一条）/ `full`（另露受管 rg 直通与 4 个索引/状态工具——一般不必给模型） |
 | `zgVendorDir` | `$DSH_HOME/vendor/zvec-grep` | `install:zg` 的落点；CLI 路径 = `<该目录>/node_modules/@zvec/zvec-grep/dist/cli/index.js` |
-| `telemetry` | `true` | **热改**（设置页）。每次拦截 / 放行 / 记账 / 补刷写一行 JSON 到 `$DSH_HOME/vendor/mcp-adapter/telemetry.log`，并在 `code_setup` 里给出计数。要不要升 `deny-once`，靠这个数据拍。计数是**跨重启累计**的：每次推送顺带把计数 max 合并进同目录的 `telemetry.counts.json`，下次启动先播种回来（「开 replace 跑几天看占比」不该被重启清零）；关掉遥测 ⇒ 停止写日志与累计文件，计数与读数**冻结在最后值**（不是清零），再开继续从累计走 |
+| `telemetry` | `true` | **热改**（设置页）。每次拦截 / 放行 / 记账 / 补刷写一行 JSON 到 `$DSH_HOME/vendor/mcp-adapter/telemetry.log`，并在 `code_setup` 里给出计数。要不要升 `deny-once`，靠这个数据拍。计数是**跨重启累计**的：每次推送顺带把计数 max 合并进同目录的 `telemetry.counts.json`，下次启动先播种回来（「开 replace 跑几天看占比」不该被重启清零）；v0.13.1 起**读侧也兑现**——报表渲染前先把累计文件里更大的值抬进显示，且每行日志带发出进程 `pid`（多宿主并跑可对账归因）；关掉遥测 ⇒ 停止写日志与累计文件，计数与读数**冻结在最后值**（不是清零），再开继续从累计走 |
 | `stats` | `""` | **插件写的，人不要配**。设置页「运行读数」的数据源：volatile 引用里的全量计数 JSON——`describe()` 直接读 `ref.get()` 把运行期数据推给页面，**不碰持久化文档**（指纹只含文档层值，不涨 revision）；每次推送后 emit `settings/document-updated` 触发浏览器重拉镜像，2 秒节流合并。它是**方向反转的 volatile**（插件→页面）；用户在文档里写什么都会被下一个事件的全量重建覆盖。**开机即推一帧快照**（遥测开时）：计数先从累计文件 `telemetry.counts.json` 播种，所以刚重启、还没事件的设置页也是**带历史数**的五张卡片常驻（真没历史才全零），不是"暂无读数"（design-v2 §6.6/§6.7）。载荷里语义层按**三轴**分开给——`zg`（清单事实 off/ready/missing）、`zgWant`（页面开关）、`zgInstalled`（包实测），「检索两层」状态行由三轴推导（v0.11.0）；`install-zg` 进行中会推 `installing` 帧；zg 探测完成即补推一帧，**遥测关时照旧一帧不推**（页面与日志同一开关） |
 
 回滚按杠杆来：`{"enforce":"off","contextHint":false,"dirtyTracking":false,"wrapperTools":false}` 就退回 v0.2 的行为，新开会话即生效。
@@ -330,7 +330,7 @@ npm run check   # = check:patch + check:client + check:plugin + check:chain + ch
 
 ```
 PATCH OK
-258/258 臂通过（tauri + web 两个 profile）   PLUGIN OK
+268/268 臂通过（tauri + web 两个 profile）   PLUGIN OK
 CHAIN OK — 阶段3.5 代理链路延迟 ms: min=28 中位=32 max=34；配了 zg 的临时清单另跑 阶段2b：桥接 + 语义检索返回真实结果
 臂A 直连 cbm            : 17 工具, 17308 B ≈ 4327 tokens
 臂B 代理·冷缓存         :  2 工具,  4278 B ≈ 1070 tokens  （省 4.0x）
@@ -355,6 +355,7 @@ cbm CLI 同一台机器单次 search_graph        : 5491 / 6526 / 8280 ms  ← �
 | `code_find` 提示"坐标很可能已过期" | 层 ⑤ 的自检生效了：返回的源码里没有那个符号名（上游 issue #1750 的静默错位）。跑一次 `code_index`；插件已经在后台补刷，但**别在补刷完成前信这些行号** |
 | 启动后头几次 `code_find` 报"查不到 project（list_projects 查询失败）" | 引擎冷启动：第一发要等 MCP server 进程起来（加载全部 project 的图谱库）。v0.10.1 起 bootstrap 已在会话外恰好预热一发（`code_setup` 报告看 `warm=ok`），撞上重试即可。**注意和"项目表里没有"区分**——那半句才是真没索引，先 `code_index` |
 | 代理工具报 `Tool "cbm_*" not found`，`code_setup` 报 `适配层进程: ⚠ stale` | 清单被重写过、活着的适配层进程还没加载它。v0.13.0 钉的适配层（≥0.0.6）自带清单监听，**几秒内自愈**；持续 stale 说明是老进程/老包（或 `MCP_CONFIG_WATCH` 关了）——对 agent 说「重启适配层」：`code_setup {action:"restart-adapter"}`，杀老进程、宿主监督器几秒内自动重拉，**不必重启宿主**；报表转 `fresh` 即恢复（v0.12.0 事故的 0-server 死锁；`warm=failed` 同因） |
+| ≤0.13.0：`code_setup` 的进程轴 pid 长期不动、遥测计数不涨、`restart-adapter` 报 `kill ESRCH` | 报表面缺陷（v0.13.1 修）：老版 code_setup 只在宿主启动时量一次进程快照、读路径没有重量，快照会显示早已死掉的 pid；kill 撞 ESRCH 崩溃还会跳过快照作废，把旧值锁死。升级后 code_setup **每次现量**（30s TTL 内复用同一量取，行尾带 `(量取 Ns 前)` 年龄后缀——**有后缀是正常缓存，不是冻结**）；计数报表渲染前从累计文件读侧 lift；telemetry 日志行带发出 `pid` 便于对账（design-v2 §6.15） |
 | 当前会话工具清单里没有 `code_index`/`code_setup`，但 `code_setup` 能调通 | 工具清单是**会话级快照**：新开的对话才看得到。"没列出"≠"没注册" |
 | `code_setup` 报 `status: NOT READY` | 看它给的缺失项与安装命令，照做后再调一次（它会重试自举，不用重启） |
 | `清单: (未写)` | bootstrap 在写 `cbm.json` 前抛错了——把 `error:` 行原样报给维护者 |

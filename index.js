@@ -375,7 +375,14 @@ async function installZgLayer(ctx, cfg, state, signal) {
  * 自愈；本节三条兜底不撤——老进程/关监听（MCP_CONFIG_WATCH=0）时仍是唯一手段。
  */
 const RESTART_WAIT_MS = 15_000
-const ADAPTER_FRESH_CACHE_MS = 30_000
+// 进程轴快照的缓存窗口。**调用时读**（模块是开机 import 的，臂跑到一半才设 env）；
+// 测试缝 DSH_CBM_FRESH_TTL_MS 把窗口压到 0，验收臂才能强制每次 code_setup 都重量。
+function freshTtlMs() {
+  const raw = process.env.DSH_CBM_FRESH_TTL_MS
+  if (raw == null || raw === '') return 30_000
+  const v = Number(raw)
+  return Number.isFinite(v) && v >= 0 ? v : 30_000
+}
 
 /** Windows CIM 输出：`pid|ISO时间` 每行一条。 */
 export function parseAdapterProcsWin(text) {
@@ -415,10 +422,16 @@ async function listAdapterProcs(ctx, cfg, signal) {
   return parseAdapterProcsPosix(r.stdout)
 }
 
-/** 测试缝 DSH_CBM_KILL_STUB_FILE：设了它，kill 只往该文件追加 pid，不真杀进程（check-plugin 臂 X 用）。 */
+/** 测试缝 DSH_CBM_KILL_STUB_FILE：设了它，kill 只往该文件追加 pid，不真杀进程（check-plugin 臂 X 用）。
+ *  测试缝 DSH_CBM_KILL_ESRCH_PIDS：逗号分隔 pid，命中即抛 ESRCH——模拟「枚举到 kill 之间
+ *  进程被监督器级联重启掉了」这个常态（2026-10-14 验收实撞），臂 U 用它锁住容错。 */
 function killAdapterProc(pid) {
   const seam = process.env.DSH_CBM_KILL_STUB_FILE
-  if (seam) { try { writeFileSync(seam, `${pid}\n`, { flag: 'a' }) } catch { /* 臂断言会暴露写不进去 */ } ; return }
+  if (seam) { try { writeFileSync(seam, `${pid}\n`, { flag: 'a' }) } catch { /* 臂断言会暴露写不进去 */ } }
+  if ((process.env.DSH_CBM_KILL_ESRCH_PIDS ?? '').split(',').map((s) => s.trim()).includes(String(pid))) {
+    const e = new Error(`kill ESRCH ${pid}`); e.code = 'ESRCH'; throw e
+  }
+  if (seam) return
   process.kill(pid)
 }
 
@@ -428,7 +441,7 @@ function killAdapterProc(pid) {
  */
 async function adapterFreshness(ctx, cfg, state, signal, { force = false } = {}) {
   const cached = state.adapterFresh
-  if (!force && cached && Date.now() - cached.at < ADAPTER_FRESH_CACHE_MS) return cached
+  if (!force && cached && Date.now() - cached.at < freshTtlMs()) return cached
   let manifestMs = 0
   try { manifestMs = statSync(cfg.adapterConfig).mtimeMs } catch { /* 清单还没写 */ }
   let procs = []
@@ -445,12 +458,18 @@ async function adapterFreshness(ctx, cfg, state, signal, { force = false } = {})
 /** 杀掉现有 adapter 进程并等监督器重拉。宿主监督器断连即重启，所以 kill 即重启。 */
 async function restartAdapter(ctx, cfg, state, signal) {
   const before = await listAdapterProcs(ctx, cfg, signal)
+  // 作废旧快照必须在 kill 循环**之前**：2026-10-14 实撞 kill ESRCH 崩在循环里、
+  // 排在后面的作废没执行，冻结的进程轴连手动重拉都清不掉。
+  state.adapterFresh = null // 旧结论作废
   if (!before.length) {
     telemetry(cfg, state, 'restart-adapter', { killed: 0 })
     return { killed: 0, oldPids: [], newPids: [], note: '没有在跑的 adapter 进程——宿主会在会话启动时拉起，新进程读的就是当前清单' }
   }
-  for (const proc of before) killAdapterProc(proc.pid)
-  state.adapterFresh = null // 旧结论作废
+  let killed = 0
+  for (const proc of before) {
+    // 枚举到 kill 之间进程死掉是常态（监督器级联重启）：ESRCH = 目标已达成，计为已杀。
+    try { killAdapterProc(proc.pid); killed++ } catch (e) { if (e?.code === 'ESRCH') killed++; else throw e }
+  }
   const deadline = Date.now() + RESTART_WAIT_MS
   let newPids = []
   while (Date.now() < deadline) {
@@ -462,9 +481,9 @@ async function restartAdapter(ctx, cfg, state, signal) {
     if (newPids.length) break
   }
   state.adapterFresh = null
-  telemetry(cfg, state, 'restart-adapter', { killed: before.length, respawned: newPids.length })
+  telemetry(cfg, state, 'restart-adapter', { killed, respawned: newPids.length })
   return {
-    killed: before.length,
+    killed,
     oldPids: before.map((p) => p.pid),
     newPids,
     note: newPids.length ? '' : `已杀但 ${RESTART_WAIT_MS / 1000}s 内没等到新进程——宿主监督器可能没接回，重启宿主`,
@@ -741,10 +760,14 @@ function adapterLine(state) {
   const f = state.adapterFresh
   if (!f) return '(待测：下次 code_setup / 启动后台量取)'
   const pids = f.pids.length ? `  pid=${f.pids.join(',')}` : ''
-  return `${ADAPTER_VERDICT_TEXT[f.verdict] ?? f.verdict}${pids}`
+  // 快照年龄：读的是缓存结论，标出它是几秒前量的，过期一眼可见（v0.13.1 报表面）。
+  const ageS = Math.max(0, Math.round((Date.now() - f.at) / 1000))
+  const age = ageS >= 2 ? `  (量取 ${ageS}s 前)` : ''
+  return `${ADAPTER_VERDICT_TEXT[f.verdict] ?? f.verdict}${pids}${age}`
 }
 
 function report(cfg, state) {
+  liftCounts(cfg, state) // 读侧 lift：报表的「累计」承诺要能在读路径兑现（v0.13.1）
   // 语义层三轴（清单事实 / 包实测 / 页面开关）不一致时把待办动作写进后缀，别让用户猜。
   const zgInstalled = existsSync(cfg.zgCli)
   const zgSuffix = state.zgInstalling ? '  [install-zg 安装中]'
@@ -1144,6 +1167,18 @@ function loadCounts(cfg) {
 }
 
 /**
+ * 读侧 lift（v0.13.1）：别的宿主/实例写了计数文件、本实例内存没跟上的增量，
+ * 报表读之前先从文件捞回来——「跨重启累计」这句话得在读路径也可证伪，
+ * 不能只写在启动播种和 max 写上（2026-10-14 验收：log 有 5 行、报表只走 9→10，
+ * 归因不了的差距就是语义洞）。max 合并幂等，不虚增本进程自己的数。
+ */
+function liftCounts(cfg, state) {
+  if (!cfg.telemetry) return
+  const f = loadCounts(cfg)
+  for (const [k, v] of Object.entries(f)) if (typeof v === 'number' && v > (state.counts[k] ?? 0)) state.counts[k] = v
+}
+
+/**
  * state.counts → 设置页读数（JSON 字符串）。**每次全量重建**：用户任何一次配置写
  * 都会让 loader 把这个 volatile 字段复位成 schema 默认（_commitVolatile 只认文档
  * 层），下一个事件回填，所以绝不能做增量。键名是面板的契约，改键要同步 lib/client.js。
@@ -1175,7 +1210,9 @@ function telemetry(cfg, state, event, fields = {}) {
     // ponytail: 追加式 JSONL，唯一的保鲜手段是"超上限就整份重来"（计数还在内存里，
     // 报表不依赖文件）。要长期分析就换成按天分文件 + 定期清理。
     try { if (statSync(path).size > TELEMETRY_MAX_BYTES) rmSync(path, { force: true }) } catch { /* 还不存在最好 */ }
-    writeFileSync(path, `${JSON.stringify({ ts: new Date().toISOString(), event, ...fields })}\n`, { flag: 'a' })
+    // pid：多宿主/多实例并跑时日志行得能说清是谁发的——否则「发事件」和「记数」
+    // 对不上账无法归因（2026-10-14 验收：log 有 5 行 wrapper-call、计数只走 1）。
+    writeFileSync(path, `${JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, event, ...fields })}\n`, { flag: 'a' })
   } catch { /* 忽略 */ }
   state.counts[event] = (state.counts[event] ?? 0) + 1
   // 带 source 的事件额外记一份 "event:source" 计数（intercept-replace 的图谱/语义
@@ -1416,7 +1453,8 @@ export async function apply(ctx, config) {
     const ref = state.statsRef
     if (isVolRef(ref)) { try { ref[VOL_WRITE](renderStats(cfg, state)) } catch { /* 绝不影响会话 */ } }
     // 累计落盘：只在计数变了时写；先与文件 max 合并再写——tauri/web 两宿主并跑时
-    // 各自只见自己的增量，max 是最接近跨进程总数的廉价做法（真总数要 per-pid 文件+读侧聚合，不值）。
+    // 各自只见自己的增量，max 写 + 读侧 lift（liftCounts）把文件里的别人的增量捞回报表，
+    // 「跨重启累计」两端都兑现（v0.13.1 前只有写侧，读路径不闭环）。
     if (cfg.telemetry) {
       const snap = JSON.stringify(state.counts)
       if (snap !== statsWritten) {
@@ -1524,6 +1562,10 @@ export async function apply(ctx, config) {
         state.lastError = String(error?.message ?? error)
         state.ok = false
       })
+      // 进程轴重量（v0.13.1）：bootstrap 在 state.ok 时早退、从不重量——2026-10-14 验收
+      // 事故里 pid 行 9 分钟报着开机快照，就是因为 code_setup 没有自己的量取路径。
+      // 30s TTL 天然限流；这是诊断面，失败静默，绝不反过来弄坏报表。
+      if (state.ok) await adapterFreshness(ctx, cfg, state, ac.signal).catch(() => {})
       return report(cfg, state)
     },
   }))

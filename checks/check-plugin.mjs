@@ -1033,6 +1033,96 @@ async function verify(profile) {
   record('X stats 载荷带 adapter 进程轴（设置页 stale 行的数据源）',
     xStatsJson?.adapter === 'stale', String(xStatsRef.get()).slice(0, 140))
 
+  // ── 臂 U：v0.13.1 报表面三处（冻结 pid 行 / kill ESRCH 作废 / telemetry pid 归因）──
+  // 事故原型（2026-10-14 验收）：监督器级联换了进程，本会话 code_setup 9 分钟仍报
+  // 09:46 的开机快照——adapterFreshness 只在 bootstrap await、state.ok 后没人重量。
+  // 契约：① code_setup 自带量取（TTL 压 0 后连打两报 pid 跟着现场变）；
+  // ② 快照过期时报表标年龄；③ kill ESRCH 容错且作废在 kill 前；
+  // ④ 计数读侧 lift（别的实例写的大值本报表可见）；⑤ telemetry 行带发出 pid。
+  // 全部走 makeCtx 罐头枚举 + 临时目录，绝不真起 powershell、绝不碰真机 vendor。
+  const pidOfLine = (t) => Number(/pid=(\d+)/.exec(t)?.[1] ?? -1)
+
+  // U1：TTL=0 ⇒ 每次 code_setup 都重量，枚举表按次序换 pid ⇒ 冻结不可能再发生
+  process.env.DSH_CBM_FRESH_TTL_MS = '0'
+  try {
+    let uSeq = 0
+    const u1 = await mount({ telemetry: false }, null, { procTable: () => procLine(41100 + (++uSeq), 0) })
+    const u1a = await u1.tools.get('code_setup').execute({}, withSignal(REPO))
+    const u1b = await u1.tools.get('code_setup').execute({}, withSignal(REPO))
+    const ua = pidOfLine(u1a); const ub = pidOfLine(u1b)
+    record('U code_setup 自带量取：TTL=0 时连打两报 pid 跟着现枚举变（不再复用开机快照）',
+      ua > 0 && ub > ua, `第一报 pid=${ua} → 第二报 pid=${ub}`)
+  } finally { delete process.env.DSH_CBM_FRESH_TTL_MS }
+
+  // U2：快照过期 ⇒ 报表标年龄（默认 TTL 命中缓存时能看出"这是 2 秒前量的"）
+  process.env.DSH_CBM_FRESH_TTL_MS = '120000' // 拉长窗口，第二次报必走缓存
+  try {
+    let uSeq2 = 0
+    const u2 = await mount({ telemetry: false }, null, { procTable: () => procLine(41200 + (++uSeq2), 0) })
+    await u2.tools.get('code_setup').execute({}, withSignal(REPO)) // 量取一次，f.at≈现在
+    await new Promise((r) => setTimeout(r, 2200)) // 让快照"过期"到 ≥2s
+    const u2b = await u2.tools.get('code_setup').execute({}, withSignal(REPO))
+    record('U 进程轴快照 ≥2s 时报表标"量取 Ns 前"（缓存结论带年龄，不再像实时）',
+      /量取 \d+s 前/.test(u2b), /适配层进程:.*$/m.exec(u2b)?.[0]?.slice(0, 130) ?? '(没有适配层进程行)')
+  } finally { delete process.env.DSH_CBM_FRESH_TTL_MS }
+
+  // U3：kill ESRCH 容错 + 作废在 kill 前（监督器级联重启时进程枚举到 kill 之间已死）
+  const killFileU = join(tmpdir(), `cbm-kill-${process.pid}-u.txt`)
+  rmSync(killFileU, { force: true })
+  process.env.DSH_CBM_KILL_STUB_FILE = killFileU
+  process.env.DSH_CBM_KILL_ESRCH_PIDS = '41301'
+  try {
+    // 第一次枚举两个老 pid（其中 41301 kill 时抛 ESRCH），杀掉后换一个新 pid 复活
+    let u3n = 0
+    const u3 = await mount({ telemetry: false }, null, { procTable: () => {
+      u3n += 1
+      return u3n === 1 ? procLine(41301, 0)
+        : existsSync(killFileU) && u3n > 2 ? procLine(41302, 0)
+          : procLine(41301, 0)
+    } })
+    let u3err = ''
+    let u3out = ''
+    try { u3out = await u3.tools.get('code_setup').execute({ action: 'restart-adapter' }, withSignal(REPO)) }
+    catch (e) { u3err = String(e?.message ?? e) }
+    record('U kill 撞 ESRCH 不崩：restart-adapter 吞掉已死进程、照常作废快照等新进程',
+      !u3err && /清单加载|已重启|没有在跑|fresh|no-process|stale/.test(u3out) && !/ESRCH/.test(u3out),
+      u3err ? `抛错：${u3err.slice(0, 120)}` : u3out.split('\n')[0]?.slice(0, 120) ?? '(空)')
+  } finally {
+    delete process.env.DSH_CBM_KILL_ESRCH_PIDS
+    delete process.env.DSH_CBM_KILL_STUB_FILE
+    rmSync(killFileU, { force: true })
+  }
+
+  // U4：计数读侧 lift——别的实例写了更大值，本实例报表读之前先捞回来
+  const countsU = join(tmpdir(), `cbm-counts-${process.pid}-u.json`)
+  rmSync(countsU, { force: true })
+  writeFileSync(countsU, JSON.stringify({ 'lift-probe-key': 1 }), 'utf8')
+  try {
+    const u4 = await mount({ telemetry: true }, null, null, countsU) // 播种 1
+    await u4.tools.get('code_setup').execute({}, withSignal(REPO))
+    writeFileSync(countsU, JSON.stringify({ 'lift-probe-key': 4242 }), 'utf8') // 外部实例抬到 4242
+    const u4b = await u4.tools.get('code_setup').execute({}, withSignal(REPO))
+    record('U 计数读侧 lift：外部写的大值在 code_setup 报表可见（「跨重启累计」读侧兑现）',
+      /lift-probe-key=4242/.test(u4b), /遥测计数.*$/m.exec(u4b)?.[0]?.slice(0, 160) ?? '(没有计数行)')
+  } finally { rmSync(countsU, { force: true }) }
+
+  // U5：telemetry 日志行带发出进程 pid（多宿主并跑才能对账归因）
+  const u5Dir = join(tmpdir(), `cbm-u5-${process.pid}-${profile}`)
+  // 尽力清理：mount 无 dispose 接口、后台收尾写句柄与删除真竞态（重试等不到）；
+  // 目录名带 pid 唯一，删不掉就静默留给系统 temp 回收
+  const rmU5 = () => { try { rmSync(u5Dir, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 }) } catch { /* 见上 */ } }
+  rmU5()
+  mkdirSync(u5Dir, { recursive: true })
+  writeFileSync(join(u5Dir, 'mcp-server.mjs'), '', 'utf8')
+  writeFileSync(join(u5Dir, 'package.json'), `{"version":"${DEFAULT_ADAPTER_VERSION}"}`, 'utf8')
+  try {
+    const u5 = await mount({ telemetry: true, adapterDir: u5Dir, cbmPath: fakeExe }, null, { procTable: '' })
+    await u5.tools.get('code_setup').execute({ action: 'restart-adapter' }, withSignal(REPO)) // 必发一条遥测
+    const u5line = JSON.parse(readFileSync(join(u5Dir, 'telemetry.log'), 'utf8').trim().split('\n').filter(Boolean).pop())
+    record('U telemetry 日志行带发出 pid=本进程（log 与计数对不上账时能归因）',
+      u5line.pid === process.pid && u5line.event === 'restart-adapter', JSON.stringify(u5line).slice(0, 150))
+  } finally { rmU5() }
+
   rmSync(tRepo, { recursive: true, force: true })
 
   // ── 臂 B：工作区绑定 ────────────────────────────────────────────────────────
