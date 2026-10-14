@@ -79,7 +79,7 @@ npm run install:zg          # 手动：npm 安装并裁剪（删 transformers.js
 #   状态行诚实显示「开关已开、清单未重建」（pending-on），不谎称已开启。
 ```
 
-开启后 `code_setup` 报表多出 `语义层(zg): ready  包=已装  页面开关=on`，清单（`cbm.json`）里注册 `zg` server（lifecycle `lazy`：首次使用才拉起本地守护进程，约 2.2s，之后热查询 1.4s），模型侧只暴露一个工具 **`zg_zvec_grep_search`**（`agent` 工具集——rg/索引/守护进程管理留在 CLI 侧；**注意代理工具名带 server 键前缀**，直连叫 `zvec_grep_search`，经代理必须叫 `zg_zvec_grep_search`）。调用**必须传 `root`**（工作区绝对路径），没有会报 `root: Invalid input`。索引产物落在被索引仓库的 `.zvec-grep/`（**务必加进 gitignore**——v0.12.0 起这条提示在设置页**常驻**：只要开关开着就一直看得见，因为装包的那个工作区未必是 git 仓库、你的仓库也多是以后才来，一次性弹窗等于没人看见；本仓库已经加了）。裁剪安全性有门禁：`install:zg` 末尾会 `--version` 自检；索引新鲜度复用脏台账链路——`dirtyTracking` 开着时，写文件后的后台补刷会连 `zg index` 一起跑（增量约 2s）。
+开启后 `code_setup` 报表多出 `语义层(zg): ready  包=已装  页面开关=on`，清单（`cbm.json`）里注册 `zg` server（lifecycle `lazy`：首次使用才拉起本地守护进程，约 2.2s，之后热查询 1.4s），模型侧只暴露一个工具 **`zg_zvec_grep_search`**（`agent` 工具集——rg/索引/守护进程管理留在 CLI 侧；**注意代理工具名带 server 键前缀**，直连叫 `zvec_grep_search`，经代理必须叫 `zg_zvec_grep_search`）。调用**必须传 `root`**（工作区绝对路径），没有会报 `root: Invalid input`。索引产物落在被索引仓库的 `.zvec-grep/`（**务必加进 gitignore**——v0.12.0 起这条提示在设置页**常驻**：只要开关开着就一直看得见，因为装包的那个工作区未必是 git 仓库、你的仓库也多是以后才来，一次性弹窗等于没人看见；本仓库已经加了）。裁剪安全性有门禁：`install:zg` 末尾会 `--version` 自检；索引新鲜度复用脏台账链路——`dirtyTracking` 开着时，写文件后的后台补刷会连 `zg index` 一起跑（增量约 2s）。注意一个隐含例外：若该仓还没有 `.zvec-grep/`，同一次后台补刷会**静默完成全量首建**（本仓实测约 23s）——授权点头开在查询侧（见排错表 `INDEX_MISSING` 行），不在这条写路径上。
 
 
 ### ② 把 bundle 挂进 profile（②③④全自动）
@@ -173,6 +173,16 @@ code_index（建索引 / 改完代码后刷新）
 > `format` 不带就是 `tree`——那是排版信封，会给每行贴固定前导空格，照抄当锚点必不匹配（详见[已知限制](#已知限制与不做)）。
 
 多步查询用 `mcp__cbm__mcpScript` 一次跑完（实测两次 `search_graph` 合计 73ms），别拆成多次往返。
+
+#### 选层速查（人看的；模型只在 zg ready 时看到对应的注入段）
+
+| 问题长什么样 | 用哪层 | 成本 |
+|---|---|---|
+| X 定义在哪 / 谁调用 Y | `code_find` / `code_callers`（结构层/图谱） | 前置一次 `code_index`；写台账后台补刷维持热度 |
+| 字面量、日志文案、配置值、对文本跑正则 | `grep`（宿主原生） | 零——永远不依赖索引 |
+| 自然语言"做 Z 的代码"；图谱外的文档/配置 | `zg_zvec_grep_search`（语义层，①b opt-in） | 一次性 ~430MB 装包 + 本仓首建约 23s；之后热查询约 1.4s，`root` 必填 |
+| 符号形 grep 而图谱没答案 | 不用选——`enforce=replace` 自动轮到 zg 补位 | 仅当包已装**且**本工作区有 `.zvec-grep/`（v0.13.3 起：否则直接跳过，不打必败的一枪） |
+| 刚写完代码怕坐标过期 | 重跑 `code_index`，或 `cbm_check_index_coverage` 验鲜 | 写台账的后台补刷已覆盖常见情形 |
 
 #### 触发层（该由插件负责的事，不该靠你话术）
 
@@ -347,6 +357,7 @@ cbm CLI 同一台机器单次 search_graph        : 5491 / 6526 / 8280 ms  ← �
 |---|---|
 | `zg_zvec_grep_search` 报 `root: Invalid input: expected string` | `root` 是**必填**——工作区绝对路径（守护进程可见的那个）。代理不替模型填参数：让模型用它已知的会话工作目录传入即可 |
 | 模型调 `zvec_grep_search` 报 tool_not_found | 代理把 MCP 工具名**按 mcpServers 键加前缀**：经本插件的清单它叫 `zg_zvec_grep_search`（zg 直连才叫裸名）。usage prompt 已给对名字——看到裸名说明会话里是旧 bundle，`npm run sync` + 重启 |
+| 刚开语义层的仓库首查 `zg_zvec_grep_search` 报 `INDEX_MISSING` | 不是故障，是上游守门：建持久索引需要用户显式授权，守护进程在 `activate()` 里直接 throw，**在读 `freshness`/`autoUpdate` 之前**（0.2.2 实证；`autoUpdate: true` 只能对**已有**索引做后台 reconcile，救不了首建）。首建唯一入口是 CLI `node <zgCli> index`——`index` 动词刻意不给 agent。v0.13.3 起 contextHint 事前提示模型（先问用户、再执行命令），replace 钩子对没索引的工作区直接跳过、不打必败的一枪 |
 | 某次 grep 返回 `Error: dsh-codebase-memory：…` | 这是层 ② 的**拦截**，不是故障：默认 `enforce=off` 根本不拦，只有你显式设成 `deny-once`/`deny` 才会出现；`deny-once` 对同一会话同一符号**只拦一次**，reason 里已带 `search_graph` 命中。想彻底关掉：设置页一键，或 `{"enforce":"off"}` |
 | grep 的"结果"变成几行检索命中、没有文件内容 | 不是故障：`enforce=replace`（层 ②b）把符号形 grep 的模型可见输出换成了两层检索（结构层图谱/语义层 zvec-grep）的命中，调用本身照常成功、不出错误。想回到原始输出：设置页把 enforce 翻回 `off`，即时生效。本会话台账脏（刚写过代码）时替换会自动让路，这时又是原输出——两种都正常 |
 | 设置页改了 `enforce`，但 grep 照样不被拦 | 先分清是"没生效"还是"合法放行"。`code_setup` 触发层那行现在报的是**实时值**，跟着设置页变就说明钩子每次调用都在重读配置（报表跟着变本身就是证据）。仍不拦的三种合法情形：pattern 被分成**字面量**（层 ② 只拦符号形）、代码图对该符号**无命中**、当前会话没有可绑定的工作区（cwd 不是路径，比如远程会话）。要确认钩子有没有跑，看 `telemetry.log` 里的 `intercept-*` 行 |

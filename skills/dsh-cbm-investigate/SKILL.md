@@ -30,6 +30,7 @@ When this skill is active:
 - File coordinates used as edit anchors must be freshness-checked with `cbm_check_index_coverage`; when the worktree is dirty or coverage is not clean, re-read disk bytes before editing.
 - External or sibling repositories are not auto-indexed by the model. If a needed project is missing, state partial scope and ask the user to open that workspace or approve CLI indexing.
 - If cbm queries fail, run `code_setup`. Do not silently fall back to grep/read.
+- When `zg_zvec_grep_search` is present (opt-in semantic layer), it answers natural-language questions ("code that handles X") and hits non-code files the graph does not index; always pass `root` = absolute workspace path. Symbols and callers still go through `code_find`/`code_callers`, exact literals still go through `grep` — three layers, distinct jobs, no substitution. A first query in a repo without `.zvec-grep/` fails with `INDEX_MISSING` (upstream authorization gate, not a fault): keep investigating with the other layers and ask the user before building the index.
 
 ## Step 0 — preflight
 

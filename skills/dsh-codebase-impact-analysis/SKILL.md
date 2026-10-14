@@ -68,6 +68,7 @@ Raw cbm tools are still available conceptually, but their names are prefixed and
 | High-level flow start points | `cbm_get_architecture` with aspects such as `entry_points`, `routes`, `packages`, `clusters`. |
 | Multi-hop or aggregate graph query | `cbm_query_graph` after checking labels via `cbm_get_graph_schema`. |
 | File-level index freshness | `cbm_check_index_coverage` with `paths`. |
+| Natural-language intent; prose/config outside the graph | `zg_zvec_grep_search` with `root` (absolute workspace path) — only when the semantic layer is enabled. `INDEX_MISSING` in a repo without `.zvec-grep/` is the upstream authorization gate, not a fault: ask the user before building, fall back to `cbm_search_code`/`grep` meanwhile. Symbols and callers still belong to `code_find`/`code_callers`; exact literals to `grep`. |
 | Project inventory | `cbm_list_projects` with `detail: "identity"`. |
 
 ## Step 0 — DSH gate
