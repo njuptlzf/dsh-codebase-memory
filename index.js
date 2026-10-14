@@ -622,16 +622,22 @@ async function bootstrap(ctx, cfg, state, signal, { force = false } = {}) {
     await ensureAutoIndex(ctx, cfg, state, signal)
   }
   state.ok = state.adapter === 'ready' && state.cbm === 'ready'
-  // 冷启动预热（v0.10.1）：宿主重启后第一次 cbm_* 代理调用要等 MCP server 进程冷起
-  // （加载全部 project 的图谱库），实测远超拦截预算 2500ms——验收时第一条 code_find
-  // 就是这么被误判成"不在项目表"的。让 bootstrap 在会话外先打一发 list_projects 把
-  // server 焐热，会话里的第一发不再付这笔钱。每进程一次；失败不重试——遥测
-  // cbm-warm 的 ok=false 和后续 pass-query-failed 计数会告诉我们真相。
+  // 冷启动预热（v0.10.1；v0.13.2 改落账方式）：宿主重启后第一次 cbm_* 代理调用要等 MCP
+  // server 进程冷起（加载全部 project 的图谱库），实测远超拦截预算 2500ms——验收时第一条
+  // code_find 就是这么被误判成"不在项目表"的。让 bootstrap 在会话外先打一发 list_projects
+  // 把 server 焐热，会话里的第一发不再付这笔钱。每进程恰好一发、不重试：第二发是对还在
+  // 加载的引擎重复施压（与并发 index_repository 被中止同源）。v0.13.2：秒表退役——旧的
+  // 20s race 只是**放弃等待**、不杀调用，引擎照样被焐热，却把报表钉成 failed（语义错位：
+  // 预热是后台投资，不是需要回话的同步查询）。改为不带预算地等真实 settle：完成→ok+耗时
+  // ms，真抛错→failed，还在加载→pending（开机后几分钟内是诚实的中间态）。遥测 cbm-warm
+  // 的 ok/ms 与后续 pass-query-failed 计数会告诉我们真相。注意预热不挂调用方的 signal：
+  // 一发要跑几分钟的后台投资若被回合结束的 abort 掐掉，就等价于旧 race 误报（同一族）。
   if (state.ok && !state.warm) {
     state.warm = true
-    cbmCall(ctx, { signal }, 'list_projects', {}, WARM_BUDGET_MS)
-      .then((r) => { state.warmOk = r.ok; telemetry(cfg, state, 'cbm-warm', { ok: r.ok }) })
-      .catch(() => { state.warmOk = false; telemetry(cfg, state, 'cbm-warm', { ok: false }) })
+    const t0 = Date.now()
+    cbmCall(ctx, {}, 'list_projects', {}, 0)
+      .then((r) => { state.warmOk = r.ok; telemetry(cfg, state, 'cbm-warm', { ok: r.ok, ms: Date.now() - t0 }) })
+      .catch(() => { state.warmOk = false; telemetry(cfg, state, 'cbm-warm', { ok: false, ms: Date.now() - t0 }) })
   }
   // 进程轴（v0.12.0）：清单写了 ≠ 活进程加载了。bootstrap 里量一次新鲜度（await——
   // 枚举进程秒级，报表第一次就要有结论，不能"待测"），结果进报表和 stats（设置页 stale 行）。
@@ -1067,6 +1073,8 @@ function resultText(res) {
 /**
  * 经宿主工具管线调一次 cbm（`mcp__cbm__mcp` 是 keep-alive 的那条长连接）。
  * 返回 `{ ok, text }`；链路不健康 / 被隐藏 / 超时都 `ok:false`，由调用方决定放行。
+ * budgetMs ≤ 0 = 不带秒表，等真实 settle（v0.13.2，预热用：没有人在等回话，
+ * race 的"超时"只是放弃等待、调用还在跑，用它落账会把焐好的引擎报成失败）。
  */
 async function cbmCall(ctx, exec, tool, args, budgetMs, namePrefix = 'cbm') {
   if (typeof ctx?.tools?.execute !== 'function') return { ok: false, text: '' }
@@ -1078,7 +1086,9 @@ async function cbmCall(ctx, exec, tool, args, budgetMs, namePrefix = 'cbm') {
     signal,
     ...(exec?.agent ? { agent: exec.agent } : {}),
   }
-  const outcome = await withBudget(budgetMs, () => ctx.tools.execute(input))
+  const outcome = budgetMs > 0
+    ? await withBudget(budgetMs, () => ctx.tools.execute(input))
+    : await ctx.tools.execute(input).catch((e) => ({ isError: true, content: [{ type: 'text', text: String(e?.message ?? e) }] }))
   if (!outcome) return { ok: false, text: '', timeout: true }
   if (outcome.isError) return { ok: false, text: resultText(outcome) }
   const text = resultText(outcome)
@@ -1284,8 +1294,6 @@ const noVars = (s) => String(s).replace(/\{\{/g, '{ {')
 
 /** 封装工具走的是模型主动等待的路径，预算给到 20s（实测代理查询 ~30–60ms，冷路径更高）。 */
 const WRAPPER_BUDGET_MS = 20000
-// 预热预算：bootstrap 在会话外跑，不挡任何人，给足冷启动时间（v0.10.1）。
-const WARM_BUDGET_MS = 20000
 
 const tryJson = (text) => { try { return JSON.parse(String(text ?? '')) } catch { return null } }
 
@@ -1428,7 +1436,7 @@ export async function apply(ctx, config) {
     adapter: 'unknown', cbm: 'unknown', ok: false, autoIndex: '', refreshing: new Set(), notes: [], lastError: '',
     zg: 'off', zgInstalling: false,
     sessions: new Map(), projectsByCwd: new Map(), counts: {}, indexJobs: new Map(),
-    warm: false, warmOk: null, // 冷启动预热（v0.10.1）：warm=打过一次，warmOk=那次的结果
+    warm: false, warmOk: null, // 冷启动预热（v0.10.1；v0.13.2 真实 settle 落账）：warm=打过一次，warmOk=那发的最终结果
     adapterFresh: null, // 进程轴（v0.12.0）：{verdict,at,manifestMs,pids,newestStartMs}，30s 缓存
   }
   // 开机播种累计计数：重启不是归零（写侧与文件 max 合并，见 pushStats）。

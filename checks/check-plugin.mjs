@@ -89,6 +89,8 @@ function makeStubProxy(calls, opts = {}) {
           if (opts.listError) return { content: [{ type: 'text', text: 'Error: MCP server not running' }] }
           // v0.12.0 臂 X：0-server 活进程的真实返回形态——以 Tool 开头，不是 Error。
           if (opts.listNotFound) return { content: [{ type: 'text', text: 'Tool "cbm_list_projects" not found. Use mcp({ server: "name" }) to list tools, mcp({ search: "..." }) to search' }] }
+          // v0.13.2 臂 W：慢引擎——预热不带秒表后，结论必须在真实 settle 处落账。
+          if (opts.warmSlowMs) await new Promise((r) => setTimeout(r, opts.warmSlowMs))
           return { content: [{ type: 'text', text: `projects: 1  (cols: name root_path branch)\n  ${project} ${root.replace(/\\/g, '/')} main` }] }
         case 'cbm_search_graph':
           // 代理工具会把底层 MCP 错误包成**普通文本**（isError 不置真）——实测
@@ -951,6 +953,29 @@ async function verify(profile) {
   record('W bootstrap 在会话外预热恰好一发（重复 code_setup 不叠加）', warmShots === 1, `list_projects 调用数=${warmShots}`)
   const wReport = await w.tools.get('code_setup').execute({}, withSignal(REPO))
   record('W 报告行报出预热状态', /warm=(ok|pending)/.test(wReport), /代理工具:.*warm=\w+/.exec(wReport)?.[0]?.slice(0, 140) ?? '(没有 warm 字段)')
+  // v0.13.2：预热秒表退役——race 超时只是放弃等待、不杀调用，引擎实际还在被焐热，
+  // 旧代码却把报表钉成 failed。契约改为按真实 settle 落账：慢一发（超过旧 20s 预算
+  // 的语义等价物=任何延迟）仍在完成时报 ok，遥测行带耗时 ms（旧行没有 ms ⇒ 可证伪）。
+  const w2Dir = join(tmpdir(), `cbm-w2-${process.pid}-${profile}`)
+  const rmW2 = () => { try { rmSync(w2Dir, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 }) } catch { /* 尽力，目录名带 pid 唯一 */ } }
+  rmW2()
+  mkdirSync(w2Dir, { recursive: true })
+  writeFileSync(join(w2Dir, 'mcp-server.mjs'), '', 'utf8')
+  writeFileSync(join(w2Dir, 'package.json'), `{"version":"${DEFAULT_ADAPTER_VERSION}"}`, 'utf8')
+  try {
+    const w2Calls = []
+    const w2 = await mount({ telemetry: true, adapterDir: w2Dir, cbmPath: fakeExe },
+      makeStubProxy(w2Calls, { project: `stub-${process.pid}-w2`, warmSlowMs: 60 }), { procTable: '' })
+    await w2.tools.get('code_setup').execute({}, withSignal(REPO)) // 点火：慢预热在后台跑
+    const w2Mid = await w2.tools.get('code_setup').execute({}, withSignal(REPO))
+    await new Promise((r) => setTimeout(r, 300)) // 等真实 settle（stub 60ms）
+    const w2Report = await w2.tools.get('code_setup').execute({}, withSignal(REPO))
+    const w2Warm = readFileSync(join(w2Dir, 'telemetry.log'), 'utf8').trim().split('\n').filter(Boolean)
+      .map((l) => { try { return JSON.parse(l) } catch { return null } }).filter((l) => l?.event === 'cbm-warm').pop()
+    record('W 预热按真实 settle 落账：慢一发完成后 warm=ok 且遥测带 ok+ms（v0.13.2，旧 race 无 ms 必挂）',
+      /warm=(ok|pending)/.test(w2Mid) && /warm=ok/.test(w2Report) && w2Warm?.ok === true && typeof w2Warm?.ms === 'number' && w2Warm.ms >= 40,
+      `点火中=${/warm=(\w+)/.exec(w2Mid)?.[1]} 落账=${/warm=(\w+)/.exec(w2Report)?.[1]} 行=${JSON.stringify(w2Warm ?? null).slice(0, 120)}`)
+  } finally { rmW2() }
   const wn = await mount({ enforce: 'off', dirtyTracking: false, telemetry: false },
     makeStubProxy([], { project: `stub-${process.pid}-nowhere`, root: 'C:/nowhere-else' }))
   await wn.tools.get('code_setup').execute({}, withSignal(REPO))
