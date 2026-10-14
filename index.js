@@ -1268,7 +1268,7 @@ function renderReplacement(symbol, source, project, hits) {
 }
 
 /** 像"查代码结构"的用户问题（杠杆 ③ 的触发词，中英各一批）。 */
-const CODE_QUESTION = /(谁调用|调用链|引用了|被谁用|定义在哪|在哪定义|哪些地方|哪几处|影响(范围|面|哪些|什么)|重命名|rename|call\s?graph|callers?|callees?|where is .{0,24}defined|what (calls|uses)|impact of)/i
+const CODE_QUESTION = /(谁调用|调用链|引用了|被谁用|定义在哪|在哪定义|哪些地方|哪几处|影响(范围|面|哪些|什么)|实现了什么|什么功能|能做什么|怎么用|怎么实现|如何工作|做什么的|重命名|rename|call\s?graph|callers?|callees?|where is .{0,24}defined|what (calls|uses|does)|impact of)/i
 
 /** 最近一条人类消息（同步、从已物化的会话事件里取；宿主对 context 的渲染不支持异步）。 */
 function lastUserQuery(agent) {
