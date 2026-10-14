@@ -1873,7 +1873,10 @@ export async function apply(ctx, config) {
         // ponytail: zg 冷启动实测 3.3s，超过默认 2500ms 预算 ⇒ 会话里第一条被换的
         // 符号搜索会超时退回原输出，之后热（1.4s）能换。宁缺勿塞，升级路径是常驻
         // daemon 或独立 zgReplaceBudgetMs 配置。
-        if (!text && state.zg === 'ready') {
+        // 本仓没建过语义索引就别白打这一枪：缺 .zvec-grep 目录 ⇒ 上游 activate() 必
+        // throw INDEX_MISSING（在读取任何参数之前），目录**不存在**这个方向的判定是
+        // 确定的（存在也未必可查，但那是守护自己的事）。省掉一发注定失败的调用 + 预算。
+        if (!text && state.zg === 'ready' && existsSync(join(cwd, '.zvec-grep'))) {
           const z = await cbmCall(ctx, exec, 'zvec_grep_search', { query: q.symbol, root: cwd, limit: 5 }, cfg.interceptBudgetMs, 'zg')
           if (z.ok && !noHits(z.text)) { source = 'zg'; text = z.text }
           else if (!z.ok) failed = true
@@ -1922,9 +1925,16 @@ export async function apply(ctx, config) {
             ? ' 语义层已开启但缺包——问用户是否同意执行 code_setup {action:"install-zg"}（约 430MB）安装；装完 code_setup {action:"restart-adapter"} 重拉清单（秒级，不必重启宿主）。'
             : ''
           if (zgFix) bumpCount(cfg, state, 'hint-zg-missing')
+          // 包已装、清单 ready，但**本仓从未建过语义索引**：上游 activate() 在读任何
+          // freshness/autoUpdate 参数之前就 throw INDEX_MISSING（0.2.2 源码实证，参数
+          // 绕不过），首查必撞墙。与缺包句互斥（缺包先于缺索引）；代建同样要用户点头。
+          const zgNoIndex = cfg.zgEnabled && !zgFix && state.zg === 'ready' && !existsSync(join(cwd, '.zvec-grep'))
+            ? ' 本仓尚未建语义索引：zg_zvec_grep_search 首查会报 INDEX_MISSING（上游守门、非故障，参数绕不过）——问用户是否同意代建，同意后跑 node ' + cfg.zgCli + ' index（增量约 2s、首建全量约 23s），产物 .zvec-grep/ 务必进 .gitignore。'
+            : ''
+          if (zgNoIndex) bumpCount(cfg, state, 'hint-zg-no-index')
           // 只数真正注入的那一次（每轮装配都调这个回调，注入与否是 ③ 的有效性读数）。
           bumpCount(cfg, state, 'hint-injected')
-          return noVars(`${head} ${tail}${zgFix}`)
+          return noVars(`${head} ${tail}${zgFix}${zgNoIndex}`)
         } catch {
           return ''
         }

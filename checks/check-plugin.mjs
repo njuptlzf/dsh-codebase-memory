@@ -99,6 +99,13 @@ function makeStubProxy(calls, opts = {}) {
           return { content: [{ type: 'text', text: JSON.stringify(opts.emptySearch
             ? { cols: ['qn', 'label', 'file', 'lines', 'rank'], rows: [], total: 0, returned: 0, has_more: false }
             : { cols: ['qn', 'label', 'file', 'lines', 'rank'], rows: [[`${project}.stubSymbol`, 'Function', 'index.js', '42-44', -1.2]], total: 1, returned: 1, has_more: false }) }] }
+        case 'zg_zvec_grep_search':
+          // 模拟上游守门（v0.13.3 实证的形状）：root 下没有 .zvec-grep 时，activate()
+          // 在读任何参数之前就 throw INDEX_MISSING——文本以 Error 开头，cbmCall 的
+          // 错误嗅探判失败；有目录才返回命中。这样"缺索引别白打"的守卫臂是真命题。
+          if (opts.zgGate && !existsSync(join(String(q.root ?? ''), '.zvec-grep')))
+            return { content: [{ type: 'text', text: 'Error: INDEX_MISSING: no persistent index under this root. Creating or rebuilding a persistent index requires explicit user authorization (CLI: index).' }] }
+          return { content: [{ type: 'text', text: 'results: 1\n#1 [global_fill] matchedBy=fts+vector stub/index.js:42-44' }] }
         case 'cbm_get_code_snippet':
           return { content: [{ type: 'text', text: JSON.stringify({ name: 'stubSymbol', qualified_name: `${project}.stubSymbol`, file_path: 'x/index.js', start_line: 42, end_line: 44, source: 'function stubSymbol() {\n  return 1;\n}\n' }) }] }
         case 'cbm_check_index_coverage':
@@ -760,6 +767,34 @@ async function verify(profile) {
   await zi.tools.get('code_setup').execute({}, withSignal(REPO))
   const zTextReady = zHintOf(zi)?.text?.({ agent: fakeAgent(`sess-${process.pid}-zgm3`, REPO, codeAsk) }) ?? 'x'
   record('G zg 包已装 ⇒ 注入句自动消失（不留常驻唠叨）', typeof zTextReady === 'string' && !/install-zg/.test(zTextReady), zTextReady.slice(-80))
+  // G8.6 缺索引注入句 + replace 守卫（v0.13.3）：包已装、清单 ready，但**本仓从未建过
+  // 语义索引**——上游 activate() 在读 freshness/autoUpdate 任何参数之前就 throw
+  // INDEX_MISSING（0.2.2 源码实证：参数救不了首建，唯一入口是 CLI index）。事前一句
+  // 话带处方（先点头、后代建、产物进 gitignore），比首查撞墙便宜；replace 通道则
+  // 干脆跳过这一发注定失败的查询。工作区用临时目录造两种状态，不依赖仓库自身。
+  const zgNoWs = join(zgmDir, 'ws-no-index')
+  const zgYesWs = join(zgmDir, 'ws-indexed')
+  mkdirSync(zgNoWs, { recursive: true })
+  mkdirSync(join(zgYesWs, '.zvec-grep'), { recursive: true })
+  const zTextNoIdx = zHintOf(zi)?.text?.({ agent: fakeAgent(`sess-${process.pid}-zgnoidx1`, zgNoWs, codeAsk) }) ?? 'x'
+  record('G zg ready 且本仓无 .zvec-grep ⇒ 注入句事前报 INDEX_MISSING 并给带点头前置的代建 CLI',
+    typeof zTextNoIdx === 'string' && /INDEX_MISSING/.test(zTextNoIdx) && /node .* index/.test(zTextNoIdx) && /\.gitignore/.test(zTextNoIdx),
+    String(zTextNoIdx).slice(-150))
+  const zTextHasIdx = zHintOf(zi)?.text?.({ agent: fakeAgent(`sess-${process.pid}-zgnoidx2`, zgYesWs, codeAsk) }) ?? 'x'
+  record('G 本仓有 .zvec-grep ⇒ 缺索引句自动消失（不唠叨已建好的仓）', typeof zTextHasIdx === 'string' && !/INDEX_MISSING/.test(zTextHasIdx), String(zTextHasIdx).slice(-70))
+  record('G 缺包句与缺索引句互斥（包没装时只谈装包，不两条处方打架）', typeof zTextMissing === 'string' && !/INDEX_MISSING/.test(zTextMissing), zTextMissing.slice(-60))
+  const zrCalls = []
+  const zr = await mount({ enforce: 'replace', dirtyTracking: false, telemetry: false, zgEnabled: true, adapterDir: zgmDir, zgVendorDir: zgmVendor }, makeStubProxy(zrCalls, { project: `stub-${process.pid}-zrguard`, zgGate: true }))
+  await zr.tools.get('code_setup').execute({}, withSignal(REPO))
+  const postZr = (zr.events['tools/post-execute'] ?? [])[1]
+  const zgSkip = await postZr(grepExec(fakeAgent(`sess-${process.pid}-zrguard-a`, zgNoWs), 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  record('R replace 对本仓无索引的 grep 直接保留原输出（不发注定 INDEX_MISSING 的白枪）',
+    zgSkip?.kind === 'accept' && zgSkip?.content === undefined && !zrCalls.some((x) => x.tool === 'zg_zvec_grep_search'),
+    `calls=${zrCalls.map((x) => x.tool).join(',') || '(无)'}`)
+  const zgSwap = await postZr(grepExec(fakeAgent(`sess-${process.pid}-zrguard-b`, zgYesWs), 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  record('R 有 .zvec-grep 目录时 replace 照常查 zg 并替换（守卫不误伤正路）',
+    /语义层/.test(zgSwap?.content?.[0]?.text ?? '') && zrCalls.some((x) => x.tool === 'zg_zvec_grep_search'),
+    String(zgSwap?.content?.[0]?.text ?? '(没换)').slice(0, 70))
   rmSync(zgmDir, { recursive: true, force: true })
   // G9 索引任务串行化 + 被并发中止后重试（这条臂来自一次真实失败：后台补刷与
   // code_index 撞上引擎 watcher ⇒ 退出码 1 + aborted_previous_preserved）。
