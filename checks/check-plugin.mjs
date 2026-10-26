@@ -1068,10 +1068,10 @@ async function verify(profile) {
   record('R3 Error 文本判为失败：不替换，且计成 passFailed 而非 noHit',
     r3Swap?.content === undefined && (r3Stats?.replace?.passFailed ?? 0) === 1 && (r3Stats?.replace?.hit ?? 0) === 0 && (r3Stats?.replace?.passNoHit ?? 1) === 0,
     String(r3Ref.get()).slice(0, 170))
-  // v0.15.0 M3：失败按腿归因。汇总键保留（旧面板不空白），分腿键给排障——
+  // v0.15.0 M3：失败按腿归因。v0.16 起语义腿退出替换通道、死键已删，只剩图谱腿——
   // 超时到底是哪一腿，不该再从同一格里猜。
-  record('R3 失败按腿归因：passFailedGraph=1 且 passFailedZg=0（M3）',
-    (r3Stats?.replace?.passFailedGraph ?? 0) === 1 && (r3Stats?.replace?.passFailedZg ?? 0) === 0,
+  record('R3 失败按腿归因：passFailedGraph=1（M3，语义腿计数已删）',
+    (r3Stats?.replace?.passFailedGraph ?? 0) === 1 && r3Stats?.replace?.passFailedZg === undefined,
     JSON.stringify(r3Stats?.replace ?? null).slice(0, 150))
 
   // ── 臂 S2：累计计数跨重启（「跑几天看占比」不能每次重启归零）─────────────────

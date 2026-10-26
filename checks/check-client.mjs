@@ -157,8 +157,7 @@ for (const lang of ['zh', 'en']) ok(!!dictEntry?.dict?.[lang], `字典有 ${lang
 const keys = Object.keys(dictEntry?.dict?.zh || {})
 for (const key of ['title', 'summary', 'loading', 'unavailable', 'enforce.label', 'telemetry.label', 'resetField', 'saveFailed', 'foot',
   'stats.label', 'stats.empty', 'stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index', 'stats.updated',
-  'stats.r.graph', 'stats.r.zg',
-  'stats.r.qfailgraph', 'stats.r.qfailzg', 'stats.r.codesearch', 'stats.r.lph', 'stats.r.lpc', 'stats.budget',
+  'stats.r.qfailgraph', 'stats.r.codesearch', 'stats.r.lph', 'stats.r.lpc', 'stats.budget',
   'hint.label', 'hint.hint', 'dirty.label', 'dirty.hint', 'interceptBudgetMs.label', 'interceptBudgetMs.hint',
   'interceptTools.label', 'interceptTools.hint',
   'sec.soft', 'sec.soft.hint', 'sec.hard', 'sec.hard.hint', 'sec.layers', 'sec.layers.hint',
@@ -405,7 +404,7 @@ ok(panel.component({ ...props, view: 'summary' }) === 'summary', 'summary 态返
 const statsJson = JSON.stringify({
   at: 1791531188925,
   zg: 'ready',
-  replace: { hit: 8, graph: 6, zg: 2, passDirty: 2, passNoHit: 0, passFailed: 0, passFailedGraph: 0, passFailedZg: 0, error: 0 },
+  replace: { hit: 8, graph: 6, passDirty: 2, passNoHit: 0, passFailed: 0, passFailedGraph: 0, error: 0 },
   deny: { blocked: 3, passDirty: 1, passNoHit: 2, passQueryFailed: 0, skipSeen: 4, error: 0 },
   dirty: { record: 9, refreshScheduled: 5, refreshDone: 4, refreshFail: 1 },
   lever: { wrapperCalls: 12, hintInjected: 3, codeSearch: 4 },
@@ -420,7 +419,7 @@ console.log('\n[读数]')
 ok(texts.includes('80%'), '命中率大数字 = hit/(hit+让路+无命中+出错)', texts.find((t) => t.endsWith('%')))
 ok(texts.includes('8/10'), '被替换行 = hit/den', texts.filter((t) => /^\d+\/\d+$/.test(t)).join('|'))
 ok(['stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index'].every((k) => texts.includes(k)), '五张卡片都在')
-ok(texts.includes('stats.r.graph') && texts.includes('stats.r.zg'), '占比条题注区分结构层/语义层（两层并存，不是二选一）')
+// v0.16 死码清理：语义腿自 v0.15.0 M4' 退出替换通道，占比条随 zg/passFailedZg 两计数一并撤下（历史数在 telemetry JSONL 可翻）
 // v0.15.0 M6：分腿失败计数、两条腿的预算、code_search 调用、清单缓存命中都要在页上
 ok(texts.includes('stats.r.qfailgraph'), '失败计数按腿分开（图谱腿行在场）', texts.filter((t) => t.startsWith('stats.r.qfail')).join('|'))
 ok(texts.includes('stats.r.codesearch'), 'code_search 调用进软引导卡（语义层退出钩子后的唯一入口）')
@@ -462,7 +461,7 @@ ok(textsNoStats.includes('logRetentionDays.label') && textsNoStats.includes('rec
 const statsWithRepos = JSON.stringify({
   at: 1791531188925,
   zg: 'ready',
-  replace: { hit: 1, graph: 1, zg: 0, passDirty: 0, passNoHit: 0, error: 0 },
+  replace: { hit: 1, graph: 1, passDirty: 0, passNoHit: 0, error: 0 },
   deny: { blocked: 0, passDirty: 0, passNoHit: 0, passQueryFailed: 0, skipSeen: 0, error: 0 },
   dirty: { record: 0, refreshScheduled: 0, refreshDone: 0, refreshFail: 0 },
   lever: { wrapperCalls: 0, hintInjected: 0 },

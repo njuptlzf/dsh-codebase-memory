@@ -1493,7 +1493,7 @@ function renderStats(cfg, state) {
     zgInstalled: existsSync(cfg.zgCli),
     // 进程轴（v0.12.0）：面板 stale 行靠它——清单写了 ≠ 活进程加载了。null=还没量过。
     adapter: state.adapterFresh ? state.adapterFresh.verdict : null,
-    replace: { hit: n('intercept-replace'), graph: n('intercept-replace:graph'), zg: n('intercept-replace:zg'), passDirty: n('replace-pass-dirty'), passRefreshing: n('replace-pass-refreshing'), passNoHit: n('replace-pass-no-hit'), passFailed: n('replace-pass-failed'), passFailedGraph: n('replace-pass-failed:graph'), passFailedZg: n('replace-pass-failed:zg'), error: n('replace-error') },
+    replace: { hit: n('intercept-replace'), graph: n('intercept-replace:graph'), passDirty: n('replace-pass-dirty'), passRefreshing: n('replace-pass-refreshing'), passNoHit: n('replace-pass-no-hit'), passFailed: n('replace-pass-failed'), passFailedGraph: n('replace-pass-failed:graph'), error: n('replace-error') },
     deny: { blocked: n('intercept-deny'), passDirty: n('intercept-pass-dirty'), passNoHit: n('intercept-pass-no-hit'), passQueryFailed: n('intercept-pass-query-failed'), skipSeen: n('intercept-skip-seen'), error: n('intercept-error') },
     dirty: { record: n('dirty-record'), refreshScheduled: n('dirty-refresh-scheduled'), refreshDone: n('dirty-refresh-done'), refreshFail: n('dirty-refresh-fail') },
     // v0.16 T-B：近失=pattern 里有符号形支但整体照旧放行（混合支 / 超 4 支封顶）。
