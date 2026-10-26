@@ -158,7 +158,10 @@ Escalation is allowed and preferred over false confidence.
 
 ## DSH-specific guardrails
 
-- If using cbm results as `file:line` edit anchors, first verify freshness:
+- **Read the output before trusting it.** The plugin rewrites grep output in place (`enforce=replace`). A result starting with `【替换自 结构层(图谱) …原始输出已丢弃` is graph hits, not grep hits — the original bytes are gone. `【未替换 · 原始 grep 输出】` means the swap was abandoned and what follows IS the original output (the reason is on that line). A `…已被拦下` notice is the plugin's denial, not a tool failure. Never re-run the same grep to "get the real output".
+- **The session ledger outranks freshness tools.** If `code_find` / `code_callers` print `⚠ 本会话…这些改动还没进索引`, this session edited files: run `code_index` before citing or editing any `file:line`. `cbm_check_index_coverage` is a per-path second opinion only — on engine 0.11.0 it reports a global generation change, so `metadata_changed` means "re-index", not "this path is broken".
+- **Semantic hits are leads, not anchors.** `code_search` / `zg_zvec_grep_search` return semantically similar snippets with no qualified name and no coordinates. Never turn them into a `file:line` reference or an edit anchor; resolve the symbol with `code_find` first.
+- If using cbm results as `file:line` edit anchors, verify freshness:
   ```jsonc
   {"tool":"cbm_check_index_coverage","args":{"project":"<project>","paths":["relative/path"]}}
   ```
