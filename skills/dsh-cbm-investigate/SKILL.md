@@ -26,6 +26,7 @@ When this skill is active:
 
 - Index current workspace code with `code_index`, not raw `index_repository`.
 - Structural cbm queries use `mcp__cbm__mcp` with `cbm_*` tools.
+- **Never hunt symbols with grep alternation.** `grep "a|b|c"` over several symbol names is the single most common escape hatch away from the index (audited: one session ran 110 greps vs 6 graph calls; the model even noted in its own log that "alternation didn't trigger a replace"). A multi-symbol structural question is NOT a text search — call `code_find`/`code_callers` once per symbol (or one `cbm_query_graph`/trace covering the chain). grep keeps exactly one job here: exact literals, log lines, config keys, regex over prose. If a pattern mixes symbol branches with literal branches, keep the literal hunt in grep and route every symbol branch through the graph — do not "keep it together" by letting the symbols ride the grep.
 - Source snippets use `cbm_get_code_snippet` with `format: "json"`.
 - File coordinates used as edit anchors must be freshness-checked with `cbm_check_index_coverage`; when the worktree is dirty or coverage is not clean, re-read disk bytes before editing.
 - External or sibling repositories are not auto-indexed by the model. If a needed project is missing, state partial scope and ask the user to open that workspace or approve CLI indexing.
@@ -51,6 +52,7 @@ When this skill is active:
 - `code_index` 一次做三件事：建/刷新图谱、**返回并缓存权威 `project`**、清空本会话的脏台账。所以"改完代码先 `code_index`"不是礼节——它同时让坐标变新、让替换通道重新打开。
 - `code_setup` 的两个动作：`{action:"install-zg"}`（装可选语义层，约 430MB，**必须先问用户**）、`{action:"restart-adapter"}`（重拉适配层清单，秒级；语义层开关切换后必须走这一步才生效，不必重启宿主）。
 - 本会话用 `write`/`edit` 改过文件时，`code_find`/`code_callers` 的输出会带 `⚠ 本会话…这些改动还没进索引`。看到它就先把 `code_index` 跑了再采信行号——插件自己的会话台账比 `cbm_index_status` 可信（后者在引擎 0.11.0 上是全局代际判定，不是逐路径判定）。
+- **陈旧提示是命令不是参考**：系统提示行里出现「本会话改了 N 个文件（坐标可能过期）」或上面那个 ⚠ 台账标记时，任何拿图谱坐标当编辑锚点之前必须先 `code_index`，成功后再 `cbm_check_index_coverage` 验鲜。不许用"整文件重读磁盘"绕开陈旧——实测一次 194 次编辑的会话就是这么烧掉 162 次全文 read、只调了 2 次 `code_index` 的。
 
 ## zg 语义层：坏死自诊与自动修复（修复免确认；首建仍须问）
 
@@ -165,6 +167,20 @@ Use when the user wants code-graph understanding before deciding whether to chan
    - If yes, hand off to the investigation core Phase 4 and Phase 5, or optional global `investigate` if available.
    - If the user only wanted understanding, stop.
    - If they want a different trace, loop back to step 1 with the new target.
+
+## 收尾：分层报数表（本 skill 激活时必须交付）
+
+任务收尾的最终回复里放一张三行计数表（参照 dsh-GenUI 的收尾卡做法），让"有没有真走索引"在会话内直接可见，而不是事后翻日志：
+
+| 层 | 通道 | 次数 |
+|---|---|---|
+| 结构层 cbm | code_find / code_callers / code_index / cbm_* 代理 | N |
+| 语义层 zg | code_search / zg_zvec_grep_search | N |
+| 字面量层 | grep / read | N |
+
+- 次数按本会话实际调用自计；不得美化，0 就写 0（写 0 恰恰是复盘信号）。
+- 表下补一行交叉校验口径：「插件设置页遥测（intercept-replace / near-miss-symbol / dirty record）为准，本表为模型自报」——两边对不上就是行为问题，指给用户看。
+- 若字面量层次数显著高于结构层且本任务含符号问题，表格后必须给一句原因（新会话未 code_index / 图无该符号 / 纯字面量任务），否则视为漏走索引。
 
 ## Optional global investigate
 
