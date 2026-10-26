@@ -21,6 +21,7 @@ The model-facing tool surface is:
 | Build or refresh the current workspace graph | `code_index` | Binds indexing to the current session workspace and returns the authoritative `project` name. |
 | Resolve a symbol → qualified name, file, line range, source | `code_find` | Wrapped high-frequency path; the plugin fills `project` from the session workspace. Prefer it over grep-for-definitions. |
 | Trace callers / callees of one symbol | `code_callers` | Wraps `cbm_trace_path` (default `inbound`). |
+| Semantic search over prose / config / natural language | `code_search` | Wraps `zg_zvec_grep_search` with `root` bound to the workspace. Returns **leads, not coordinates** — never cite them as `file:line`. Only when the semantic layer is enabled. |
 | Repair or inspect plugin chain | `code_setup` | Reports adapter, cbm binary, manifest, sync status, and trigger-layer counters. |
 | Run cbm graph queries | `mcp__cbm__mcp` | The plugin compresses cbm MCP tools into a proxy tool. |
 | Batch multi-step cbm queries | `mcp__cbm__mcpScript` | Use when a workflow needs repeated graph calls and you want to avoid round trips. |
@@ -46,7 +47,7 @@ Raw cbm tools are still available conceptually, but their names are prefixed and
 
 4. **Use JSON for source snippets.** Always include `format: "json"` in `cbm_get_code_snippet`. The default tree format is a layout envelope and can change line whitespace.
 
-5. **Verify line coordinates before treating them as edit anchors.** `cbm_index_status` can report `ready` while file coordinates are stale after unindexed edits. Before citing or editing `file:line`, run `cbm_check_index_coverage` on the cited paths. If it reports `freshness=metadata_changed`, `recommended_action=read_source_and_reindex`, or the git worktree is dirty and the line range is load-bearing, refresh with `code_index` and then read disk bytes with `read` for the edit anchor.
+5. **Verify line coordinates before treating them as edit anchors.** The plugin's **session ledger is the first authority**: it records every file this session wrote/edited, and `code_find` / `code_callers` surface that as `⚠ 本会话…这些改动还没进索引`. When you see it, run `code_index` before citing or editing any `file:line` — the graph's coordinates are stale by construction. `cbm_check_index_coverage` is the second opinion, per path: on engine 0.11.0 it reports a global generation change rather than a per-path verdict, so treat `metadata_changed` as "re-index", not as "this file is fine". Semantic hits (`code_search` / `zg_zvec_grep_search`) carry **no coordinates at all** — never promote them to an anchor.
 
 6. **Do not silently degrade to grep/read.** Structural code queries must prefer `code_index` and `cbm_*` tools. Use `grep`/`read` only for literals, non-graph files, explicit user-approved fallback, or after a verified graph failure. If you fall back, begin the answer with the tool path and graph status, for example:
 
@@ -68,7 +69,7 @@ Raw cbm tools are still available conceptually, but their names are prefixed and
 | High-level flow start points | `cbm_get_architecture` with aspects such as `entry_points`, `routes`, `packages`, `clusters`. |
 | Multi-hop or aggregate graph query | `cbm_query_graph` after checking labels via `cbm_get_graph_schema`. |
 | File-level index freshness | `cbm_check_index_coverage` with `paths`. |
-| Natural-language intent; prose/config outside the graph | `zg_zvec_grep_search` with `root` (absolute workspace path) — only when the semantic layer is enabled. `INDEX_MISSING` in a repo without `.zvec-grep/` is the upstream authorization gate, not a fault: ask the user before building, fall back to `cbm_search_code`/`grep` meanwhile. Symbols and callers still belong to `code_find`/`code_callers`; exact literals to `grep`. |
+| Natural-language intent; prose/config outside the graph | `code_search("...")` — fills `root` for you; the raw `zg_zvec_grep_search` (with `root`, absolute workspace path) is the fallback when the wrapper is absent. Only when the semantic layer is enabled. **Leads, not anchors.** `INDEX_MISSING` in a repo without `.zvec-grep/` is the upstream authorization gate, not a fault: ask the user before building, fall back to `cbm_search_code`/`grep` meanwhile. Symbols and callers still belong to `code_find`/`code_callers`; exact literals to `grep`. |
 | Project inventory | `cbm_list_projects` with `detail: "identity"`. |
 
 ## Step 0 — DSH gate
@@ -76,10 +77,12 @@ Raw cbm tools are still available conceptually, but their names are prefixed and
 For work in the current session workspace:
 
 1. Run `code_index({mode:"full"})` unless the same session already indexed the workspace with no subsequent substantial edits.
+   - `code_index` does **three** things at once: builds/refreshes the graph, returns and caches the authoritative `project`, and clears this session's dirty ledger. That is why it also re-opens the grep-swap channel — a dirty session has swaps disabled by design.
    - Use `mode: "fast"` only for a small refresh where semantic similarity is unnecessary.
    - `code_index` is blocking and returns `project`, `status`, `nodes`, `edges`, and `root`.
 
 2. If `code_index` fails, run `code_setup` and report the failure. Do not continue as if graph analysis ran.
+   - `code_setup {action:"restart-adapter"}` reloads the adapter manifest (seconds) after a semantic-layer toggle or a manifest drift; `code_setup {action:"install-zg"}` installs the optional semantic layer (~430MB) and **must be approved by the user first**.
 
 3. For an already indexed external project, discover it with:
 
