@@ -610,6 +610,17 @@ async function verify(profile) {
   record('G 分类器：符号类正例全部识别', badSymbols.length === 0, badSymbols.join(', ') || `${symbolCases.length}/${symbolCases.length}`)
   record('G 分类器：字面量类误拦为 0', falsePositives.length === 0, falsePositives.join(', ') || `${literalCases.length}/${literalCases.length}`)
   record('G 分类器：限定到非代码路径时一律放行', classifyPattern('usageSection', 'package.json').kind === 'literal' && classifyPattern('usageSection', 'notes.md').kind === 'literal')
+  // v0.16 T-A：alternation 逐支判——全符号支才并集；混合/超 4 支整体放行并标 near-miss。
+  const mmCls = classifyPattern('loadMcpDecls|function loadMcp')
+  record('G 分类器：全支皆符号的 alternation 判 symbol-multi（去重、展示名带 |）',
+    mmCls.kind === 'symbol-multi' && mmCls.symbols.join(',') === 'loadMcpDecls,loadMcp' && mmCls.symbol === 'loadMcpDecls|loadMcp', JSON.stringify(mmCls))
+  record('G 分类器：async 臂补齐；混合支放行+近失标记；>4 支封顶；转义竖线不拆',
+    classifyPattern('async function foo').symbol === 'foo' &&
+    classifyPattern('function telemetry|recent\\.push').kind === 'literal' &&
+    classifyPattern('function telemetry|recent\\.push').nearMiss === true &&
+    classifyPattern('aFoo|bBar|cBaz|dQux|eFuzz').nearMiss === true &&
+    classifyPattern('aFoo\\|bBar').kind === 'literal' &&
+    classifyPattern('loadMcpDecls|function loadMcp|loadMcpDecls').symbols.length === 2)
   record('G 内置工具名判定（裸名小写，MCP 带前缀不算）', isGrepLike('grep', ['grep', 'glob']) && isGrepLike('GLOB', ['grep', 'glob']) && !isGrepLike('mcp__cbm__mcp', ['grep', 'glob']))
   // 码点截断：dsh-mneme #334 的教训——按 UTF-16 单元切会切出孤立代理对，宿主每个请求 400。
   const cut = truncateCodepoints('ab😀cd', 3)
@@ -923,6 +934,24 @@ async function verify(profile) {
   const dirtyKeep = await rd2Rep(grepExec(agentRd2, 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
   record('R 脏的是别的文件 ⇒ 命中照换（v0.15.1 按命中文件过滤）',
     /stubSymbol/.test(dirtyKeep?.content?.[0]?.text ?? ''), JSON.stringify(dirtyKeep).slice(0, 100))
+  // v0.16 T-A：symbol-multi 并集臂——全符号 alternation 逐支各查一次 search_graph、
+  // 合并替换；混合支整体放行（替换不许吞掉模型要的文本检索意图）。
+  const rmCalls = []
+  const rm = await mount({ enforce: 'replace', dirtyTracking: false }, makeStubProxy(rmCalls, { project: `stub-${process.pid}-multi` }))
+  await rm.tools.get('code_setup').execute({}, withSignal(REPO))
+  const rmRep = (rm.events['tools/post-execute'] ?? [])[1]
+  const agentRm = fakeAgent(`sess-${process.pid}-multi`, REPO)
+  const multiSwap = await rmRep(grepExec(agentRm, 'usageSection|renderStats'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  record('R 全符号 alternation ⇒ 逐支并集查询照换（两支各查一次图谱）',
+    multiSwap?.kind === 'accept' && /stubSymbol/.test(multiSwap?.content?.[0]?.text ?? '') &&
+    rmCalls.filter((x) => x.tool === 'cbm_search_graph' && x.args.query === 'usageSection').length === 1 &&
+    rmCalls.filter((x) => x.tool === 'cbm_search_graph' && x.args.query === 'renderStats').length === 1,
+    rmCalls.map((x) => `${x.tool}:${x.args.query ?? ''}`).join(',').slice(0, 160))
+  record('R symbol-multi 替换文案的"找的是"按支展示',
+    /usageSection\|renderStats/.test(String(multiSwap?.content?.[0]?.text ?? '')), String(multiSwap?.content?.[0]?.text ?? '').slice(0, 80))
+  const mixedRaw = await rmRep(grepExec(agentRm, 'function telemetry|recent\\.push'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  record('R 混合支 alternation 整体放行：原始 grep 输出保留',
+    mixedRaw?.kind === 'accept' && mixedRaw?.content === undefined, JSON.stringify(mixedRaw).slice(0, 90))
   // 纯函数单元臂：dropDirtyRows 拿**现场 search_graph 的真实返回体形状**（3 行 / 2 文件）
   // 验四条：只丢脏文件的行、空脏集原样、非 JSON 原样、路径写法差异也能匹配。
   {

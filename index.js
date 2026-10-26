@@ -1109,24 +1109,54 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
  */
 export function classifyPattern(pattern, path = '') {
   const p = String(pattern ?? '').trim()
-  if (!p) return { kind: 'literal', symbol: '' }
+  const lit = (nearMiss) => (nearMiss ? { kind: 'literal', symbol: '', nearMiss: true } : { kind: 'literal', symbol: '' })
+  if (!p) return lit()
   // 明确限定到非代码文件/目录：那是字面量与配置的领域，一律放行。
-  if (path && NON_CODE_PATH.test(String(path))) return { kind: 'literal', symbol: '' }
-  const def = /^(?:@\s*)?(?:export\s+(?:default\s+)?)?(?:class|def|fn|func|function|interface|type|enum|struct|trait|impl|const|let|var)\s+([A-Za-z_$][\w$]*)/.exec(p)
-  if (def) return { kind: 'symbol', symbol: def[1] }
+  if (path && NON_CODE_PATH.test(String(path))) return lit()
+  // v0.16 T-A：先按 | 拆 alternation 分支再逐支判。`\|` 是转义竖线（文本分支的写法），
+  // 不拆；`(a|b)` 这类分组拆出的碎片带着括号字符，在 classifyBranch 里自然落回字面量。
+  const branches = p.includes('|') && !p.includes('\\|') ? p.split('|') : [p]
+  const symbols = []
+  let literalSeen = false
+  for (const b of branches) {
+    const s = classifyBranch(b.trim())
+    if (s) symbols.push(s)
+    else literalSeen = true
+  }
+  const uniq = [...new Set(symbols)]
+  if (!uniq.length) return lit()
+  if (branches.length === 1) return { kind: 'symbol', symbol: uniq[0] }
+  // 全部分支都像符号才按 symbol-multi 并集查询（≤4 支封顶控串行时延）；含任一字面量
+  // 支就整体放行——替换不能吞掉模型要的文本检索。反例实测：十条支的 pattern 被首条
+  // `function X` 劫持成单符号替换，其余九条的意图全丢。
+  if (!literalSeen && uniq.length <= 4) return { kind: 'symbol-multi', symbol: uniq.join('|'), symbols: uniq }
+  // 能走到这里必是「多支且有符号支」：混合支（literalSeen）或超 4 支封顶拒换——都算
+  // 近失（T-B 遥测只记账，不改任何输出）：模型的符号意图被整条放行了。
+  return lit(true)
+}
+
+/**
+ * v0.16 T-A 抽出：单个分支像不像"找符号"。判据与原 classifyPattern 一致且保守：
+ * def 形（这次补了 async 臂）直接取名字；否则要求整串是纯标识符形态，并避开配置键
+ * 风格、全小写点分链、太短太通用的裸名。返回符号名；null = 这一支按字面量放行。
+ */
+function classifyBranch(p) {
+  if (!p) return null
+  const def = /^(?:@\s*)?(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:class|def|fn|func|function|interface|type|enum|struct|trait|impl|const|let|var)\s+([A-Za-z_$][\w$]*)/.exec(p)
+  if (def) return def[1]
   // 纯标识符（可含限定符 . : #）；任何正则元字符、空格、引号、URL 都直接落回 literal。
-  if (!/^[A-Za-z_$][\w$.:#]*$/.test(p)) return { kind: 'literal', symbol: '' }
-  if (/^[A-Z][A-Z0-9_]{2,}$/.test(p)) return { kind: 'literal', symbol: '' } // 配置键风格 MAX_RETRIES
+  if (!/^[A-Za-z_$][\w$.:#]*$/.test(p)) return null
+  if (/^[A-Z][A-Z0-9_]{2,}$/.test(p)) return null // 配置键风格 MAX_RETRIES
   // 限定名：`svc.doThing` 找的是 doThing；但 `dsh.profile.bundles` 这种**全小写点分链**
   // 是配置键的形态，不是符号——误拦一次配置搜索比漏拦一次符号搜索贵得多。
   if (/[.:#]/.test(p) && !p.split(/[.:#]/).some((s) => /[A-Z]/.test(s) || (s.includes('_') && s.length >= 4))) {
-    return { kind: 'literal', symbol: '' }
+    return null
   }
   // 限定名取**最后一段**做本体：`svc.doThing` 找的是 doThing，`a.b` 太短就没意义。
   const bare = p.split(/[.:#]/).pop() ?? p
-  if (bare.length < 4) return { kind: 'literal', symbol: '' } // foo / api / id 这类太通用
-  if (bare.length < 6 && !/[A-Z_]/.test(bare)) return { kind: 'literal', symbol: '' } // name / mode
-  return { kind: 'symbol', symbol: bare }
+  if (bare.length < 4) return null // foo / api / id 这类太通用
+  if (bare.length < 6 && !/[A-Z_]/.test(bare)) return null // name / mode
+  return bare
 }
 
 /** 内置搜索工具是裸名小写（`grep` / `glob`），MCP 工具才带 `mcp__` 前缀。 */
@@ -1752,7 +1782,7 @@ function scheduleDirtyRefresh(ctx, cfg, state, sess, exec) {
 function interceptPremises(exec, cfg, state) {
   if (!isGrepLike(exec?.name, cfg.interceptTools)) return null
   const q = classifyPattern(exec?.arguments?.pattern, exec?.arguments?.path)
-  if (q.kind !== 'symbol') return null
+  if (q.kind !== 'symbol' && q.kind !== 'symbol-multi') return null // v0.16 T-A：deny 钩子(:2241)仍只认单符号，multi 在 deny 档放行(fail-open)，替换档才做并集
   const key = sessionKey(exec?.agent)
   const cwd = exec?.agent?.session?.header?.cwd
   if (!key || !cwd || !state.ok) return null
@@ -2315,16 +2345,24 @@ export async function apply(ctx, config) {
         let failNote = ''
         let dropped = 0
         if (project) {
-          const hits = await cbmCall(ctx, exec, 'search_graph', { project, query: q.symbol, limit: 5 }, budgetGraph(cfg))
-          if (hits.ok && !noHits(hits.text)) {
-            const f = dropDirtyRows(hits.text, sess, cwd)
-            dropped = f.dropped
-            if (!noHits(f.text)) { source = 'graph'; text = f.text }
-          } else if (!hits.ok) {
-            failed = true
-            // 失败必须带原文：否则下次只能靠时间线反推（cbm-warm 那次的教训）。
-            failNote = hits.timeout ? '(超时)' : String(hits.text ?? '').slice(0, 120)
+          // v0.16 T-A：symbol-multi 按支并集查询（分类器封顶 ≤4 支；Promise.all 并发走
+          // 常驻代理，最坏也只等单支超时预算）。有任一支给出可信文本就替换；全支失败
+          // 记 failed、全空记 no-hit，dropped 跨支累计。
+          const syms = q.symbols && q.symbols.length ? q.symbols : [q.symbol]
+          const legs = await Promise.all(syms.map((sym) => cbmCall(ctx, exec, 'search_graph', { project, query: sym, limit: 5 }, budgetGraph(cfg))))
+          const texts = []
+          for (const hits of legs) {
+            if (hits.ok && !noHits(hits.text)) {
+              const f = dropDirtyRows(hits.text, sess, cwd)
+              dropped += f.dropped
+              if (!noHits(f.text)) texts.push(f.text)
+            } else if (!hits.ok) {
+              failed = true
+              // 失败必须带原文：否则下次只能靠时间线反推（cbm-warm 那次的教训）。
+              failNote = hits.timeout ? '(超时)' : String(hits.text ?? '').slice(0, 120)
+            }
           }
+          if (texts.length) { source = 'graph'; text = texts.join('\n') }
         }
         // v0.15.0 M4'：**语义层退出替换钩子**。这里原来还有一段"图谱没答案就轮到
         // zg 补位"，三个理由拆掉它：
