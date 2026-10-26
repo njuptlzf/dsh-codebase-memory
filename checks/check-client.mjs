@@ -158,6 +158,7 @@ const keys = Object.keys(dictEntry?.dict?.zh || {})
 for (const key of ['title', 'summary', 'loading', 'unavailable', 'enforce.label', 'telemetry.label', 'resetField', 'saveFailed', 'foot',
   'stats.label', 'stats.empty', 'stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index', 'stats.updated',
   'stats.r.graph', 'stats.r.zg',
+  'stats.r.qfailgraph', 'stats.r.qfailzg', 'stats.r.codesearch', 'stats.r.lph', 'stats.r.lpc', 'stats.budget',
   'hint.label', 'hint.hint', 'dirty.label', 'dirty.hint', 'interceptBudgetMs.label', 'interceptBudgetMs.hint',
   'interceptTools.label', 'interceptTools.hint',
   'sec.soft', 'sec.soft.hint', 'sec.hard', 'sec.hard.hint', 'sec.layers', 'sec.layers.hint',
@@ -193,7 +194,9 @@ for (const mode of modes) {
 
 /* ---- 5. 渲染两态 + 点击写路径 ---- */
 const flatten = (node, out = []) => {
-  if (node === null || node === undefined || typeof node === 'string') return out
+  if (node === null || node === undefined) return out
+  if (Array.isArray(node)) { node.forEach((k) => flatten(k, out)); return out }
+  if (typeof node === 'string' || typeof node === 'number') return out
   out.push(node)
   const kids = node.props?.children
   if (Array.isArray(kids)) kids.forEach((k) => flatten(k, out))
@@ -213,21 +216,21 @@ ok(JSON.stringify(segValues) === JSON.stringify(modes), '分段控件的选项 =
 ok(seg?.props?.value === 'deny-once', '分段控件当前值取自主机快照', seg?.props?.value)
 ok(seg?.props?.disabled === false, 'writable 时控件可用')
 const switches = flatten(tree).filter((n) => n.type === primitives.Switch)
-ok(switches.length === 3, '渲染出 3 个 Switch（contextHint / dirtyTracking / telemetry——按层排布）', String(switches.length))
+ok(switches.length === 4, '渲染出 4 个 Switch（contextHint / markPassthrough / dirtyTracking / telemetry——按层排布）', String(switches.length))
 const texts185 = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
 ok(['sec.soft', 'sec.hard', 'sec.layers', 'sec.aux', 'sec.params'].every((k) => texts185.includes(k)),
   '五个分层标题按序在场（软引导→硬拦截→检索两层→记账遥测→参数）', texts185.filter((t) => t.startsWith('sec.')).join('|'))
 ok(texts185.includes('layer.graph.on') && texts185.includes('layer.zg.unknown'),
   '检索两层状态行常驻；没数时语义层明说「状态未知」', texts185.filter((t) => t.startsWith('layer.')).join('|'))
-ok(switches[2]?.props?.checked === true, 'telemetry=true → checked', String(switches[2]?.props?.checked))
-ok(switches[0]?.props?.checked === true && switches[1]?.props?.checked === true,
-  'contextHint / dirtyTracking 缺省即开（!== false 判定）', `${switches[0]?.props?.checked}|${switches[1]?.props?.checked}`)
+ok(switches[3]?.props?.checked === true, 'telemetry=true → checked', String(switches[3]?.props?.checked))
+ok(switches[0]?.props?.checked === true && switches[2]?.props?.checked === true,
+  'contextHint / dirtyTracking 缺省即开（!== false 判定）', `${switches[0]?.props?.checked}|${switches[2]?.props?.checked}`)
 ok(flatten(tree).some((n) => n.type === 'span' && n.props?.children === 'telemetry.label'),
   '开关标签与控件同行（span 自铺，不依赖 Switch 的 label prop 渲染）')
 
 // 点击：改写宿主表单，而不是本地状态。
 seg.props.onChange('deny')
-switches[2].props.onChange(false)
+switches[3].props.onChange(false)
 ok(JSON.stringify(calls.set) === JSON.stringify([['enforce', 'deny'], ['telemetry', false]]), 'onChange 直接 form.set(字段, 值)', JSON.stringify(calls.set))
 ok(findType(tree, (n) => n.type === primitives.Button) === undefined, 'user 层为空 → 不显示任何「恢复此项」')
 
@@ -249,23 +252,37 @@ const sw2 = flatten(tree).filter((n) => n.type === primitives.Switch)
 calls.set.length = 0
 sw2[0].props.onChange(true)
 ok(sw2[0].props.checked === false, 'contextHint=false → 开关显示关（缺省开只属于 !== false）', String(sw2[0].props.checked))
+ok(sw2[1].props.checked === false, 'markPassthrough 缺省关（!== true 判定）', String(sw2[1].props.checked))
+sw2[1].props.onChange(true)
+ok(JSON.stringify(calls.set) === JSON.stringify([['contextHint', true], ['markPassthrough', true]]),
+  'markPassthrough 开关即时写（不写进 enforce=off 的默认里）', JSON.stringify(calls.set))
+calls.set.length = 0
 const inputs = flatten(tree).filter((n) => n.type === primitives.Input)
-ok(inputs.length === 2, '两个输入框（interceptBudgetMs / interceptTools）', String(inputs.length))
+ok(inputs.length === 6, '六个输入框（interceptBudgetMs / graphBudgetMs / zgBudgetMs / interceptTools / logRetentionDays / recentLimit）', String(inputs.length))
 ok(inputs[0]?.props?.type === 'number' && inputs[0]?.props?.defaultValue === 2500
-  && inputs[1]?.props?.defaultValue === 'grep,glob', '输入框回填主机快照当前值', `${inputs[0]?.props?.defaultValue}|${inputs[1]?.props?.defaultValue}`)
+  && inputs[1]?.props?.defaultValue === 0 && inputs[2]?.props?.defaultValue === 0
+  && inputs[3]?.props?.defaultValue === 'grep,glob'
+  && inputs[4]?.props?.defaultValue === 7 && inputs[5]?.props?.defaultValue === 100,
+  '输入框回填主机快照当前值', `${inputs[0]?.props?.defaultValue}|${inputs[1]?.props?.defaultValue}|${inputs[2]?.props?.defaultValue}|${inputs[3]?.props?.defaultValue}|${inputs[4]?.props?.defaultValue}|${inputs[5]?.props?.defaultValue}`)
 inputs[0].props.onBlur({ target: { value: '1800' } })
-ok(JSON.stringify(calls.set) === JSON.stringify([['contextHint', true], ['interceptBudgetMs', 1800]]),
-  '开关即时写；blur 且值合法才写表单（数字已解析）', JSON.stringify(calls.set))
+ok(JSON.stringify(calls.set) === JSON.stringify([['interceptBudgetMs', 1800]]),
+  'blur 且值合法才写表单（数字已解析）', JSON.stringify(calls.set))
 const badNum = { value: 'abc' }
 const badCsv = { value: '   ' }
 inputs[0].props.onBlur({ target: badNum })
-inputs[1].props.onBlur({ target: badCsv })
-ok(calls.set.length === 2 && badNum.value === '2500' && badCsv.value === 'grep,glob',
-  '非法/空值一个字节都不写，输入框拨回当前值', `${badNum.value}|${badCsv.value}`)
+inputs[3].props.onBlur({ target: badCsv })
+// 追加四输入（graphBudgetMs / zgBudgetMs / logRetentionDays / recentLimit）也走 blur 才写；坏值一律不写并拨回默认
+const badDays = { value: 'x' }
+const badLimit = { value: '0' }
+inputs[4].props.onBlur({ target: badDays })
+inputs[5].props.onBlur({ target: badLimit })
+ok(calls.set.length === 1 && badNum.value === '2500' && badCsv.value === 'grep,glob'
+  && badDays.value === '7' && badLimit.value === '100',
+  '非法/空值一个字节都不写，输入框拨回当前值', `${badNum.value}|${badCsv.value}|${badDays.value}|${badLimit.value}`)
 let blurred = 0
 const fakeTarget = { blur: () => { blurred += 1 } }
-inputs[1].props.onKeyDown({ key: 'Enter', currentTarget: fakeTarget })
-inputs[1].props.onKeyDown({ key: 'a', currentTarget: fakeTarget })
+inputs[3].props.onKeyDown({ key: 'Enter', currentTarget: fakeTarget })
+inputs[3].props.onKeyDown({ key: 'a', currentTarget: fakeTarget })
 ok(blurred === 1, '回车即提交（走 blur），普通按键不打扰表单', String(blurred))
 calls.unset.length = 0
 const btns2 = flatten(tree).filter((n) => n.props && typeof n.props.onClick === 'function')
@@ -388,10 +405,12 @@ ok(panel.component({ ...props, view: 'summary' }) === 'summary', 'summary 态返
 const statsJson = JSON.stringify({
   at: 1791531188925,
   zg: 'ready',
-  replace: { hit: 8, graph: 6, zg: 2, passDirty: 2, passNoHit: 0, error: 0 },
+  replace: { hit: 8, graph: 6, zg: 2, passDirty: 2, passNoHit: 0, passFailed: 0, passFailedGraph: 0, passFailedZg: 0, error: 0 },
   deny: { blocked: 3, passDirty: 1, passNoHit: 2, passQueryFailed: 0, skipSeen: 4, error: 0 },
   dirty: { record: 9, refreshScheduled: 5, refreshDone: 4, refreshFail: 1 },
-  lever: { wrapperCalls: 12, hintInjected: 3 },
+  lever: { wrapperCalls: 12, hintInjected: 3, codeSearch: 4 },
+  listProjects: { hot: 0, cacheHit: 5 },
+  budget: { graph: 6000, zg: 4000 },
   index: { retryContention: 1, zgIndexFail: 0 },
 })
 storeSnapshot = { status: 'ready', value: { enforce: 'replace', telemetry: true, zgEnabled: true, stats: statsJson }, base: {}, user: {}, writable: true, revision: 11 }
@@ -402,6 +421,14 @@ ok(texts.includes('80%'), '命中率大数字 = hit/(hit+让路+无命中+出错
 ok(texts.includes('8/10'), '被替换行 = hit/den', texts.filter((t) => /^\d+\/\d+$/.test(t)).join('|'))
 ok(['stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index'].every((k) => texts.includes(k)), '五张卡片都在')
 ok(texts.includes('stats.r.graph') && texts.includes('stats.r.zg'), '占比条题注区分结构层/语义层（两层并存，不是二选一）')
+// v0.15.0 M6：分腿失败计数、两条腿的预算、code_search 调用、清单缓存命中都要在页上
+ok(texts.includes('stats.r.qfailgraph'), '失败计数按腿分开（图谱腿行在场）', texts.filter((t) => t.startsWith('stats.r.qfail')).join('|'))
+ok(texts.includes('stats.r.codesearch'), 'code_search 调用进软引导卡（语义层退出钩子后的唯一入口）')
+ok(texts.includes('stats.r.lpc') && texts.includes('stats.r.lph'), '清单缓存命中/现查进索引卡（M1 的验收读数）')
+// 夹具的 t() 原样返回 key（不查字典），所以这里断言"渲染了这一行"，
+// 模板占位符由下面的字典断言单独锁（{graph}/{zg} 必须都在）。
+ok(texts.includes('stats.budget') && /\{graph\}/.test(dictEntry?.dict?.zh?.['stats.budget'] ?? '') && /\{zg\}/.test(dictEntry?.dict?.zh?.['stats.budget'] ?? ''),
+  '两条腿的预算在页上（占位符 {graph}/{zg} 都在模板里）', texts.filter((t) => /budget/.test(t)).join('|').slice(0, 80))
 ok(texts.includes('layer.zg.ready'), '状态行的语义层取自 stats.zg（有数时用实测状态，不再「未知」）', texts.filter((t) => t.startsWith('layer.')).join('|'))
 ok(flatten(tree).filter((n) => n.type === primitives.SegmentedControl).length === 1
   && flatten(tree).filter((n) => n.props && typeof n.props.onClick === 'function').length === 0, '读数块不新增交互件（卡片全只读）')
@@ -418,6 +445,65 @@ ok(['stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index
 storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: false, stats: '' }, base: {}, user: {}, writable: true, revision: 14 }
 tree = panel.component({ ...props })
 ok(flatten(tree).some((n) => n.props?.children === 'stats.empty'), '空态只属于"关了遥测"')
+
+/* ---- 7. 仓库索引状态 + 最近替换效果 + 日志与环形上限（v0.14.0 新段落）---- */
+console.log('\n[仓库 / 效果 / 日志]')
+// 无 stats：两个新段落都要有各自的空态
+storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true }, base: {}, user: {}, writable: true, revision: 20 }
+tree = panel.component({ ...props })
+const textsNoStats = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
+ok(textsNoStats.includes('sec.repos.empty') && textsNoStats.includes('sec.effect.empty'),
+  '无 stats ⇒ 仓库表与最近效果都出各自的空态', textsNoStats.filter((t) => t.startsWith('sec.')).join('|'))
+ok(textsNoStats.includes('sec.log'), '「日志与环形上限」段常驻')
+ok(textsNoStats.includes('logRetentionDays.label') && textsNoStats.includes('recentLimit.label'),
+  '两个新输入框的标签在场')
+
+// 有 repos + recent：表格按 cwd 分列；outcome 徽标按 recent 键渲染；snippet 折叠在场
+const statsWithRepos = JSON.stringify({
+  at: 1791531188925,
+  zg: 'ready',
+  replace: { hit: 1, graph: 1, zg: 0, passDirty: 0, passNoHit: 0, error: 0 },
+  deny: { blocked: 0, passDirty: 0, passNoHit: 0, passQueryFailed: 0, skipSeen: 0, error: 0 },
+  dirty: { record: 0, refreshScheduled: 0, refreshDone: 0, refreshFail: 0 },
+  lever: { wrapperCalls: 0, hintInjected: 0 },
+  index: { retryContention: 0, zgIndexFail: 0 },
+  repos: [
+    { cwd: 'C:/repoA', project: 'repo-a', zg: true, replace: { 'intercept-replace': 3 }, deny: { 'intercept-deny': 1 } },
+    { cwd: 'C:/repoB', project: '', zg: false, replace: {}, deny: {} },
+  ],
+  recent: [
+    { ts: 1791531188925, cwd: 'C:/repoA', project: 'repo-a', symbol: 'foo', source: 'graph', outcome: 'replaced-graph', snippet: 'results: 1\n#1 [foo]' },
+    { ts: 1791531188924, cwd: 'C:/repoB', project: '', symbol: 'bar', source: 'graph', outcome: 'denied', snippet: 'results: 2\n#1 [bar]\n#2 [baz]' },
+  ],
+})
+storeSnapshot = { status: 'ready', value: { enforce: 'replace', telemetry: true, zgEnabled: true, stats: statsWithRepos }, base: {}, user: {}, writable: true, revision: 21 }
+tree = panel.component({ ...props })
+const textsRepos = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
+ok(textsRepos.some((t) => /repoA/.test(t)) && textsRepos.some((t) => /repoB/.test(t)),
+  '仓库表按 cwd 列出两个仓库（basename 或末两级路径）',
+  textsRepos.filter((t) => /repo[AB]/.test(t)).join('|'))
+ok(textsRepos.includes('sec.repos.cbm'), '仓库表有 cbm project 列头')
+ok(textsRepos.includes('sec.repos.zg.yes') && textsRepos.includes('sec.repos.zg.no'),
+  '仓库表 zg 列同时有「有索引 / 无索引」两态')
+ok(textsRepos.includes('recent.replaced-graph') && textsRepos.includes('recent.denied'),
+  '最近效果区渲染 outcome 徽标（replaced-graph / denied）')
+ok(!textsRepos.includes('sec.repos.empty') && !textsRepos.includes('sec.effect.empty'),
+  '有数据时两个空态都不出现')
+// snippet 用 <details>/<summary> 折叠——渲染出 <pre> 承载片段文本
+const preNodes = flatten(tree).filter((n) => n.type === 'pre')
+ok(preNodes.length >= 1 && /results: 1/.test(String(preNodes[0]?.props?.children)),
+  '片段文本进 <pre>（折叠后展开可见）', JSON.stringify(preNodes[0]?.props?.children ?? '').slice(0, 60))
+const repoSegs = flatten(tree).filter((n) => n.type === primitives.SegmentedControl)
+ok(repoSegs.length === 2,
+  '仓库筛选器是第二段 segmented（enforce + repo）',
+  String(repoSegs.length))
+ok(repoSegs[1]?.props?.options?.[0]?.label === 'sec.filter.all',
+  '仓库筛选器首项为「全部」（值为空字符串），后续每项对应一个 cwd',
+  JSON.stringify(repoSegs[1]?.props?.options ?? []).slice(0, 120))
+// 输入框总数应为 6：interceptBudgetMs / graphBudgetMs / zgBudgetMs / interceptTools / logRetentionDays / recentLimit
+ok(flatten(tree).filter((n) => n.type === primitives.Input).length === 6,
+  '总输入框数 = 6（整体预算 + 两条腿预算 + 名单 + 保留天数/环形上限）',
+  String(flatten(tree).filter((n) => n.type === primitives.Input).length))
 
 console.log(`\n${failed === 0 ? 'check:client 全过' : `${failed} 项失败`}`)
 process.exit(failed === 0 ? 0 : 1)

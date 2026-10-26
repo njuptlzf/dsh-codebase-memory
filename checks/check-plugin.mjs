@@ -25,10 +25,10 @@
  *   V 适配层版本对账（v0.13.0）：实装 ≠ 钉 ⇒ 自动重装并带 note + adapter-upgrade
  *     计数；= 钉 ⇒ 零安装；manual ⇒ 不碰网络只记差距；清单写 settings.scriptMode。
  */
-import { execFileSync, spawn } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, basename } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const DSH_HOME = process.env.DSH_HOME || join(process.env.USERPROFILE, '.dsh')
@@ -48,9 +48,43 @@ const profiles = existsSync(PROFILES_DIR)
     .filter((name) => existsSync(join(installedIn(name), 'index.js')))
   : []
 
-const targets = profileArg ? [profileArg] : profiles
+/**
+ * profile 是否**真的接线**了：node_modules 里有目录 ≠ 宿主会加载它——
+ * 名字必须出现在 composition 里。两个落点都要认（宿主版本不同写法不同）：
+ *   · 新版：profile 的 package.json → dsh.profile.bundles（cordis.yml 只剩一个空 `[]`）；
+ *   · 老版：cordis.yml 里物化的完整插件树。
+ * 不认这个，验一个装了但没接线的 profile 只会产出"链路 NOT READY / 清单里多了 zg"
+ * 的假红灯（清单是跨 profile 共享的，谁最后 bootstrap 就写谁那份）。
+ * 显式传 profile 参数时不做这个过滤。
+ */
+const wired = (profile) => {
+  try {
+    const pkg = JSON.parse(readFileSync(join(PROFILES_DIR, profile, 'package.json'), 'utf8'))
+    const list = pkg?.dsh?.profile?.bundles
+    if (Array.isArray(list)) return list.includes('dsh-codebase-memory')
+  } catch { /* 没有 package.json 就退回 cordis.yml */ }
+  try { return /dsh-codebase-memory/.test(readFileSync(join(PROFILES_DIR, profile, 'cordis.yml'), 'utf8')) } catch { return false }
+}
+
+const targets = profileArg ? [profileArg] : profiles.filter(wired)
+if (!profileArg) {
+  for (const p of profiles.filter((p) => !wired(p))) console.log(`跳过 ${p}：装目录在，但没在 dsh.profile.bundles 里注册（未接线）`)
+}
 if (targets.length === 0) {
   throw new Error(`没有任何 profile 装了插件。先跑：dsh plugin --profile <name> add file:${REPO}`)
+}
+
+// 一个 profile 一个进程。为什么：所有 profile 共享同一个 adapterDir 与 cbm.json，
+// 同一进程里连跑会互相污染——前一个 profile 的臂会把清单写成"带 zg"、把真引擎的
+// 索引任务占住，后一个 profile 的 A（链路就绪）/Z（默认清单无 zg）就误判。
+// 实测 2026-10-24：tauri+web 同进程 = 一串假红灯；各自单独跑 = 169/169。
+if (!profileArg && targets.length > 1) {
+  let failedAny = 0
+  for (const p of targets) {
+    const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), p], { stdio: 'inherit' })
+    if (r.status !== 0) failedAny = 1
+  }
+  process.exit(failedAny)
 }
 
 const results = []
@@ -246,8 +280,11 @@ async function verify(profile) {
   const installed = join(installedIn(profile), 'index.js')
   console.log(`\n[${profile}] ${installed}`)
 
+  // 预热的"延后 1.5s"是给真实宿主躲启动竞态用的；验收里要的是确定性 ⇒ 归零。
+  // 必须在 import 之前设：这个值在模块加载时读一次。
+  process.env.DSH_CBM_WARM_DELAY_MS = '0'
   const mod = await import(pathToFileURL(installed).href)
-  const { apply, name, inject, engineVerdict, fileDrift, classifyPattern, truncateCodepoints, isGrepLike, normPath, projectFromListing, Config, parseAdapterProcsWin, parseAdapterProcsPosix, DEFAULT_ADAPTER_VERSION } = mod
+  const { apply, name, inject, engineVerdict, fileDrift, classifyPattern, truncateCodepoints, isGrepLike, normPath, projectFromListing, dropDirtyRows, Config, parseAdapterProcsWin, parseAdapterProcsPosix, DEFAULT_ADAPTER_VERSION } = mod
   if (name !== 'dsh-codebase-memory') throw new Error(`unexpected plugin name: ${name}`)
   record('装载', true, `name=${name}  inject=${inject.join(',')}`)
 
@@ -257,8 +294,13 @@ async function verify(profile) {
   const countsDir = join(tmpdir(), `cbm-counts-${process.pid}-${profile}`)
   mkdirSync(countsDir, { recursive: true })
   let countsSeq = 0
-  const mount = async (config, proxy = null, ctxOpts = null, countsFile = null) => {
+  const mount = async (config, proxy = null, ctxOpts = null, countsFile = null, tdir = null) => {
     process.env.DSH_CBM_COUNTS_FILE = countsFile ?? join(countsDir, `c${(countsSeq += 1)}.json`)
+    // 遥测也隔离：显式传 adapterDir 的臂（W2/U5/O1 要读自己目录下的 telemetry-*.log）
+    // 指回自己的目录，其余一律写临时目录——否则几十次 mount 的桩会把真实日志淹掉
+    // （2026-10-24 实测：真实日志里 283 条 intercept-replace 全是 project:"stub-*"）。
+    // 第 5 参 tdir 给"需要在 mount 前后读同一目录"的臂（G9 的重试计数）。
+    process.env.DSH_CBM_TELEMETRY_DIR = tdir || config.adapterDir || join(countsDir, 'telemetry')
     const tools = new Map()
     const sections = []
     const contexts = []
@@ -274,7 +316,7 @@ async function verify(profile) {
   // ── 臂 A：链路就绪 ──────────────────────────────────────────────────────────
   const a = await mount({})
   const setup = await a.tools.get('code_setup').execute({}, withSignal(REPO))
-  record('A 链路就绪', /status: OK/.test(setup), setup.split('\n')[0])
+  record('A 链路就绪', /status: OK/.test(setup), /status: OK/.test(setup) ? setup.split('\n')[0] : setup.split('\n').slice(0, 6).join(' | ').slice(0, 400))
   record('A auto_index 默认开且已落进引擎配置', /^auto_index: true/m.test(setup), /auto_index:.*$/m.exec(setup)?.[0] ?? '(报表里没有 auto_index 行)')
   record('A code_setup 报出引擎实测范围', /^引擎实测: 实测通过 \d/m.test(setup), /^引擎实测:.*$/m.exec(setup)?.[0]?.slice(0, 150) ?? '(没有 引擎实测 行)')
   // 版本判定直接调用导出函数证伪，不必伪造一个"未实测的引擎"
@@ -710,10 +752,14 @@ async function verify(profile) {
   // _commitVolatile（它就是把新快照 updateVolatile 进同一个引用）。
   // stats 方向相反：不是用户可写项，是插件→页面的只读读数通道，但它同样必须 volatile
   // ——describe() 只把 volatile 字段解引用进快照，标错（或漏标）页面就永远看不到读数。
-  const VOLATILE_KEYS = ['enforce', 'interceptTools', 'interceptBudgetMs', 'contextHint', 'telemetry', 'dirtyTracking', 'stats', 'zgEnabled']
+  // v0.15.0 增补 graphBudgetMs / zgBudgetMs；v0.14.0 增补 logRetentionDays /
+  // recentLimit / markPassthrough——它们在 Config 里都标了 volatile（页面可写、
+  // 决策点现读），名单漏了就会让"标错等于对 UI 撒谎"这条断言失去意义。
+  const VOLATILE_KEYS = ['enforce', 'interceptTools', 'interceptBudgetMs', 'contextHint', 'telemetry', 'dirtyTracking', 'stats', 'zgEnabled',
+    'logRetentionDays', 'recentLimit', 'markPassthrough', 'graphBudgetMs', 'zgBudgetMs']
   // schemastery 的字段表在 `Config.dict`（宿主 dsh-settings 的 volatileForm 也是递归它）。
   const marked = VOLATILE_KEYS.filter((k) => Config?.dict?.[k]?.meta?.volatile === true)
-  record('G 六个即时热改字段 + zgEnabled（延迟生效）+ 读数通道在 Config 里标了 volatile（宿主才肯 serve/写）', marked.length === 8, `标了的是 ${marked.join(',') || '(无)'}`)
+  record('G 即时热改字段 + 观测字段 + 读数通道在 Config 里标了 volatile（宿主才肯 serve/写）', marked.length === VOLATILE_KEYS.length, `标了的是 ${marked.join(',') || '(无)'}`)
   const extra = Object.keys(Config?.dict ?? {}).filter((k) => Config.dict[k]?.meta?.volatile === true && !VOLATILE_KEYS.includes(k))
   record('G 没有把需要重启的字段标成 volatile（标错等于对 UI 撒谎）', extra.length === 0, extra.join(','))
 
@@ -800,16 +846,23 @@ async function verify(profile) {
     zgSkip?.kind === 'accept' && zgSkip?.content === undefined && !zrCalls.some((x) => x.tool === 'zg_zvec_grep_search'),
     `calls=${zrCalls.map((x) => x.tool).join(',') || '(无)'}`)
   const zgSwap = await postZr(grepExec(fakeAgent(`sess-${process.pid}-zrguard-b`, zgYesWs), 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
-  record('R 有 .zvec-grep 目录时 replace 照常查 zg 并替换（守卫不误伤正路）',
-    /语义层/.test(zgSwap?.content?.[0]?.text ?? '') && zrCalls.some((x) => x.tool === 'zg_zvec_grep_search'),
-    String(zgSwap?.content?.[0]?.text ?? '(没换)').slice(0, 70))
+  // v0.15.0 M4'：语义层退出替换钩子——即使包已装、清单 ready、本仓有 .zvec-grep，
+  // 符号类 grep 也只走图谱。理由：同一个裸标识符喂给向量检索是最差输入，而"图谱
+  // 没答案才试语义"恰好只在语义最不擅长时启动，还让一次 grep 白等 6s+4s。
+  record('R 语义层退出替换钩子：包就绪 + 有索引也不查 zg（M4′）',
+    !zrCalls.some((x) => x.tool === 'zg_zvec_grep_search') && !/语义层/.test(zgSwap?.content?.[0]?.text ?? ''),
+    `calls=${zrCalls.map((x) => x.tool).join(',') || '(无)'} out=${String(zgSwap?.content?.[0]?.text ?? '(原样)').slice(0, 40)}`)
   rmSync(zgmDir, { recursive: true, force: true })
   // G9 索引任务串行化 + 被并发中止后重试（这条臂来自一次真实失败：后台补刷与
   // code_index 撞上引擎 watcher ⇒ 退出码 1 + aborted_previous_preserved）。
-  const telemetryPath = join(ADAPTER_DIR, 'telemetry.log')
-  const retryCount = () => (existsSync(telemetryPath) ? readFileSync(telemetryPath, 'utf8').split('\n').filter((l) => /index-retry-contention/.test(l)).length : 0)
+  // v0.14.0 起遥测日志按天轮转（telemetry-YYYY-MM-DD.log）——读旧名 telemetry.log
+  // 永远是 0 条，断言就会静默变成"重试没被记账"（读数在，事件不在）。
+  // 这条臂要在 mount 前后读同一个目录 ⇒ 用自己的遥测目录（mount 第 5 参钉住）。
+  const retryTdir = join(countsDir, 'telemetry-g9')
+  const telemetryFiles = () => (existsSync(retryTdir) ? readdirSync(retryTdir).filter((f) => /^telemetry-\d{4}-\d{2}-\d{2}\.log$/.test(f)) : [])
+  const retryCount = () => telemetryFiles().reduce((acc, f) => acc + readFileSync(join(retryTdir, f), 'utf8').split('\n').filter((l) => /index-retry-contention/.test(l)).length, 0)
   const beforeRetries = retryCount()
-  const c = await mount({ enforce: 'off', dirtyTracking: false, contextHint: false }, null, { abortOnce: true })
+  const c = await mount({ enforce: 'off', dirtyTracking: false, contextHint: false }, null, { abortOnce: true }, null, retryTdir)
   await c.tools.get('code_setup').execute({}, withSignal(REPO))
   const retried = await c.tools.get('code_index').execute({}, withSignal(REPO))
   record('G 索引第一次被并发中止时自动重试并成功', typeof retried?.project === 'string' && retried.project.length > 0, `project=${retried?.project} status=${retried?.status}`)
@@ -856,8 +909,44 @@ async function verify(profile) {
   const agentRd = fakeAgent(`sess-${process.pid}-rdirty`, REPO)
   await rdBook({ name: 'edit', arguments: { file_path: join(REPO, 'index.js') }, agent: agentRd, signal: sig() }, { content: [], isError: false }, nextPost)
   const dirtySwap = await rdRep(grepExec(agentRd, 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
-  record('R 本会话写过代码 ⇒ 不换（台账脏=坐标可能过期，拿旧图替换就是骗人）',
+  record('R 本会话写过**命中所在的文件** ⇒ 不换（那条命中的坐标可能过期）',
     dirtySwap?.kind === 'accept' && dirtySwap?.content === undefined, JSON.stringify(dirtySwap).slice(0, 90))
+  // v0.15.1：脏台账从"整会话让路"改成"按命中文件过滤"。现场依据：replace-pass-dirty 95 :
+  // intercept-replace 12 —— 编辑会话里等于把替换永久关闭，而多数命中落在没改过的文件里。
+  const rd2Calls = []
+  const rd2 = await mount({ enforce: 'replace' }, makeStubProxy(rd2Calls, { project: `stub-${process.pid}-rdirty2` }))
+  await rd2.tools.get('code_setup').execute({}, withSignal(REPO))
+  const rd2Book = (rd2.events['tools/post-execute'] ?? [])[0]
+  const rd2Rep = (rd2.events['tools/post-execute'] ?? [])[1]
+  const agentRd2 = fakeAgent(`sess-${process.pid}-rdirty2`, REPO)
+  await rd2Book({ name: 'edit', arguments: { file_path: join(REPO, 'some-other-file.ts') }, agent: agentRd2, signal: sig() }, { content: [], isError: false }, nextPost)
+  const dirtyKeep = await rd2Rep(grepExec(agentRd2, 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  record('R 脏的是别的文件 ⇒ 命中照换（v0.15.1 按命中文件过滤）',
+    /stubSymbol/.test(dirtyKeep?.content?.[0]?.text ?? ''), JSON.stringify(dirtyKeep).slice(0, 100))
+  // 纯函数单元臂：dropDirtyRows 拿**现场 search_graph 的真实返回体形状**（3 行 / 2 文件）
+  // 验四条：只丢脏文件的行、空脏集原样、非 JSON 原样、路径写法差异也能匹配。
+  {
+    const payload = JSON.stringify({
+      cols: ['qn', 'label', 'file', 'lines', 'rank'],
+      rows: [
+        ['p.classifyPattern', 'Function', 'index.js', '1099-1119', -16.8],
+        ['p.docs.section', 'Section', 'docs/plan.md', '303-304', -1.2],
+        ['p.docs.m4', 'Section', 'docs/plan.md', '92-93', -1.1],
+      ],
+      total: 7, returned: 3, has_more: true,
+    })
+    const r1 = dropDirtyRows(payload, { dirty: new Set(['index.js']) }, REPO)
+    const kept = JSON.parse(r1.text)
+    record('D 只丢脏文件的行：index.js 剔除、docs 两行保留、计数正确',
+      r1.dropped === 1 && kept.rows.length === 2 && kept.returned === 2 && kept.dirty_dropped === 1,
+      `dropped=${r1.dropped} rows=${kept.rows.length}`)
+    record('D 脏集合为空 ⇒ 原样返回（一个字节都不改）',
+      dropDirtyRows(payload, { dirty: new Set() }, REPO).text === payload)
+    record('D 非 JSON 文本（表格）原样返回，绝不误删',
+      dropDirtyRows('rows: 1\n  a b c', { dirty: new Set(['index.js']) }, REPO).text === 'rows: 1\n  a b c')
+    record('D 反斜杠 + 大小写差异也能匹配（normPath 归一 + Windows 折叠）',
+      dropDirtyRows(payload, { dirty: new Set(['DOCS\\Plan.md']) }, REPO).dropped === 2)
+  }
   let flipRep = 'off'
   const rf = await mount({ enforce: { get: () => flipRep }, dirtyTracking: false, telemetry: false }, makeStubProxy([], { project: `stub-${process.pid}-rflip` }))
   await rf.tools.get('code_setup').execute({}, withSignal(REPO))
@@ -926,6 +1015,11 @@ async function verify(profile) {
   record('R3 Error 文本判为失败：不替换，且计成 passFailed 而非 noHit',
     r3Swap?.content === undefined && (r3Stats?.replace?.passFailed ?? 0) === 1 && (r3Stats?.replace?.hit ?? 0) === 0 && (r3Stats?.replace?.passNoHit ?? 1) === 0,
     String(r3Ref.get()).slice(0, 170))
+  // v0.15.0 M3：失败按腿归因。汇总键保留（旧面板不空白），分腿键给排障——
+  // 超时到底是哪一腿，不该再从同一格里猜。
+  record('R3 失败按腿归因：passFailedGraph=1 且 passFailedZg=0（M3）',
+    (r3Stats?.replace?.passFailedGraph ?? 0) === 1 && (r3Stats?.replace?.passFailedZg ?? 0) === 0,
+    JSON.stringify(r3Stats?.replace ?? null).slice(0, 150))
 
   // ── 臂 S2：累计计数跨重启（「跑几天看占比」不能每次重启归零）─────────────────
   const seedFile = join(countsDir, 's2-shared.json')
@@ -1013,7 +1107,10 @@ async function verify(profile) {
     const w2Mid = await w2.tools.get('code_setup').execute({}, withSignal(REPO))
     await new Promise((r) => setTimeout(r, 300)) // 等真实 settle（stub 60ms）
     const w2Report = await w2.tools.get('code_setup').execute({}, withSignal(REPO))
-    const w2Warm = readFileSync(join(w2Dir, 'telemetry.log'), 'utf8').trim().split('\n').filter(Boolean)
+    // v0.14.0 起遥测日志按天轮转（telemetry-YYYY-MM-DD.log）——同族断言 U/O1 已改，
+    // 这条漏改会在读旧名 telemetry.log 时 ENOENT 崩掉整个验收。读当天那个文件。
+    const w2logFiles = readdirSync(w2Dir).filter((f) => /^telemetry-\d{4}-\d{2}-\d{2}\.log$/.test(f)).sort()
+    const w2Warm = w2logFiles.flatMap((f) => readFileSync(join(w2Dir, f), 'utf8').trim().split('\n').filter(Boolean))
       .map((l) => { try { return JSON.parse(l) } catch { return null } }).filter((l) => l?.event === 'cbm-warm').pop()
     record('W 预热按真实 settle 落账：慢一发完成后 warm=ok 且遥测带 ok+ms（v0.13.2，旧 race 无 ms 必挂）',
       /warm=(ok|pending)/.test(w2Mid) && /warm=ok/.test(w2Report) && w2Warm?.ok === true && typeof w2Warm?.ms === 'number' && w2Warm.ms >= 40,
@@ -1186,10 +1283,140 @@ async function verify(profile) {
   try {
     const u5 = await mount({ telemetry: true, adapterDir: u5Dir, cbmPath: fakeExe }, null, { procTable: '' })
     await u5.tools.get('code_setup').execute({ action: 'restart-adapter' }, withSignal(REPO)) // 必发一条遥测
-    const u5line = JSON.parse(readFileSync(join(u5Dir, 'telemetry.log'), 'utf8').trim().split('\n').filter(Boolean).pop())
+    const u5logFiles = readdirSync(u5Dir).filter((f) => /^telemetry-\d{4}-\d{2}-\d{2}\.log$/.test(f)).sort()
+    const u5line = JSON.parse(readFileSync(join(u5Dir, u5logFiles[u5logFiles.length - 1]), 'utf8').trim().split('\n').filter(Boolean).pop())
     record('U telemetry 日志行带发出 pid=本进程（log 与计数对不上账时能归因）',
       u5line.pid === process.pid && u5line.event === 'restart-adapter', JSON.stringify(u5line).slice(0, 150))
   } finally { rmU5() }
+
+  // ── 臂 O：按仓库观测（v0.14.0）——logRetentionDays 轮转、repos[] per-repo 计数、
+  // recent 环形 + snippet、renderReplacement 徽标、markPassthrough 标记
+  const src = readFileSync(installed, 'utf8')
+  record('O Config 默认 logRetentionDays=7', /logRetentionDays\s*:\s*z\.number\(\)\.default\(7\)/.test(src))
+  record('O Config 默认 recentLimit=100', /recentLimit\s*:\s*z\.number\(\)\.default\(100\)/.test(src))
+  record('O Config 默认 markPassthrough=false', /markPassthrough\s*:\s*z\.boolean\(\)\.default\(false\)/.test(src))
+
+  // 轮转：logRetentionDays=7 时，写新日志触发 sweepTelemetry，超期文件被删、当天文件不动
+  const o1Dir = join(tmpdir(), `cbm-o1-${process.pid}-${profile}`)
+  const rmO1 = () => { try { rmSync(o1Dir, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 }) } catch { } }
+  rmO1()
+  mkdirSync(o1Dir, { recursive: true })
+  writeFileSync(join(o1Dir, 'mcp-server.mjs'), '', 'utf8')
+  writeFileSync(join(o1Dir, 'package.json'), `{"version":"${DEFAULT_ADAPTER_VERSION}"}`, 'utf8')
+  const stamp = (offsetDays) => {
+    const d = new Date(Date.now() - offsetDays * 86400000)
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  }
+  const oldStamp = stamp(30)
+  const recentStamp = stamp(3)
+  writeFileSync(join(o1Dir, `telemetry-${oldStamp}.log`), '{"event":"old"}\n', 'utf8')
+  writeFileSync(join(o1Dir, `telemetry-${recentStamp}.log`), '{"event":"recent"}\n', 'utf8')
+  try {
+    const o1 = await mount({ telemetry: true, adapterDir: o1Dir, logRetentionDays: 7, cbmPath: fakeExe }, null, { procTable: '' })
+    await o1.tools.get('code_setup').execute({ action: 'restart-adapter' }, withSignal(REPO))
+    const names = readdirSync(o1Dir).filter((f) => /^telemetry-\d{4}-\d{2}-\d{2}\.log$/.test(f)).sort()
+    record('O1 logRetentionDays=7：超 30 天文件被 sweep 删',
+      !names.some((n) => n.includes(oldStamp)), `现存日志文件: ${names.join(', ')}`)
+    record('O1 logRetentionDays=7：3 天前文件保留', names.some((n) => n.includes(recentStamp)))
+    record('O1 新事件写到当天文件（telemetryPath 按天命名）',
+      names.some((n) => n === `telemetry-${stamp(0)}.log`), `现存: ${names.join(', ')}`)
+  } finally { rmO1() }
+
+  // logRetentionDays=0：关掉轮转，超期文件仍留
+  const o1bDir = join(tmpdir(), `cbm-o1b-${process.pid}-${profile}`)
+  const rmO1b = () => { try { rmSync(o1bDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 }) } catch { } }
+  rmO1b()
+  mkdirSync(o1bDir, { recursive: true })
+  writeFileSync(join(o1bDir, 'mcp-server.mjs'), '', 'utf8')
+  writeFileSync(join(o1bDir, 'package.json'), `{"version":"${DEFAULT_ADAPTER_VERSION}"}`, 'utf8')
+  writeFileSync(join(o1bDir, `telemetry-${oldStamp}.log`), '{"event":"old"}\n', 'utf8')
+  try {
+    const o1b = await mount({ telemetry: true, adapterDir: o1bDir, logRetentionDays: 0, cbmPath: fakeExe }, null, { procTable: '' })
+    await o1b.tools.get('code_setup').execute({ action: 'restart-adapter' }, withSignal(REPO))
+    const stillThere = readdirSync(o1bDir).some((f) => f === `telemetry-${oldStamp}.log`)
+    record('O1 logRetentionDays=0 关掉轮转：超期文件仍留', stillThere)
+  } finally { rmO1b() }
+
+  // repos[] 带 cwd + project + zg + per-repo 计数：一个 replace 事件后应有完整行
+  const o2Ref = mkVolRef('')
+  const o2 = await mount({ enforce: 'replace', dirtyTracking: false, stats: o2Ref }, makeStubProxy([], { project: `stub-${process.pid}-o2` }))
+  await o2.tools.get('code_setup').execute({}, withSignal(REPO))
+  await (o2.events['tools/post-execute'] ?? [])[1](grepExec(fakeAgent(`sess-${process.pid}-o2`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
+  let o2Stats = null
+  try { o2Stats = JSON.parse(String(o2Ref.get())) } catch { }
+  record('O2 repos[] 带 cwd + project + zg + 替换计数（按仓库观测）',
+    Array.isArray(o2Stats?.repos) && o2Stats.repos.length === 1
+      && o2Stats.repos[0].cwd === REPO
+      && typeof o2Stats.repos[0].project === 'string' && o2Stats.repos[0].project.length > 0
+      && typeof o2Stats.repos[0].zg === 'boolean'
+      && (o2Stats.repos[0].replace?.['intercept-replace'] ?? 0) === 1,
+    JSON.stringify({ repos: o2Stats?.repos ?? null, replace: o2Stats?.replace ?? null }).slice(0, 300))
+
+  // recent 环形：连续 3 个 replace 事件，recent 有 3 条，每条含 outcome='replaced-graph' 与 snippet
+  // pattern 必须**像符号**：classifyPattern 对 <6 字符且无大写/下划线的（sym0）判字面量，
+  // 那是设计上的保守——断言要用真能触发替换的 pattern，否则测的是"字面量不替换"。
+  const o3Ref = mkVolRef('')
+  const o3 = await mount({ enforce: 'replace', dirtyTracking: false, stats: o3Ref }, makeStubProxy([], { project: `stub-${process.pid}-o3` }))
+  await o3.tools.get('code_setup').execute({}, withSignal(REPO))
+  for (let i = 0; i < 3; i++) {
+    await (o3.events['tools/post-execute'] ?? [])[1](grepExec(fakeAgent(`sess-${process.pid}-o3-${i}`, REPO), `symB${i}`), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
+  }
+  let o3Stats = null
+  try { o3Stats = JSON.parse(String(o3Ref.get())) } catch { }
+  const o3recent = o3Stats?.recent ?? []
+  record('O3 recent 收 3 条替换决策（含 outcome=replaced-graph 与 snippet）',
+    o3recent.length === 3 && o3recent.every((e) => e.outcome === 'replaced-graph' && typeof e.snippet === 'string' && e.snippet.length > 0),
+    `len=${o3recent.length} outcomes=${o3recent.map((e) => e.outcome).join(',')} syms=${o3recent.map((e) => e.symbol).join(',')}`)
+  record('O3 recent 每条带 symbol + cwd + source',
+    o3recent.every((e) => typeof e.symbol === 'string' && e.cwd === REPO && e.source === 'graph'),
+    JSON.stringify(o3recent[0] ?? {}).slice(0, 120))
+
+  // recentLimit 截尾：recentLimit=2，跑 5 条，recent 只留最后 2
+  const o4Ref = mkVolRef('')
+  const o4 = await mount({ enforce: 'replace', dirtyTracking: false, recentLimit: 2, stats: o4Ref }, makeStubProxy([], { project: `stub-${process.pid}-o4` }))
+  await o4.tools.get('code_setup').execute({}, withSignal(REPO))
+  for (let i = 0; i < 5; i++) {
+    await (o4.events['tools/post-execute'] ?? [])[1](grepExec(fakeAgent(`sess-${process.pid}-o4-${i}`, REPO), `symB${i}`), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
+  }
+  let o4Stats = null
+  try { o4Stats = JSON.parse(String(o4Ref.get())) } catch { }
+  const o4recent = o4Stats?.recent ?? []
+  record('O4 recentLimit=2：跑 5 条只留最后 2（环形截尾）',
+    o4recent.length === 2 && o4recent[0].symbol === 'symB3' && o4recent[1].symbol === 'symB4',
+    `len=${o4recent.length} syms=${o4recent.map((e) => e.symbol).join(',')}`)
+
+  // markPassthrough：replace 无命中时 =false 原样返回；=true 前缀标记 + 保留原 grep 输出
+  // 夹具的 nextPost 返回 {kind:'accept'} 不带内容，而真实宿主的 next() 会把原结果
+  // 原样带下去——放行路径要能被断言看见，夹具就得回显原 body。
+  const nextEcho = async () => ({ kind: 'accept', content: [{ type: 'text', text: 'RAW_GREP_BODY' }] })
+  const o5a = await mount({ enforce: 'replace', dirtyTracking: false, markPassthrough: false }, makeStubProxy([], { project: `stub-${process.pid}-o5a`, emptySearch: true }))
+  await o5a.tools.get('code_setup').execute({}, withSignal(REPO))
+  const o5aOut = await (o5a.events['tools/post-execute'] ?? [])[1](grepExec(fakeAgent(`sess-${process.pid}-o5a`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'RAW_GREP_BODY' }], isError: false }, nextEcho)
+  const o5aText = o5aOut?.content?.[0]?.text ?? ''
+  record('O5 markPassthrough=false：pass-no-hit 时原样返回（不加标记）',
+    o5aOut?.kind === 'accept' && o5aText === 'RAW_GREP_BODY',
+    JSON.stringify(o5aOut).slice(0, 80))
+
+  const o5b = await mount({ enforce: 'replace', dirtyTracking: false, markPassthrough: true }, makeStubProxy([], { project: `stub-${process.pid}-o5b`, emptySearch: true }))
+  await o5b.tools.get('code_setup').execute({}, withSignal(REPO))
+  const o5bOut = await (o5b.events['tools/post-execute'] ?? [])[1](grepExec(fakeAgent(`sess-${process.pid}-o5b`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'RAW_GREP_BODY' }], isError: false }, nextPost)
+  const o5bText = o5bOut?.content?.[0]?.text ?? ''
+  record('O5 markPassthrough=true：pass-no-hit 时前缀标记 + 保留原 grep 输出',
+    o5bOut?.kind === 'accept' && /未替换/.test(o5bText) && /原始 grep/.test(o5bText) && o5bText.includes('RAW_GREP_BODY'),
+    JSON.stringify(o5bOut).slice(0, 160))
+
+  // renderReplacement 徽标：命中分支输出首行含「替换自 结构层(图谱) · 仓 <basename>」
+  const o6 = await mount({ enforce: 'replace', dirtyTracking: false }, makeStubProxy([], { project: `stub-${process.pid}-o6` }))
+  await o6.tools.get('code_setup').execute({}, withSignal(REPO))
+  const o6Out = await (o6.events['tools/post-execute'] ?? [])[1](grepExec(fakeAgent(`sess-${process.pid}-o6`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
+  const o6Text = o6Out?.content?.[0]?.text ?? ''
+  const o6First = o6Text.split('\n')[0] ?? ''
+  record('O6 renderReplacement 首行徽标：含「替换自 结构层(图谱) · 仓 <basename> · N 行」',
+    /【替换自 结构层\(图谱\) · 仓 [^·]+ · \d+ 行】/.test(o6First), o6First)
+  record('O6 徽标带仓名 basename（本工作区末级目录名）',
+    o6First.includes(basename(REPO)), `${basename(REPO)} in: ${o6First}`)
+  record('O6 徽标说破「原始 grep 输出已丢弃」+ 指路关 replace',
+    /原始输出已丢弃/.test(o6Text) && /改回 off/.test(o6Text), o6Text.slice(0, 120))
 
   rmSync(tRepo, { recursive: true, force: true })
 
@@ -1204,6 +1431,151 @@ async function verify(profile) {
   const names = ((await listProjects()).projects ?? []).map((p) => p.name)
   record('C 本工作区出现在项目表', names.includes(indexed.project), names.join(' | '))
   record('C 另一个工作区是另一个 project', names.length >= 2 && names.some((n) => n !== indexed.project), `共 ${names.length} 个`)
+
+  // ── 臂 M1/M2：预热结果复用 + 两条腿分项预算（v0.15.0）──────────────────────
+  // M1 的实测背景：钩子里现查 list_projects 要 10.8s，而拦截预算只有 2500ms ⇒
+  // project 永远是空串 ⇒ 图谱分支（`if (project)` 守卫）一次都没被走到 ⇒ 全部
+  // 遥测里 intercept-replace:graph 恒为 0。修法：把预热那一发的**返回体**留下，
+  // 热路径先用它本地解析 project。
+  const m1Calls = []
+  const m1 = await mount({ enforce: 'replace', dirtyTracking: false },
+    makeStubProxy(m1Calls, { project: `stub-${process.pid}-m1` }))
+  await m1.tools.get('code_setup').execute({}, withSignal(REPO))
+  await new Promise((r) => setTimeout(r, 80)) // 等预热那一发落账（桩同步返回）
+  const m1Warm = m1Calls.length
+  await (m1.events['tools/post-execute'] ?? [])[1](
+    grepExec(fakeAgent(`sess-${process.pid}-m1`, REPO), 'usageSection'),
+    { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  const m1After = m1Calls.slice(m1Warm)
+  record('M1 热路径复用预热清单：不再现查 list_projects',
+    m1After.filter((c) => c.tool === 'cbm_list_projects').length === 0,
+    `热路径新增调用=${m1After.map((c) => c.tool).join(',') || '(无)'}（预热阶段共 ${m1Warm} 次）`)
+  record('M1 复用后图谱腿真的被走到（search_graph 发出）',
+    m1After.some((c) => c.tool === 'cbm_search_graph'),
+    m1After.map((c) => c.tool).join(',') || '(无)')
+  record('M1 预热失败时不缓存清单，热路径回落现查（不假装有）',
+    await (async () => {
+      const c = []
+      const m = await mount({ enforce: 'replace', dirtyTracking: false },
+        makeStubProxy(c, { project: `stub-${process.pid}-m1f`, listNotFound: true }))
+      await m.tools.get('code_setup').execute({}, withSignal(REPO))
+      await new Promise((r) => setTimeout(r, 80))
+      const before = c.length
+      await (m.events['tools/post-execute'] ?? [])[1](
+        grepExec(fakeAgent(`sess-${process.pid}-m1f`, REPO), 'usageSection'),
+        { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+      return c.slice(before).filter((x) => x.tool === 'cbm_list_projects').length > 0
+    })(),
+    '预热返回 not-found ⇒ 热路径必须现查一次（缓存不撒谎）')
+  // 2026-10-24 实机暴露的洞：宿主刚起来时第一发 list_projects 打在**懒建**的 cbm
+  // 连接上，55ms 就回错；而预热只打一次 ⇒ 清单永远空 ⇒ M1 白做（每次符号 grep 都
+  // 现查 10.8s，必超预算）。这条臂锁"失败会重试"。测试缝把间隔压到 40/80ms。
+  {
+    const rtCalls = []
+    const rt = await mount({ enforce: 'replace', dirtyTracking: false },
+      makeStubProxy(rtCalls, { project: `stub-${process.pid}-rt`, listNotFound: true }))
+    process.env.DSH_CBM_LISTING_RETRY_MS = '40,80'
+    try {
+      await rt.tools.get('code_setup').execute({}, withSignal(REPO))
+      // 不拿"基线差值"判（code_setup 慢的时候三次尝试可能都已经跑完，基线就已是 3）。
+      // 桩恒定失败 ⇒ 这个 mount 的 list_projects 总次数就是尝试次数，轮询到稳定再断言。
+      let attempts = 0
+      for (let i = 0; i < 20 && attempts < 2; i++) {
+        await new Promise((r) => setTimeout(r, 50))
+        attempts = rtCalls.filter((c) => c.tool === 'cbm_list_projects').length
+      }
+      record('M1 预热失败会重试（启动竞态能自愈，不把 M1 钉死）', attempts >= 2, `list_projects 尝试次数=${attempts}`)
+    } finally { delete process.env.DSH_CBM_LISTING_RETRY_MS }
+  }
+  // 2026-10-24 19:19 实机：预热在跑时热路径又发了一发 list_projects，两发抢同一个
+  // 守护进程 → 后到的排队 → 第一次 code_find 20s 整点超时。修法是**共享**在飞的那
+  // 一发。这条臂钉住"只发一次"且"共享等待期间就能拿到清单"。
+  {
+    const raceCalls = []
+    const race = await mount({ enforce: 'replace', dirtyTracking: false },
+      makeStubProxy(raceCalls, { project: `stub-${process.pid}-race`, warmSlowMs: 300 }))
+    const raceSetup = await race.tools.get('code_setup').execute({}, withSignal(REPO)) // 点火：预热在飞
+    record('M1 预热在飞时报表报出 pending(Ns)（状态不再隐形）',
+      /warm=pending\(\d+s\)/.test(raceSetup), /warm=\S+/.exec(raceSetup)?.[0] ?? '(没有 warm 字段)')
+    const raceOut = await race.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: fakeAgent(`sess-${process.pid}-race`, REPO), signal: sig() })
+    const listCalls = raceCalls.filter((c) => c.tool === 'cbm_list_projects').length
+    record('M1 预热在飞时共享那一发（不并发第二发 list_projects）',
+      listCalls === 1 && /stubSymbol/.test(String(raceOut?.text ?? '')),
+      `list_projects 调用数=${listCalls} out=${String(raceOut?.text ?? raceOut?.error ?? '').slice(0, 80)}`)
+  }
+
+  // M2：两条腿分项预算。旧的共用 2500ms 预算下，图谱腿（实测 ~5000ms）必然超时。
+  const m2Calls = []
+  const m2 = await mount({ enforce: 'replace', dirtyTracking: false, graphBudgetMs: 4000 },
+    makeStubProxy(m2Calls, { project: `stub-${process.pid}-m2`, slow: true, slowMs: 3000 }))
+  await m2.tools.get('code_setup').execute({}, withSignal(REPO))
+  await new Promise((r) => setTimeout(r, 80))
+  const m2Swap = await (m2.events['tools/post-execute'] ?? [])[1](
+    grepExec(fakeAgent(`sess-${process.pid}-m2`, REPO), 'usageSection'),
+    { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  record('M2 图谱腿有自己的预算：慢引擎 3000ms 在 4000ms 预算内换成命中',
+    /stubSymbol/.test(m2Swap?.content?.[0]?.text ?? ''), JSON.stringify(m2Swap).slice(0, 90))
+
+  const m2bCalls = []
+  const m2b = await mount({ enforce: 'replace', dirtyTracking: false, graphBudgetMs: 0, interceptBudgetMs: 1500 },
+    makeStubProxy(m2bCalls, { project: `stub-${process.pid}-m2b`, slow: true, slowMs: 3000 }))
+  await m2b.tools.get('code_setup').execute({}, withSignal(REPO))
+  await new Promise((r) => setTimeout(r, 80))
+  const m2bSwap = await (m2b.events['tools/post-execute'] ?? [])[1](
+    grepExec(fakeAgent(`sess-${process.pid}-m2b`, REPO), 'usageSection'),
+    { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+  record('M2 graphBudgetMs=0 ⇒ 跟随 interceptBudgetMs（老配置的唯一出口，且默认 6000 不偷跑）',
+    m2bSwap?.content === undefined, JSON.stringify(m2bSwap).slice(0, 90))
+
+  // M4′（v0.15.0）：图谱腿失败**不再**转语义腿。这条臂在 v0.15.0 之前断言的是
+  // 反面（"语义腿仍能替换"）——那条行为被拆掉了，理由见 index.js replace 路径的
+  // 注释：裸标识符喂向量检索是最差输入，而且 6s 超时再叠 4s 让一次 grep 白等 10s。
+  const zgCliPresent = existsSync(join(DSH_HOME, 'vendor', 'zvec-grep', 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli', 'index.js'))
+  if (zgCliPresent) {
+    const m2dCalls = []
+    const m2d = await mount({ enforce: 'replace', dirtyTracking: false, zgEnabled: true, graphBudgetMs: 200 },
+      makeStubProxy(m2dCalls, { project: `stub-${process.pid}-m2d`, errorSearch: true }))
+    await m2d.tools.get('code_setup').execute({}, withSignal(REPO))
+    await new Promise((r) => setTimeout(r, 80))
+    const m2dSwap = await (m2d.events['tools/post-execute'] ?? [])[1](
+      grepExec(fakeAgent(`sess-${process.pid}-m2d`, REPO), 'usageSection'),
+      { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
+    record('M4′ 图谱腿失败不再转语义腿：一次 grep 只等一腿（zg 一枪不发）',
+      m2dSwap?.content === undefined && !m2dCalls.some((x) => x.tool === 'zg_zvec_grep_search'),
+      `calls=${m2dCalls.map((x) => x.tool).join(',') || '(无)'}`)
+  } else {
+    record('M4′ 图谱腿失败不再转语义腿：一次 grep 只等一腿（zg 一枪不发）', true, '跳过：语义层包未装')
+  }
+
+  // ── 臂 C：语义层封装工具 code_search（v0.15.0 M4b）────────────────────────
+  // 语义层退出替换钩子之后（M4'），它是唯一的"正路"入口。三条契约：
+  // ① root/limit 由插件填（模型不必知道必填参数与绝对路径）；
+  // ② 输出必须自称"语义近似、不是锚点"（否则模型会拿片段当 file:line）；
+  // ③ 前提不成立即 throw（未开启 / 本仓无索引），不静默降级成 grep。
+  const csCalls = []
+  const csWs = join(tmpdir(), `cbm-cs-${process.pid}`)
+  const csNoIdxWs = join(tmpdir(), `cbm-cs-noidx-${process.pid}`)
+  mkdirSync(join(csWs, '.zvec-grep'), { recursive: true })
+  mkdirSync(csNoIdxWs, { recursive: true })
+  try {
+    const cs = await mount({ telemetry: false, zgEnabled: true }, makeStubProxy(csCalls, { project: `stub-${process.pid}-cs` }))
+    await cs.tools.get('code_setup').execute({}, withSignal(csWs))
+    const csExec = (ws) => ({ agent: fakeAgent(`sess-${process.pid}-cs-${basename(ws)}`, ws), signal: sig() })
+    const csOut = await cs.tools.get('code_search').execute({ query: 'how are retries handled' }, csExec(csWs))
+    record('C code_search 走代理调 zg，root 由插件填（模型不必知道必填参数）',
+      csCalls.some((x) => x.tool === 'zg_zvec_grep_search' && x.args.root === csWs && /retries/.test(String(x.args.query))),
+      JSON.stringify(csCalls.find((x) => x.tool === 'zg_zvec_grep_search') ?? null).slice(0, 150))
+    record('C code_search 输出自称"语义近似、不是锚点"（M5 的同一条纪律）',
+      /语义近似/.test(csOut?.text ?? '') && /不能当 file:line/.test(csOut?.text ?? ''),
+      String(csOut?.text ?? '(空)').slice(0, 110))
+    let csNoIdx = '(未抛错)'
+    try { await cs.tools.get('code_search').execute({ query: 'retry' }, csExec(csNoIdxWs)) } catch (error) { csNoIdx = String(error?.message ?? error) }
+    record('C 本仓无 .zvec-grep ⇒ 直接给建索引的处方，不白打注定 INDEX_MISSING 的一枪',
+      /语义索引/.test(csNoIdx) && /index/.test(csNoIdx) && /gitignore/.test(csNoIdx), csNoIdx.slice(0, 130))
+  } finally {
+    try { rmSync(csWs, { recursive: true, force: true }) } catch { /* 尽力 */ }
+    try { rmSync(csNoIdxWs, { recursive: true, force: true }) } catch { /* 尽力 */ }
+  }
 
   // ── 臂 D：前提不成立即 throw（不静默降级）──────────────────────────────────
   const savedHome = process.env.DSH_HOME

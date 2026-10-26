@@ -22,9 +22,9 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const name = 'dsh-codebase-memory'
@@ -44,6 +44,39 @@ const PROXY_TOOL = 'mcp__cbm__mcp'
 
 /** 触发层（docs/design-v2.md）的常量。跨平台：内置工具是裸名小写（官方 tool-fs-search README 与实装一致）。 */
 const ENFORCE_MODES = ['off', 'deny-once', 'deny', 'replace']
+/**
+ * 两条检索腿各自的钩子预算（ms）。为什么要拆：一个 interceptBudgetMs 管两腿时，
+ * 图谱实测 ~5000ms、语义层热态 ~376ms，2500ms 的共同预算下**两腿都进不来**——
+ * 图谱腿超时 ⇒ project 空串 ⇒ 图谱分支整段跳过；语义腿只在自己热了才够用。
+ * 拆开之后每一腿按自己的真实成本定价：图谱给足，语义层用小预算（它热得很快）。
+ * interceptBudgetMs 保留为「跟随」出口：把新项设成 0 就回到它（老配置的唯一出口）。
+ */
+const DEFAULT_GRAPH_BUDGET_MS = 8000
+const DEFAULT_ZG_BUDGET_MS = 4000
+/** 预热缓存的 project 清单有效期：root_path 会变，过期就后台刷（热路径不现查）。 */
+const PROJECTS_LISTING_TTL_MS = 10 * 60 * 1000
+/**
+ * 预热失败后的重试间隔（ms）。为什么必须重试：宿主的 cbm 连接是**懒建**的，
+ * 宿主刚起来时第一发 list_projects 常常打在"适配层/守护进程还在加载"上——
+ * 实测 2026-10-24 18:01 那次：ok=false，55ms 就回了错。这不是配置问题，重试即好。
+ * 不重试的后果是 M1 直接失效：清单空 ⇒ 每次符号 grep 都现查（10.8s > 预算）
+ * ⇒ 图谱腿照样进不去，而 `state.warm` 已经把这一发钉成"打过一次"了。
+ */
+const LISTING_RETRY_DELAYS_MS = [5000, 15000, 45000]
+/** 预热第一发的延后（ms）：避开宿主启动瞬间的加载窗口（见上）。测试缝同名可覆盖。 */
+const WARM_DELAY_MS = Number.parseInt(process.env.DSH_CBM_WARM_DELAY_MS ?? '', 10) >= 0
+  ? Number.parseInt(process.env.DSH_CBM_WARM_DELAY_MS, 10)
+  : 1500
+
+/** 预热重试间隔；测试缝 `DSH_CBM_LISTING_RETRY_MS`（逗号分隔毫秒）可覆盖。 */
+function listingRetryDelays() {
+  const raw = process.env.DSH_CBM_LISTING_RETRY_MS
+  if (raw) {
+    const list = String(raw).split(',').map((x) => Number.parseInt(x, 10)).filter((n) => Number.isFinite(n) && n >= 0)
+    if (list.length) return list
+  }
+  return LISTING_RETRY_DELAYS_MS
+}
 /** 语义检索层（zvec-grep）的 MCP 工具集：agent 只暴露 zvec_grep_search；rg/index/status 走 CLI 与我们的后台补刷。 */
 const ZG_TOOLSETS = ['agent', 'full']
 /** 语义层包的钉死版本。与 scripts/install-zg.mjs 是两份字面量（仓库没有本地
@@ -87,7 +120,13 @@ export const Config = z.object({
   // bootstrap 写的）等仍留在文件级。其余普通字段改了要重启。
   enforce: z.string().default('off').volatile(),
   interceptTools: z.string().default('grep,glob').volatile(),
-  interceptBudgetMs: z.number().default(2500).volatile(),
+  // v0.15.0：interceptBudgetMs 的默认从 2500 改成 0，含义从「整体预算」变成
+  // 「未设」——0 时两条腿各按自己的默认预算走（结构层 6000 / 语义层 4000）。
+  // 显式设过它的老 profile 不受影响（它优先于新项），没设过的才吃到新默认。
+  interceptBudgetMs: z.number().default(0).volatile(),
+  // 两条检索腿各自的预算；0 = 跟随 interceptBudgetMs（它也是 0 时用各自的默认）。
+  graphBudgetMs: z.number().default(0).volatile(),
+  zgBudgetMs: z.number().default(0).volatile(),
   contextHint: z.boolean().default(true).volatile(),
   telemetry: z.boolean().default(true).volatile(),
   // stats 是**插件→设置页**的读数通道，不是用户配置：pushStats 把计数推进这个引用，
@@ -97,6 +136,16 @@ export const Config = z.object({
   stats: z.string().default('').volatile(),
   dirtyTracking: z.boolean().default(true).volatile(),
   dirtyRefreshCooldownSec: z.number().default(120),
+  // ── 观测（v0.13.4）：日志保留期 + 效果留痕 + 未替换标记 ──────────────────────
+  // logRetentionDays：telemetry.log 按天轮转，超这个天数的旧文件删掉（默认 7 天）。
+  // 只按**文件名日期**判断、不逐行解析——逐行会扫整个文件，热路径上不值。
+  // recentLimit：「效果」环形（最近 N 条替换/拒绝决策，带命中文本片段）的上限。
+  // markPassthrough：replace 档下没换成的 grep（no-hit/dirty/failed）要不要回一个
+  // 「未替换」标记。默认 false = 只靠页上的 recent 标 pass-* 解释，grep 返回值不污染；
+  // 打开后模型自己也能看清哪些 grep 是被替换前的原始结果。
+  logRetentionDays: z.number().default(7).volatile(),
+  recentLimit: z.number().default(100).volatile(),
+  markPassthrough: z.boolean().default(false).volatile(),
   // ── 语义检索层（zvec-grep，可选，docs/design-v2.md 第 9 节）─────────────────
   // zgEnabled 标 volatile：设置页的开关写它（v0.11.0）。诚实靠状态机而不是藏开关——
   // cbm.json 清单仍是 bootstrap 时写的、adapter 进程加载清单要重拉（钉的 ≥0.0.6 有 watcher 秒级自愈；老进程靠 restart-adapter），所以热改只翻转
@@ -121,6 +170,31 @@ const live = (value) => (value && typeof value.get === 'function' ? value.get() 
 
 /** 把 volatile 字段挂成 getter：读点永远拿到当前值，而不是 apply 时的快照。 */
 const defineLive = (cfg, key, read) => Object.defineProperty(cfg, key, { get: read, enumerable: true, configurable: true })
+
+/**
+ * 两条检索腿的钩子预算（ms）。优先级：**具体项 > 0 → 旧的整体预算 > 0 → 各自的默认**。
+ * 为什么旧字段（interceptBudgetMs）优先于新项的默认值：它是 2026-08 就存在的
+ * 字段，老 profile 显式设过它（"我把检索等压到 60ms"），新默认值不能把它顶掉。
+ * 而它自己的默认改成 0（=未设），于是没设过它的 profile 自然吃到分项默认。
+ *
+ * 图谱腿为什么是 8000 而不是更小：实测**经适配层代理**的一次图谱查询要 5.1s
+ * （引擎自己答只要 13ms —— 那 5s 是代理层的固定开销）。6000 只剩 900ms 余量，
+ * 一次抖动就超时；8000 留 3s 余量。语义层热态 376ms、冷启 3.3s ⇒ 4000 够。
+ */
+const budgetGraph = (cfg) => {
+  const specific = Number(live(cfg.graphBudgetMs) ?? 0)
+  if (specific > 0) return specific
+  const legacy = Number(live(cfg.interceptBudgetMs) ?? 0)
+  if (legacy > 0) return legacy
+  return DEFAULT_GRAPH_BUDGET_MS
+}
+const budgetZg = (cfg) => {
+  const specific = Number(live(cfg.zgBudgetMs) ?? 0)
+  if (specific > 0) return specific
+  const legacy = Number(live(cfg.interceptBudgetMs) ?? 0)
+  if (legacy > 0) return legacy
+  return DEFAULT_ZG_BUDGET_MS
+}
 
 /**
  * cosmokit 的 volatile 引用写符号。Symbol.for 走全局注册表，跨模块副本同键
@@ -188,12 +262,16 @@ function normalize(config = {}) {
   if (enforceRaw !== undefined && !ENFORCE_MODES.includes(enforceRaw)) {
     cfg.notes.push(`enforce="${enforceRaw}" 非法，已按 off 处理（可选：${ENFORCE_MODES.join('|')}；advise 的事件注入已于 2026-10-08 撤回）`)
   }
-  positiveInt('interceptBudgetMs', live(config.interceptBudgetMs), 2500, cfg.notes)
+  positiveInt('interceptBudgetMs', live(config.interceptBudgetMs), 0, cfg.notes)
+  positiveInt('graphBudgetMs', live(config.graphBudgetMs), 0, cfg.notes)
+  positiveInt('zgBudgetMs', live(config.zgBudgetMs), 0, cfg.notes)
   boolOf(live(config.telemetry), true, cfg.notes, 'telemetry')
   boolOf(live(config.contextHint), true, cfg.notes, 'contextHint')
   boolOf(live(config.dirtyTracking), true, cfg.notes, 'dirtyTracking')
   defineLive(cfg, 'enforce', () => (ENFORCE_MODES.includes(live(config.enforce)) ? live(config.enforce) : 'off'))
-  defineLive(cfg, 'interceptBudgetMs', () => positiveInt('interceptBudgetMs', live(config.interceptBudgetMs), 2500, []))
+  defineLive(cfg, 'interceptBudgetMs', () => positiveInt('interceptBudgetMs', live(config.interceptBudgetMs), 0, []))
+  defineLive(cfg, 'graphBudgetMs', () => positiveInt('graphBudgetMs', live(config.graphBudgetMs), 0, []))
+  defineLive(cfg, 'zgBudgetMs', () => positiveInt('zgBudgetMs', live(config.zgBudgetMs), 0, []))
   defineLive(cfg, 'telemetry', () => boolOf(live(config.telemetry), true, [], 'telemetry'))
   // v0.9.0：这三个也上了设置页 ⇒ 同一纪律。interceptTools 是决策点现读的名单
   // （csv 对任何字符串都成立，非法只可能是"写错工具名"，那本来就是空名单语义）。
@@ -201,6 +279,13 @@ function normalize(config = {}) {
   defineLive(cfg, 'contextHint', () => boolOf(live(config.contextHint), true, [], 'contextHint'))
   defineLive(cfg, 'dirtyTracking', () => boolOf(live(config.dirtyTracking), true, [], 'dirtyTracking'))
   defineLive(cfg, 'zgEnabled', () => boolOf(live(config.zgEnabled), false, [], 'zgEnabled'))
+  // v0.14.0 的三个观测字段（按天轮转 / recent 环形上限 / 未替换标记）。它们在
+  // Config 里标了 volatile、页面也能写，但**归一化时忘了搬进 cfg** ⇒ 运行时恒为
+  // undefined：sweepTelemetry 直接 early return（超期日志永不删）、slice(-undefined)
+  // 等于不截尾、markPassthrough 永远 falsy。三条都是"页面能改、代码不读"的静默洞。
+  defineLive(cfg, 'logRetentionDays', () => positiveInt('logRetentionDays', live(config.logRetentionDays), 7, []))
+  defineLive(cfg, 'recentLimit', () => positiveInt('recentLimit', live(config.recentLimit), 100, []))
+  defineLive(cfg, 'markPassthrough', () => boolOf(live(config.markPassthrough), false, [], 'markPassthrough'))
   cfg.adapterMjs = join(cfg.adapterDir, 'node_modules', '@njuptlzf', 'mcp-adapter', 'mcp-server.mjs')
   cfg.adapterConfig = join(cfg.adapterDir, 'cbm.json')
   return cfg
@@ -634,10 +719,28 @@ async function bootstrap(ctx, cfg, state, signal, { force = false } = {}) {
   // 一发要跑几分钟的后台投资若被回合结束的 abort 掐掉，就等价于旧 race 误报（同一族）。
   if (state.ok && !state.warm) {
     state.warm = true
+    state.warmStartedAt = Date.now()
     const t0 = Date.now()
-    cbmCall(ctx, {}, 'list_projects', {}, 0)
-      .then((r) => { state.warmOk = r.ok; telemetry(cfg, state, 'cbm-warm', { ok: r.ok, ms: Date.now() - t0 }) })
-      .catch(() => { state.warmOk = false; telemetry(cfg, state, 'cbm-warm', { ok: false, ms: Date.now() - t0 }) })
+    // 延后 1.5s 再打第一发：宿主刚起来时适配层/守护进程还在加载，2026-10-24 18:01
+    // 实机第一发 55ms 就回了错（清单因此永远是空的，M1 直接白做）。延后 + 失败重试
+    // 两道保险。定时器 unref：预热是后台投资，不该把宿主进程钉住。
+    // 延后为 0 时**同步**点火（不绕定时器）：测试缝把它设成 0 就是要确定性。
+    const fire = () => {
+      refreshProjectsListing(ctx, cfg, state)
+        .then((r) => {
+          state.warmOk = r.ok
+          // 失败必须带原因：那次只有 ok:false/55ms 没有原文，只能靠时间线反推是启动竞态。
+          // 代理会把底层错误包成普通文本，截断着留证就够定位。
+          telemetry(cfg, state, 'cbm-warm', { ok: r.ok, ms: Date.now() - t0, ...(r.ok ? {} : { err: String(r.text ?? '').slice(0, 160) }) })
+        })
+        .catch(() => { state.warmOk = false; telemetry(cfg, state, 'cbm-warm', { ok: false, ms: Date.now() - t0 }) })
+    }
+    if (WARM_DELAY_MS > 0) {
+      const kick = setTimeout(fire, WARM_DELAY_MS)
+      kick.unref?.()
+    } else {
+      fire()
+    }
   }
   // 进程轴（v0.12.0）：清单写了 ≠ 活进程加载了。bootstrap 里量一次新鲜度（await——
   // 枚举进程秒级，报表第一次就要有结论，不能"待测"），结果进报表和 stats（设置页 stale 行）。
@@ -788,13 +891,13 @@ function report(cfg, state) {
     `索引引擎(①): ${state.cbm}  ${state.cbmPath || '(未找到)'}${state.cbmVersion ? '  ' + state.cbmVersion : ''}`,
     `引擎实测: 实测通过 ${testedEngine() || '(未声明)'}；当前 ${state.cbmVersion || '(未探测)'}${engineVerdict(state.cbmVersion) === 'untested' ? '  ⚠ 超出实测范围——工具面可能已变，跑 npm run check' : ''}`,
     `清单: ${state.configPath ?? '(未写)'}  exclude=${JSON.stringify(EXCLUDE_TOOLS)}`,
-    `代理工具: ${PROXY_TOOL}  bootstrap=${cfg.bootstrap}  adapterVersion=${cfg.adapterVersion}  warm=${state.warm ? (state.warmOk === true ? 'ok' : state.warmOk === false ? 'failed' : 'pending') : 'off'}`,
+    `代理工具: ${PROXY_TOOL}  bootstrap=${cfg.bootstrap}  adapterVersion=${cfg.adapterVersion}  warm=${state.warm ? (state.warmOk === true ? 'ok' : state.warmOk === false ? 'failed' : `pending(${state.warmStartedAt ? Math.round((Date.now() - state.warmStartedAt) / 1000) : 0}s)`) : 'off'}`,
     `适配层进程: ${adapterLine(state)}`,
-    `触发层: wrapper=${cfg.wrapperTools ? 'on' : 'off'}  enforce=${cfg.enforce}  intercept=${cfg.interceptTools.join('+') || '(无)'}  budget=${cfg.interceptBudgetMs}ms  dirty=${cfg.dirtyTracking ? 'on' : 'off'}(冷却 ${cfg.dirtyRefreshCooldownSec}s)  context=${cfg.contextHint ? 'on' : 'off'}`,
+    `触发层: wrapper=${cfg.wrapperTools ? 'on' : 'off'}  enforce=${cfg.enforce}  intercept=${cfg.interceptTools.join('+') || '(无)'}  budget=graph:${budgetGraph(cfg)}ms/zg:${budgetZg(cfg)}ms(intercept=${cfg.interceptBudgetMs > 0 ? `${cfg.interceptBudgetMs}ms` : '未设'})  dirty=${cfg.dirtyTracking ? 'on' : 'off'}(冷却 ${cfg.dirtyRefreshCooldownSec}s)  context=${cfg.contextHint ? 'on' : 'off'}`,
     `语义层(zg): ${state.zgInstalling ? 'installing' : state.zg}  包=${zgInstalled ? '已装' : '未装'}  页面开关=${cfg.zgEnabled ? 'on' : 'off'}  toolset=${cfg.zgToolset}  ${cfg.zgCli}${zgSuffix}`,
     // 六个即时热字段 + zgEnabled（v0.11.0 起页面可写）；清单重建不用重启宿主——
     // code_setup {action:"restart-adapter"} 重拉适配层即可（宿主监督器自动重生进程）。
-    '热改: enforce / telemetry / contextHint / dirtyTracking / interceptBudgetMs / interceptTools → 设置 → 插件 → dsh-codebase-memory → codebase-memory 行「配置」（不用重启）；zgEnabled 也在页面上改，重启适配层进程（restart-adapter）或重启宿主后进清单；其余字段改 profile 的 cordis.patch.yml 并重启',
+    '热改: enforce / telemetry / contextHint / dirtyTracking / interceptBudgetMs / interceptTools / graphBudgetMs / zgBudgetMs → 设置 → 插件 → dsh-codebase-memory → codebase-memory 行「配置」（不用重启）；zgEnabled 也在页面上改，重启适配层进程（restart-adapter）或重启宿主后进清单；其余字段改 profile 的 cordis.patch.yml 并重启',
     `遥测计数(跨重启累计): ${Object.entries(state.counts).map(([k, v]) => `${k}=${v}`).join(' ') || '(无事件)'}`,
     `auto_index: ${state.autoIndex || '(未设置)'}（期望 ${cfg.autoIndex ? 'true' : 'false'}；机器级共享配置，只补"无索引的新项目"，不刷新陈旧坐标）`,
     syncStatusLine(),
@@ -803,6 +906,27 @@ function report(cfg, state) {
   if (state.notes.length) lines.push('notes: ' + state.notes.join(' / '))
   if (state.lastError) lines.push('error: ' + state.lastError)
   if (state.cbm !== 'ready') lines.push('', cbmInstallHint(state))
+  // 按仓库索引状态（v0.13.4）：只有本进程见过的 cwd 才在这里列——没见过的仓库
+  // 本插件一无所知，不假装知道。cbm=是否已入图（cwd 在 projectsByCwd 里），
+  // zg=该仓 .zvec-grep 目录是否存在。
+  const cwds = new Set([
+    ...state.projectsByCwd.keys(),
+    ...state.sessions.values().map((s) => s?.cwd).filter(Boolean),
+  ])
+  if (cwds.size) {
+    lines.push('')
+    lines.push(`仓库索引状态(本进程见过 ${cwds.size} 个 cwd):`)
+    for (const cwd of [...cwds].sort()) {
+      const project = state.projectsByCwd.get(cwd) || ''
+      const zg = existsSync(join(cwd, '.zvec-grep'))
+      const hit = state.repos.get(cwd)
+      const r = hit?.replace || {}
+      const d = hit?.deny || {}
+      const repl = `${(r['intercept-replace'] ?? 0)}`
+      const dny = `${(d['intercept-deny'] ?? 0)}`
+      lines.push(`  ${basename(cwd)}  cbm=${project || '未入图'}  zg=${zg ? '有索引' : '无索引'}  替换=${repl}  拒绝=${dny}`)
+    }
+  }
   return lines.join('\n')
 }
 
@@ -843,12 +967,15 @@ function usageSection(state) {
   ]
   // 语义路由段只在 zg 真的 ready 时出现：图谱引擎（0.11.0 实测）没有任何向量检索，
   // 这段是唯一能说出"自然语言/文档检索"的地方——zg 没装就一个字都不提，不画饼。
+  // v0.15.0：语义层从替换钩子里退出来了（M4'），所以这段要同时说清"它不参与 grep
+  // 替换"——否则模型会以为 grep 被换掉的可能是语义结果，从而不敢信替换后的坐标。
   if (state.zg === 'ready') {
     lines.push(
       '',
-      '**语义/文档检索**（图谱不做向量，这是补位不是重复）：代理工具调 `zg_zvec_grep_search`，',
-      'args {"root":"<工作区绝对路径>","query":"自然语言描述","limit":8}——root 必填；非代码文件（md/配置）也能命中。',
-      '找符号与调用关系仍用 code_find / code_callers，精确字面量仍用 grep——三者各有分工，别互相顶替。',
+      '**语义/文档检索**（图谱只索引代码，这一层补的是自然语言问题与 md/配置/文档）：',
+      '首选 `code_search("自然语言描述")`——root 与 limit 由插件填；没有这个封装时才用代理工具调 `zg_zvec_grep_search`（args 必须带 root）。',
+      '它回的是**近似片段、没有坐标**：要 file:line 用 code_find，要精确字面量用 grep——三者各有分工，别互相顶替。',
+      '注意：enforce=replace 只换**符号类** grep（走图谱）；语义层不参与 grep 替换——它答的是问题，不是正则。',
     )
   }
   return lines.join('\n')
@@ -1121,16 +1248,95 @@ export function projectFromListing(text, cwd) {
 }
 
 /**
- * project 名：会话缓存 → code_index 落过的记录 → 现查 list_projects。
+ * 拉一次项目清单，并**把返回体留下**（v0.15.0 M1）。
+ *
+ * 之前这一发只用来报"引擎热了没有"（ok/ms），返回文本直接丢掉——于是热路径上的
+ * projectFor 每次都要现查一次 list_projects，而实测那要 10.8s（钩子预算只有
+ * 2500ms）⇒ project 永远是空串 ⇒ 图谱分支（replace 路径里的 `if (project)` 守卫）
+ * 一次都没被走到。现在文本留在 state.projectsListing 里，热路径先用
+ * projectFromListing 解析（纯本地、零成本），过期就在后台刷，不占用钩子预算。
+ *
+ * budget=0 = 不带秒表，等真实 settle（预热是后台投资，不是需要回话的同步查询）。
+ */
+function refreshProjectsListing(ctx, cfg, state, attempt = 0) {
+  // 共享在飞的那一发：v0.15.0 实机教训（2026-10-24 19:19）——预热那一发正在跑时
+  // 热路径又发了一发，两发 list_projects 抢同一个守护进程，后到的排队，20s 预算
+  // 整点超时（第一次 code_find 就是这么失败的）。共享 promise 就只占引擎一次。
+  if (state.listingPromise) return state.listingPromise
+  const p = cbmCall(ctx, {}, 'list_projects', {}, 0)
+    .then((r) => {
+      if (r.ok && r.text) {
+        state.projectsListing = r.text
+        state.projectsListingAt = Date.now()
+        return r
+      }
+      // 启动竞态（见 LISTING_RETRY_DELAYS_MS 注释）：排一次重试，不阻塞任何人。
+      // 定时器 unref：后台投资不该把宿主进程钉住。
+      const delays = listingRetryDelays()
+      if (attempt < delays.length) {
+        const timer = setTimeout(() => {
+          void refreshProjectsListing(ctx, cfg, state, attempt + 1).catch(() => {})
+        }, delays[attempt])
+        timer.unref?.()
+      }
+      return r
+    })
+    .catch(() => ({ ok: false, text: '' }))
+  state.listingPromise = p
+  p.finally(() => {
+    if (state.listingPromise === p) { state.listingPromise = null; state.listingRefreshing = false }
+  })
+  return p
+}
+
+/**
+ * project 名：会话缓存 → code_index 落过的记录 → 预热清单（本地解析）→ 现查 list_projects。
  * 返回 `{ project, reason }`：查不到时 reason 必须区分**为什么**查不到——
  * 实测教训（v0.10.0 验收）：引擎冷启动时 list_projects 会失败，旧版把"查询失败"
  * 和"不在表里"都报成"还没进代码图"，把一个假消息塞进了真错误里，排障的人被带去
  * 跑 code_index，而真正的原因（代理层报错/超时）一个字都没露。
  */
-async function projectFor(ctx, exec, cfg, state, session, cwd, budgetMs = cfg.interceptBudgetMs) {
+async function projectFor(ctx, exec, cfg, state, session, cwd, budgetMs = budgetGraph(cfg)) {
   if (session.project) return { project: session.project, reason: '' }
   const cached = state.projectsByCwd.get(cwd)
   if (cached) { session.project = cached; return { project: cached, reason: '' } }
+  // v0.15.0 M1：先用预热留下的清单解析（纯本地、零成本）。过期就在后台刷一把，
+  // 热路径不等——现查要 8.7~10.8s，钩子预算根本付不起。
+  const listing = state.projectsListing
+  if (!listing) {
+    // 清单空：预热多半还在跑。**共享它**，绝不再发第二发（两发抢守护进程=排队超时）。
+    const inFlight = state.listingPromise
+    if (inFlight) {
+      const waited = await withBudget(budgetMs, () => inFlight)
+      if (waited?.ok && waited.text) {
+        const fromWarm = projectFromListing(waited.text, cwd)
+        if (fromWarm) {
+          session.project = fromWarm
+          state.projectsByCwd.set(cwd, fromWarm)
+          bumpCount(cfg, state, 'list-projects:cache-hit')
+          return { project: fromWarm, reason: '' }
+        }
+      }
+      if (waited && !waited.ok) {
+        return { project: '', reason: `预热那一发 list_projects 失败（${waited.timeout ? '超时' : '错误'}）：${String(waited.text || '(空输出)').slice(0, 120)}` }
+      }
+      // 预算内没等到：给出**可执行**的处方，而不是让模型等满 20s 换一句"超时"。
+      const ran = state.warmStartedAt ? Math.round((Date.now() - state.warmStartedAt) / 1000) : 0
+      return { project: '', reason: `引擎正在预热（list_projects 还没跑完${ran ? `，已跑 ${ran}s` : ''}）——先跑 code_index（项目级、约 10s），或稍后重试` }
+    }
+    void refreshProjectsListing(ctx, cfg, state).catch(() => {})
+  } else {
+    if (Date.now() - (state.projectsListingAt || 0) >= PROJECTS_LISTING_TTL_MS) {
+      void refreshProjectsListing(ctx, cfg, state).catch(() => {})
+    }
+    const fromListing = projectFromListing(listing, cwd)
+    if (fromListing) {
+      session.project = fromListing
+      state.projectsByCwd.set(cwd, fromListing)
+      bumpCount(cfg, state, 'list-projects:cache-hit')
+      return { project: fromListing, reason: '' }
+    }
+  }
   const r = await cbmCall(ctx, exec, 'list_projects', {}, budgetMs)
   if (!r.ok) {
     // 事故教训（v0.12.0）：not-found 是"清单没被活进程加载"的签名，不是查询失败——
@@ -1143,7 +1349,14 @@ async function projectFor(ctx, exec, cfg, state, session, cwd, budgetMs = cfg.in
     return { project: '', reason: `list_projects 查询失败（${r.timeout ? '超时' : '代理报错'}）：${(r.text || '').trim().slice(0, 120) || '(空输出)'}${axis}` }
   }
   const found = projectFromListing(r.text, cwd)
-  if (found) { session.project = found; state.projectsByCwd.set(cwd, found); return { project: found, reason: '' } }
+  if (found) {
+    session.project = found
+    state.projectsByCwd.set(cwd, found)
+    state.projectsListing = r.text
+    state.projectsListingAt = Date.now()
+    telemetry(cfg, state, 'list-projects:hot', { cwd })
+    return { project: found, reason: '' }
+  }
   return { project: '', reason: `项目表里没有 cwd=${cwd}` }
 }
 
@@ -1165,6 +1378,36 @@ const ledgerStale = (sess) => (sess.dirty.size > 0 ? 'stale' : 'fresh')
 
 /** 遥测：一行 JSON。写失败绝不影响会话（与 refreshLog 同一原则）。 */
 const TELEMETRY_MAX_BYTES = 512 * 1024
+
+/**
+ * 日志按天轮转（v0.13.4）：文件名带本地日期，`logRetentionDays` 之前的旧文件清掉。
+ * 只按**文件名日期**判断、不逐行解析——逐行要扫整个文件，而遥测在工具调用热路径上。
+ */
+const dayStamp = (d = new Date()) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+/**
+ * 遥测目录。测试缝 `DSH_CBM_TELEMETRY_DIR` 可把它挪走——验收会跑几十次 mount、
+ * 每次都可能写 cbm-warm/intercept-replace，写进真实目录就把现场数据淹了
+ * （2026-10-24 实测：真实日志里 283 条 intercept-replace 全是桩，`project:"stub-*"`）。
+ * 显式传 adapterDir 的臂（W2/U5/O1）不受影响：它们的 mount 把缝指回自己的目录。
+ */
+const telemetryDir = (cfg) => process.env.DSH_CBM_TELEMETRY_DIR || cfg.adapterDir
+const telemetryPath = (cfg, d = new Date()) => join(telemetryDir(cfg), `telemetry-${dayStamp(d)}.log`)
+
+/** 删掉超 `logRetentionDays` 的旧日志。只认文件名日期，幂等且廉价。 */
+function sweepTelemetry(cfg) {
+  const days = live(cfg.logRetentionDays)
+  if (!days || days <= 0) return
+  try {
+    const dir = telemetryDir(cfg)
+    if (!existsSync(dir)) return
+    const cutoff = dayStamp(new Date(Date.now() - days * 86400000))
+    for (const f of readdirSync(dir)) {
+      const m = /^telemetry-(\d{4}-\d{2}-\d{2})\.log$/.exec(f)
+      if (m && m[1] < cutoff) rmSync(join(dir, f), { force: true })
+    }
+  } catch { /* 忽略 */ }
+}
 
 /**
  * 累计计数文件 = telemetry.log 同目录的 telemetry.counts.json。「开 replace 跑几天
@@ -1210,25 +1453,43 @@ function renderStats(cfg, state) {
     zgInstalled: existsSync(cfg.zgCli),
     // 进程轴（v0.12.0）：面板 stale 行靠它——清单写了 ≠ 活进程加载了。null=还没量过。
     adapter: state.adapterFresh ? state.adapterFresh.verdict : null,
-    replace: { hit: n('intercept-replace'), graph: n('intercept-replace:graph'), zg: n('intercept-replace:zg'), passDirty: n('replace-pass-dirty'), passNoHit: n('replace-pass-no-hit'), passFailed: n('replace-pass-failed'), error: n('replace-error') },
+    replace: { hit: n('intercept-replace'), graph: n('intercept-replace:graph'), zg: n('intercept-replace:zg'), passDirty: n('replace-pass-dirty'), passRefreshing: n('replace-pass-refreshing'), passNoHit: n('replace-pass-no-hit'), passFailed: n('replace-pass-failed'), passFailedGraph: n('replace-pass-failed:graph'), passFailedZg: n('replace-pass-failed:zg'), error: n('replace-error') },
     deny: { blocked: n('intercept-deny'), passDirty: n('intercept-pass-dirty'), passNoHit: n('intercept-pass-no-hit'), passQueryFailed: n('intercept-pass-query-failed'), skipSeen: n('intercept-skip-seen'), error: n('intercept-error') },
     dirty: { record: n('dirty-record'), refreshScheduled: n('dirty-refresh-scheduled'), refreshDone: n('dirty-refresh-done'), refreshFail: n('dirty-refresh-fail') },
-    lever: { wrapperCalls: n('wrapper-call'), hintInjected: n('hint-injected') },
+    lever: { wrapperCalls: n('wrapper-call'), hintInjected: n('hint-injected'), codeSearch: n('code-search') },
+    // v0.15.0 M1：project 清单的取用方式——hot=热路径现查 list_projects（应趋零），
+    // cacheHit=命中预热留下的清单（零成本）。hot 不降就是预热没生效。
+    listProjects: { hot: n('list-projects:hot'), cacheHit: n('list-projects:cache-hit') },
+    // 两条腿当前生效的预算（ms）：面板要让"为什么慢"能一眼看到是哪一腿的锅。
+    budget: { graph: budgetGraph(cfg), zg: budgetZg(cfg) },
     index: { retryContention: n('index-retry-contention'), zgIndexFail: n('zg-index-fail') },
+    // 按仓库的读数（v0.13.4）：面板仓库选择器用。进程内累计、重启归零——落盘会
+    // 污染 counts.json 的扁平契约，而趋势看板本来就不跨重启。project / zg 两列是
+    // 该仓的索引状态：project=结构层入图名，zg=语义层目录是否存在（页面每帧重算，
+    // 一次 existsSync 很便宜，不值得单独做失效通知）。
+    repos: Array.from(state.repos.entries()).map(([cwd, r]) => ({
+      cwd,
+      project: state.projectsByCwd.get(cwd) || '',
+      zg: existsSync(join(cwd, '.zvec-grep')),
+      ...r,
+    })),
+    // 最近 N 条替换/拒绝决策（带命中文本片段）：「换成 zg 返回了什么」就靠它。
+    recent: state.recent.slice(-live(cfg.recentLimit)),
   })
 }
 
 function telemetry(cfg, state, event, fields = {}) {
   if (!cfg.telemetry) return
   try {
-    mkdirSync(cfg.adapterDir, { recursive: true })
-    const path = join(cfg.adapterDir, 'telemetry.log')
-    // ponytail: 追加式 JSONL，唯一的保鲜手段是"超上限就整份重来"（计数还在内存里，
-    // 报表不依赖文件）。要长期分析就换成按天分文件 + 定期清理。
+    mkdirSync(telemetryDir(cfg), { recursive: true })
+    const path = telemetryPath(cfg)
+    // ponytail: 追加式 JSONL + 按天分文件，sweepTelemetry 按保留期清旧文件。旧的
+    // 「超上限整份重来」会连当天的分析依据一起删掉；现在只删超期的文件，当天不动。
     try { if (statSync(path).size > TELEMETRY_MAX_BYTES) rmSync(path, { force: true }) } catch { /* 还不存在最好 */ }
     // pid：多宿主/多实例并跑时日志行得能说清是谁发的——否则「发事件」和「记数」
     // 对不上账无法归因（2026-10-14 验收：log 有 5 行 wrapper-call、计数只走 1）。
     writeFileSync(path, `${JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, event, ...fields })}\n`, { flag: 'a' })
+    sweepTelemetry(cfg)
   } catch { /* 忽略 */ }
   state.counts[event] = (state.counts[event] ?? 0) + 1
   // 带 source 的事件额外记一份 "event:source" 计数（intercept-replace 的图谱/语义
@@ -1244,6 +1505,64 @@ function bumpCount(cfg, state, event) {
   state.pushStats?.()
 }
 
+/**
+ * 按仓库累计（v0.13.4）。只记替换/拒绝类决策——`dirty-record`、`wrapper-call`
+ * 这类高频事件录进来会瞬间稀释掉环形和面板，看不到「效果」。cwd 缺失不记：
+ * 记了也无法归因，比不记更糟。intercept-* 归 deny 桶，replace-* 归 replace 桶。
+ */
+function repoBump(state, cwd, event) {
+  if (!cwd) return
+  const r = state.repos.get(cwd) ?? { replace: {}, deny: {} }
+  // 桶归属：替换决策进 replace 桶，拦截（deny）决策进 deny 桶。
+  // 注意 'intercept-replace' 名字带 'intercept-' 前缀，但它是**替换**决策不是拒绝
+  // 决策——按前缀分流会把它错记进 deny 桶（v0.14.0 臂 O 抓到的真 bug）。
+  const bucket = (event === 'intercept-replace' || event.startsWith('replace-')) ? r.replace : r.deny
+  bucket[event] = (bucket[event] ?? 0) + 1
+  state.repos.set(cwd, r)
+  // 记账变了就得让读数跟上：telemetry() 那一推发生在本函数**之前**，快照里必然
+  // 少这一条（页面上的按仓库计数永远慢一拍，臂 O 抓到的第二个洞）。
+  state.pushStats?.()
+}
+
+/**
+ * 按**命中文件**过滤（v0.15.1）。台账脏的语义是"这些文件的坐标可能过期"——那只是
+ * 那些文件的事，不该让整会话的替换全部让路。现场实测（2026-10-24）：`replace-pass-dirty`
+ * 95 : `intercept-replace` 12，编辑会话里等于把替换永久关闭，而绝大多数命中都落在
+ * 没改过的文件里。
+ *
+ * 只处理 search_graph 的 JSON 行；非 JSON（表格文本）原样返回，绝不误删。
+ * 返回 `{ text, dropped }`：dropped=0 时 text 原样。
+ */
+export function dropDirtyRows(text, sess, cwd) {
+  const raw = sess?.dirty
+  if (!raw || raw.size === 0) return { text, dropped: 0 }
+  let obj
+  try { obj = JSON.parse(text) } catch { return { text, dropped: 0 } }
+  if (!Array.isArray(obj?.cols) || !Array.isArray(obj?.rows)) return { text, dropped: 0 }
+  const fi = obj.cols.indexOf('file')
+  if (fi < 0) return { text, dropped: 0 }
+  // 两侧都要归一：图里的 `file` 是索引写的相对路径，脏集合是 write/edit 的 file_path
+  // 归一出来的——斜杠方向、大小写、有没有 cwd 前缀都可能不一致。Windows 路径不区分
+  // 大小写，这里跟着平台走（POSIX 保持区分，别把两个不同文件合成一个）。
+  const key = (p) => {
+    const n = normPath(String(p ?? ''), cwd)
+    return process.platform === 'win32' ? n.toLowerCase() : n
+  }
+  const dirty = new Set([...raw].map((p) => key(p)))
+  const kept = obj.rows.filter((r) => !dirty.has(key(r?.[fi])))
+  const dropped = obj.rows.length - kept.length
+  if (dropped === 0) return { text, dropped: 0 }
+  return { text: JSON.stringify({ ...obj, rows: kept, returned: kept.length, dirty_dropped: dropped }), dropped }
+}
+
+/** 「效果」环形：只记替换/拒绝决策，带命中文本片段供页上展示。 */
+function pushRecent(state, entry) {
+  state.recent.push(entry)
+  if (state.recent.length > 500) state.recent.splice(0, state.recent.length - 500) // 硬顶，防 runaway
+  // 同 repoBump：环形变了就推一帧读数，否则页面上的「效果」永远差最后一条。
+  state.pushStats?.()
+}
+
 /** deny 的 reason：模型这一轮就要拿到可用结果，而不是一句说教。 */
 function renderInterceptHint(symbol, project, hits) {
   return truncateCodepoints([
@@ -1255,6 +1574,26 @@ function renderInterceptHint(symbol, project, hits) {
 }
 
 /**
+ * 命中条数：图谱 tree / zg 输出都按「非空行」粗数——只要够模型与人判断量级，
+ * 不追求精确（精确要解析两种表形状，得不偿失）。
+ */
+const hitCount = (text) => String(text ?? '').split('\n').filter((l) => l.trim()).length
+
+/** 「效果」环形留的片段：前几行 + 字符上限。页上折叠展开就靠它。 */
+const snippet = (text, maxCodepoints = 400) =>
+  truncateCodepoints(String(text ?? '').split('\n').filter((l) => l.trim()).slice(0, 4).join('\n'), maxCodepoints)
+
+/** 未替换标记（markPassthrough 打开时）：不丢原 grep 输出，只在前头盖个章。 */
+function renderPassthroughMark(symbol, outcome, cwd) {
+  const repo = cwd ? basename(cwd) : '未知仓'
+  const why = outcome === 'replace-pass-dirty' ? '本会话改过这些文件，图里坐标不可信'
+    : outcome === 'replace-pass-refreshing' ? '引擎正在为本工作区重建索引，查询会排队超时'
+    : outcome === 'replace-pass-failed' ? '检索层查询失败'
+    : '索引里没有这个符号'
+  return `【未替换 · 原始 grep 输出 · 仓 ${repo}】grep "${symbol}" 没被换掉：${why}。enforce=replace 下这是原始结果，不是图谱/zg 命中。\n`
+}
+
+/**
  * replace 档（enforce=replace）的模型可见内容：原始 grep 输出整体换成两层检索的
  * 命中（结构层优先、语义层补位是**单次替换内**的取数顺序，不代表两层能力二选一——
  * code_find 与 zvec_grep_search 作为常规工具始终并存可用，本档只改 grep 的可见输出）。
@@ -1263,14 +1602,28 @@ function renderInterceptHint(symbol, project, hits) {
  * content when given)"；pre-execute 不能改写参数，参数在执行前已被 deepFreeze）。
  * 不留原输出是刻意的：两者都给，模型（和人）的习惯会赢回 grep——用户验收结论
  * （m00773"还是软限制"）要的是换了就真换了。
+ *
+ * 首行是**来源徽标**（v0.13.4）：层 + 仓库 + 条数三件套，让「这是 grep 还是 zg」
+ * 在文本最前端就分清——徽标放在第一行、用方括号包裹，扫一眼就能定位。
  */
-function renderReplacement(symbol, source, project, hits) {
+function renderReplacement(symbol, source, project, hits, cwd, dropped = 0) {
+  const layer = source === 'graph' ? '结构层(图谱)' : '语义层(zg)'
+  const repo = cwd ? basename(cwd) : project || '未知仓'
+  // v0.15.0 M5'：两层文案必须分层，不能同构——
+  //  · 结构层给的是符号坐标（qualified_name + 文件 + 行范围），可以当锚点用；
+  //  · 语义层给的是**近似片段**，没有坐标，拿它当 file:line 就是伪造。
+  // 替换钩子现在只产出结构层（M4'），但函数保持通用：以后若从别的通道进来，
+  // 文案仍然要说真话。
   return truncateCodepoints([
-    `dsh-codebase-memory（enforce=replace）：grep "${symbol}" 的原始输出已替换为${source === 'graph' ? '结构层（代码图谱）' : '语义层（zvec-grep）'}命中。要看原始 grep 结果，把 enforce 改回 off。`,
-    `${source === 'graph' ? `project=${project} 的 search_graph` : 'zvec_grep_search'} 命中：`,
+    `【替换自 ${layer} · 仓 ${repo} · ${hitCount(hits)} 行】grep "${symbol}" 的原始输出已丢弃。要看原始 grep 结果，把 enforce 改回 off。`,
+    // 被脏台账过滤掉的行必须说破：模型看到的命中是"过滤后"的，不是全部。
+    dropped > 0 ? `（已过滤 ${dropped} 条本会话改过的文件——那些坐标可能过期；要它们就先 code_index）` : '',
+    source === 'graph' ? `project=${project} 的 search_graph 命中（坐标来自索引）：` : 'zvec_grep_search 命中（语义近似，不是字面匹配、不是符号定义，不能当 file:line 锚点）：',
     (hits || '(无命中)').trim(),
-    source === 'graph' ? `下一步：code_find("${symbol}") 拿源码，或 code_callers("<qualified_name>") 拿调用者。` : '下一步：code_find / code_callers 走图谱，或继续 zg 检索。',
-  ].join('\n'), HINT_MAX_CODEPOINTS)
+    source === 'graph'
+      ? `下一步：code_find("${symbol}") 拿源码，或 code_callers("<qualified_name>") 拿调用者；本会话改过代码就先 code_index 再采信行号。`
+      : '下一步：要坐标用 code_find / code_callers，要精确字面量用 grep；这一段只能当线索。',
+  ].filter(Boolean).join('\n'), HINT_MAX_CODEPOINTS)
 }
 
 /** 像"查代码结构"的用户问题（杠杆 ③ 的触发词，中英各一批）。 */
@@ -1442,6 +1795,11 @@ export async function apply(ctx, config) {
     adapter: 'unknown', cbm: 'unknown', ok: false, autoIndex: '', refreshing: new Set(), notes: [], lastError: '',
     zg: 'off', zgInstalling: false,
     sessions: new Map(), projectsByCwd: new Map(), counts: {}, indexJobs: new Map(),
+    repos: new Map(), recent: [],
+    // v0.15.0：预热那一发 list_projects 的**返回体**留在这儿（M1）。它的返回文本
+    // 已经付过 10.8s 的开库成本，丢掉等于让每个符号类 grep 再付一次（而钩子预算
+    // 根本付不起 ⇒ project 查不到 ⇒ 图谱腿整段跳过）。
+    projectsListing: '', projectsListingAt: 0, listingRefreshing: false, listingPromise: null, warmStartedAt: 0,
     warm: false, warmOk: null, // 冷启动预热（v0.10.1；v0.13.2 真实 settle 落账）：warm=打过一次，warmOk=那发的最终结果
     adapterFresh: null, // 进程轴（v0.12.0）：{verdict,at,manifestMs,pids,newestStartMs}，30s 缓存
   }
@@ -1464,6 +1822,10 @@ export async function apply(ctx, config) {
   let statsWritten = ''
   const doStatsEmit = () => { try { ctx.emit('settings/document-updated', 'codebase-memory', Date.now()) } catch { /* 没有转发器就算了 */ } }
   state.pushStats = () => {
+    // 页面读数与遥测日志同一个开关（v0.9.0 的契约，臂 S 钉着）：关掉遥测就冻结在
+    // 最后值，不推也不 emit。repoBump/pushRecent 现在会主动补推一帧（否则环形与
+    // 按仓库计数永远慢一条），这个闸门保证"关掉"仍然是真的关掉。
+    if (!cfg.telemetry) return
     const ref = state.statsRef
     if (isVolRef(ref)) { try { ref[VOL_WRITE](renderStats(cfg, state)) } catch { /* 绝不影响会话 */ } }
     // 累计落盘：只在计数变了时写；先与文件 max 合并再写——tauri/web 两宿主并跑时
@@ -1771,8 +2133,70 @@ export async function apply(ctx, config) {
         })
       },
     }))
-  }
 
+    // ── 杠杆 ①b：语义层封装工具（v0.15.0 M4b）────────────────────────────────
+    // 为什么需要它：语义层从替换钩子退出之后（M4'），模型若只能通过代理工具调
+    // `zg_zvec_grep_search`，就得自己知道三件事——工具名带 server 前缀、root 必填
+    // 且是绝对路径、本仓有没有 `.zvec-grep`。三件都是模型容易错的（实测：工具在
+    // 手时 code_find 的调用次数是 0，"知道有"不等于"会用"）。这个封装与 code_find
+    // 同一条纪律：把路由键从模型手里拿走，它只管说人话。
+    ctx.tools.register(defineTool({
+      name: 'code_search',
+      description: 'Semantic search over THIS workspace: use it for natural-language questions ("where does X get retried / how is Y configured") and for prose or config files (md / yaml / json) that the code graph does not index. Returns semantically similar snippets — they are LEADS, not coordinates: there is no qualified name and no file:line you may cite. For definitions and call relations use code_find / code_callers; for exact literals, log lines and config keys keep using grep. Requires the optional semantic layer; when it is off or this repo has no index, the tool says so instead of degrading silently.',
+      parameters: {
+        query: { type: 'string', required: true, description: 'Natural-language description of what the code does. Keywords are fine; a bare identifier is a poor query here (use code_find for that).' },
+        limit: { type: 'integer', description: 'Max snippets (default 8, cap 20).' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            text: { type: 'string', required: true },
+            status: { type: 'string', required: true },
+          },
+        },
+        render: (_args, value) => [{ type: 'text', text: value.text }],
+      },
+      async execute(args, exec) {
+        const cwd = exec?.agent?.session?.header?.cwd
+        if (!cwd) throw new Error('code_search 需要会话工作区：exec.agent.session.header.cwd 为空')
+        await bootstrap(ctx, cfg, state, exec.signal).catch((error) => {
+          state.lastError = String(error?.message ?? error)
+          state.ok = false
+        })
+        // 前提不成立即 throw，不静默降级成 grep（与 code_index/code_find 同一条纪律）。
+        if (state.zg !== 'ready') {
+          throw new Error(cfg.zgEnabled
+            ? `语义层包已开启但没就绪（state=${state.zg}）：先 code_setup {action:"install-zg"} 装包（约 430MB，需用户点头），再 code_setup {action:"restart-adapter"} 重拉清单。`
+            : '语义层未开启（zgEnabled=false）：这是可选层，装它约 430MB。要开就去设置页打开「检索两层 → 语义层」，或让用户在 profile 里设 zgEnabled: true；不想开就用 code_find / grep。')
+        }
+        // 本仓没有语义索引：上游 activate() 在读任何参数之前就 throw INDEX_MISSING
+        // （0.2.2 实证），所以这一枪注定失败——不如直接说清怎么建。
+        if (!existsSync(join(cwd, '.zvec-grep'))) {
+          throw new Error(`本工作区还没有语义索引（缺 ${join(cwd, '.zvec-grep')}）：先问用户是否同意建索引，同意后跑 node "${cfg.zgCli}" index（增量约 2s、首建全量约 23s；产物目录务必进 .gitignore）。这是上游的显式授权门，不是故障。`)
+        }
+        const limit = Math.min(Math.max(Number.isInteger(args.limit) ? args.limit : 8, 1), 20)
+        const query = String(args.query ?? '').trim()
+        if (!query) throw new Error('code_search 需要 query（自然语言描述）')
+        const r = await cbmCall(ctx, exec, 'zvec_grep_search', { query, root: cwd, limit }, budgetZg(cfg), 'zg')
+        if (!r.ok) throw new Error(`zvec_grep_search 调用失败（链路或引擎异常）：${(r.text || '超时').slice(0, 300)}`)
+        const hits = String(r.text ?? '')
+        telemetry(cfg, state, 'code-search', { cwd, chars: hits.length })
+        if (noHits(hits)) {
+          return { status: 'empty', text: `语义层（root=${cwd}）没有匹配 "${truncateCodepoints(query, 80)}" 的片段。\n这是语义检索的空答案，不代表代码里没有——换个说法，或改用 code_find（符号）/ grep（字面量）。` }
+        }
+        return {
+          status: 'ok',
+          text: truncateCodepoints([
+            `code_search 语义命中（root=${cwd}，${hitCount(hits)} 行）：`,
+            '⚠ 这是**语义近似片段**，不是符号定义、也没有坐标：不能当 file:line 引用。要坐标用 code_find / code_callers。',
+            hits.trim(),
+          ].join('\n'), 6000),
+        }
+      },
+    }))
+  }
   // ── 杠杆 ②：tools/pre-execute 拦截符号类 grep/glob（仅 deny-once / deny）──────
   // 关键路径上的同步钩子：只做纯本地判断，必要才查（实测代理查询 ~30–60ms，
   // 而 cbm CLI 冷启动实测 5.5–8.3s —— 绝不能在钩子里 spawn CLI）。任何不满足
@@ -1792,7 +2216,8 @@ export async function apply(ctx, config) {
         if (!coversWorkspace(exec.arguments, cwd)) return next() // 越界搜索：图谱答不了，拦了就是伪造坐标
         const sess = sessionOf(state, key)
         if (cfg.enforce === 'deny-once' && sess.blocked.has(q.symbol)) {
-          telemetry(cfg, state, 'intercept-skip-seen', { session: key, symbol: q.symbol })
+          telemetry(cfg, state, 'intercept-skip-seen', { session: key, cwd, symbol: q.symbol })
+          repoBump(state, cwd, 'intercept-skip-seen')
           return next()
         }
         const { project } = await projectFor(ctx, exec, cfg, state, sess, cwd)
@@ -1800,23 +2225,31 @@ export async function apply(ctx, config) {
         const fresh = ledgerStale(sess)
         if (fresh !== 'fresh') {
           // 本会话写过代码 ⇒ 图里的坐标不可信，这时拦截就是在骗人：放行 + 后台补刷。
-          telemetry(cfg, state, 'intercept-pass-dirty', { session: key, symbol: q.symbol, dirty: sess.dirty.size })
+          telemetry(cfg, state, 'intercept-pass-dirty', { session: key, cwd, symbol: q.symbol, dirty: sess.dirty.size })
+          repoBump(state, cwd, 'intercept-pass-dirty')
+          pushRecent(state, { ts: Date.now(), cwd, project, symbol: q.symbol, source: '', outcome: 'deny-pass-dirty' })
           scheduleDirtyRefresh(ctx, cfg, state, sess, exec)
           return next()
         }
-        const hits = await cbmCall(ctx, exec, 'search_graph', { project, query: q.symbol, limit: 5 }, cfg.interceptBudgetMs)
+        const hits = await cbmCall(ctx, exec, 'search_graph', { project, query: q.symbol, limit: 5 }, budgetGraph(cfg))
         if (!hits.ok) {
-          telemetry(cfg, state, 'intercept-pass-query-failed', { session: key, symbol: q.symbol, timeout: !!hits.timeout })
+          telemetry(cfg, state, 'intercept-pass-query-failed', { session: key, cwd, symbol: q.symbol, timeout: !!hits.timeout })
+          repoBump(state, cwd, 'intercept-pass-query-failed')
+          pushRecent(state, { ts: Date.now(), cwd, project, symbol: q.symbol, source: '', outcome: 'deny-pass-failed' })
           return next()
         }
         // 图里没有这个符号 ⇒ grep 才是对的工具。拦一条"索引本来就没答案"的搜索，
         // 既没教育到东西，还把模型唯一能走通的路挡了——所以命中为空就放行。
         if (noHits(hits.text)) {
-          telemetry(cfg, state, 'intercept-pass-no-hit', { session: key, symbol: q.symbol })
+          telemetry(cfg, state, 'intercept-pass-no-hit', { session: key, cwd, symbol: q.symbol })
+          repoBump(state, cwd, 'intercept-pass-no-hit')
+          pushRecent(state, { ts: Date.now(), cwd, project, symbol: q.symbol, source: '', outcome: 'deny-pass-no-hit' })
           return next()
         }
         sess.blocked.add(q.symbol)
-        telemetry(cfg, state, 'intercept-deny', { session: key, symbol: q.symbol, enforce: cfg.enforce })
+        telemetry(cfg, state, 'intercept-deny', { session: key, cwd, symbol: q.symbol, enforce: cfg.enforce })
+        repoBump(state, cwd, 'intercept-deny')
+        pushRecent(state, { ts: Date.now(), cwd, project, symbol: q.symbol, source: 'graph', outcome: 'denied', snippet: snippet(hits.text) })
         // reason 是模型唯一看得到的部分；info 只进结构化错误元数据（宿主契约：info.reason 不进模型内容）。
         return {
           kind: 'deny',
@@ -1858,11 +2291,20 @@ export async function apply(ctx, config) {
         const prem = interceptPremises(exec, cfg, state)
         if (!prem) return next()
         const { q, key, cwd, sess } = prem
-        if (ledgerStale(sess) !== 'fresh') {
-          // 台账脏 ⇒ 图里的坐标不可信，替换就是骗人：保留原 grep 输出 + 后台补刷。
-          telemetry(cfg, state, 'replace-pass-dirty', { session: key, symbol: q.symbol, dirty: sess.dirty.size })
-          scheduleDirtyRefresh(ctx, cfg, state, sess, exec)
-          return next()
+        // v0.15.1：脏台账不再让**整会话**让路，改成按命中文件过滤（dropDirtyRows）。
+        // 后台补刷照旧调度——坐标最终还是得靠重索引变新，过滤只是别把没改过的文件
+        // 一起陪葬。
+        if (ledgerStale(sess) !== 'fresh') scheduleDirtyRefresh(ctx, cfg, state, sess, exec)
+        // 引擎正在为本工作区重建索引 ⇒ 查询必然排队超时。现场实测（2026-10-25 11:53）：
+        // 该会话 3 次替换决策里 2 次是 failed，而 dirty-refresh 窗口 11:53:26–11:54:15
+        // 正好盖住第一次。直接放行，别让模型白等 8 秒，也别把"引擎忙"记成"查询失败"。
+        if (state.refreshing.has(cwd)) {
+          telemetry(cfg, state, 'replace-pass-refreshing', { session: key, cwd, symbol: q.symbol })
+          repoBump(state, cwd, 'replace-pass-refreshing')
+          pushRecent(state, { ts: Date.now(), cwd, project: sess.project || '', symbol: q.symbol, source: '', outcome: 'pass-refreshing' })
+          return live(cfg.markPassthrough)
+            ? { kind: 'accept', content: [{ type: 'text', text: renderPassthroughMark(q.symbol, 'replace-pass-refreshing', cwd) + resultText(result) }] }
+            : next()
         }
         const { project } = await projectFor(ctx, exec, cfg, state, sess, cwd)
         let source = ''
@@ -1870,29 +2312,43 @@ export async function apply(ctx, config) {
         // 区分"索引本来没答案"与"层查询失败"（超时/底层错误文本）：前者 grep 才是对的
         // 工具，后者是基础设施问题——泡数据时这两个占比的含义相反，不能混一个计数。
         let failed = false
+        let failNote = ''
+        let dropped = 0
         if (project) {
-          const hits = await cbmCall(ctx, exec, 'search_graph', { project, query: q.symbol, limit: 5 }, cfg.interceptBudgetMs)
-          if (hits.ok && !noHits(hits.text)) { source = 'graph'; text = hits.text }
-          else if (!hits.ok) failed = true
+          const hits = await cbmCall(ctx, exec, 'search_graph', { project, query: q.symbol, limit: 5 }, budgetGraph(cfg))
+          if (hits.ok && !noHits(hits.text)) {
+            const f = dropDirtyRows(hits.text, sess, cwd)
+            dropped = f.dropped
+            if (!noHits(f.text)) { source = 'graph'; text = f.text }
+          } else if (!hits.ok) {
+            failed = true
+            // 失败必须带原文：否则下次只能靠时间线反推（cbm-warm 那次的教训）。
+            failNote = hits.timeout ? '(超时)' : String(hits.text ?? '').slice(0, 120)
+          }
         }
-        // 图谱没答案才轮到 zg 语义层；root 由钩子补上——模型忘填必填参数的坑就此消掉。
-        // ponytail: zg 冷启动实测 3.3s，超过默认 2500ms 预算 ⇒ 会话里第一条被换的
-        // 符号搜索会超时退回原输出，之后热（1.4s）能换。宁缺勿塞，升级路径是常驻
-        // daemon 或独立 zgReplaceBudgetMs 配置。
-        // 本仓没建过语义索引就别白打这一枪：缺 .zvec-grep 目录 ⇒ 上游 activate() 必
-        // throw INDEX_MISSING（在读取任何参数之前），目录**不存在**这个方向的判定是
-        // 确定的（存在也未必可查，但那是守护自己的事）。省掉一发注定失败的调用 + 预算。
-        if (!text && state.zg === 'ready' && existsSync(join(cwd, '.zvec-grep'))) {
-          const z = await cbmCall(ctx, exec, 'zvec_grep_search', { query: q.symbol, root: cwd, limit: 5 }, cfg.interceptBudgetMs, 'zg')
-          if (z.ok && !noHits(z.text)) { source = 'zg'; text = z.text }
-          else if (!z.ok) failed = true
-        }
+        // v0.15.0 M4'：**语义层退出替换钩子**。这里原来还有一段"图谱没答案就轮到
+        // zg 补位"，三个理由拆掉它：
+        //   ① 喂进去的是同一个裸标识符（q.symbol）。对图谱这是正确输入，对向量检索
+        //      是最差输入——单个标识符的 embedding 几乎没有语义信号，回来的多是噪声。
+        //   ② 它只在"图谱没这个符号"时启动，也就是语义最不可能给准答案的时刻。
+        //   ③ 代价翻倍：图谱腿 6s 超时后再等语义腿 4s，一次符号类 grep 白等 10s。
+        // 语义层的正确输入是**用户的问题**（自然语言、md/配置/文档），那些不以 grep
+        // pattern 的形态出现 ⇒ 走显式入口 code_search（v0.15.0 M4b），不进热路径。
         if (!text) {
-          telemetry(cfg, state, failed ? 'replace-pass-failed' : 'replace-pass-no-hit', { session: key, symbol: q.symbol })
-          return next() // 索引本来没答案 ⇒ grep 才是对的工具
+          // 失败按**腿**归因（M3）。全被脏过滤掉是第三种情况：有答案、但坐标都不可信
+          // ⇒ 记 pass-dirty（语义是"有命中但不该换"），不是 no-hit。
+          const ev = dropped > 0 ? 'replace-pass-dirty' : (failed ? 'replace-pass-failed' : 'replace-pass-no-hit')
+          telemetry(cfg, state, ev, { session: key, cwd, project, symbol: q.symbol, ...(dropped > 0 ? { dropped } : failed ? { source: 'graph', ...(failNote ? { err: failNote } : {}) } : {}) })
+          repoBump(state, cwd, ev)
+          pushRecent(state, { ts: Date.now(), cwd, project, symbol: q.symbol, source: '', outcome: dropped > 0 ? 'pass-dirty' : (failed ? 'pass-failed' : 'pass-no-hit') })
+          return live(cfg.markPassthrough)
+            ? { kind: 'accept', content: [{ type: 'text', text: renderPassthroughMark(q.symbol, ev, cwd) + resultText(result) }] }
+            : next() // 索引本来没答案 ⇒ grep 才是对的工具
         }
-        telemetry(cfg, state, 'intercept-replace', { session: key, symbol: q.symbol, source })
-        return { kind: 'accept', content: [{ type: 'text', text: renderReplacement(q.symbol, source, project, text) }] }
+        telemetry(cfg, state, 'intercept-replace', { session: key, cwd, project, symbol: q.symbol, source, ...(dropped ? { dropped } : {}) })
+        repoBump(state, cwd, 'intercept-replace')
+        pushRecent(state, { ts: Date.now(), cwd, project, symbol: q.symbol, source, outcome: source === 'graph' ? 'replaced-graph' : 'replaced-zg', snippet: snippet(text) })
+        return { kind: 'accept', content: [{ type: 'text', text: renderReplacement(q.symbol, source, project, text, cwd, dropped) }] }
       } catch (error) {
         telemetry(cfg, state, 'replace-error', { message: String(error?.message ?? error).slice(0, 200) })
       }
