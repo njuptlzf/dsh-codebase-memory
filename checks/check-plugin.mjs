@@ -767,7 +767,7 @@ async function verify(profile) {
   // recentLimit / markPassthrough——它们在 Config 里都标了 volatile（页面可写、
   // 决策点现读），名单漏了就会让"标错等于对 UI 撒谎"这条断言失去意义。
   const VOLATILE_KEYS = ['enforce', 'interceptTools', 'interceptBudgetMs', 'contextHint', 'telemetry', 'dirtyTracking', 'stats', 'zgEnabled',
-    'logRetentionDays', 'recentLimit', 'markPassthrough', 'graphBudgetMs', 'zgBudgetMs']
+    'logRetentionDays', 'recentLimit', 'markPassthrough', 'graphBudgetMs', 'zgBudgetMs', 'staleWarnFiles', 'staleWarnMinIntervalSec']
   // schemastery 的字段表在 `Config.dict`（宿主 dsh-settings 的 volatileForm 也是递归它）。
   const marked = VOLATILE_KEYS.filter((k) => Config?.dict?.[k]?.meta?.volatile === true)
   record('G 即时热改字段 + 观测字段 + 读数通道在 Config 里标了 volatile（宿主才肯 serve/写）', marked.length === VOLATILE_KEYS.length, `标了的是 ${marked.join(',') || '(无)'}`)
@@ -952,6 +952,30 @@ async function verify(profile) {
   const mixedRaw = await rmRep(grepExec(agentRm, 'function telemetry|recent\\.push'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
   record('R 混合支 alternation 整体放行：原始 grep 输出保留',
     mixedRaw?.kind === 'accept' && mixedRaw?.content === undefined, JSON.stringify(mixedRaw).slice(0, 90))
+  // v0.16 T-B：近失遥测——放行的混合支在替换通道里"看不见"（不替换是刻意的），
+  // 但审计必须看得见：记账腿 post-execute[0] 喂同一条 exec ⇒ counts + recent 留痕，
+  // 输出原样不动。stats ref 每推帧同步写值（emit 才节流），读法同 S 臂。
+  const rmnRef = mkVolRef('')
+  const rmn = await mount({ enforce: 'replace', dirtyTracking: false, stats: rmnRef }, makeStubProxy([], { project: `stub-${process.pid}-rmiss` }))
+  await rmn.tools.get('code_setup').execute({}, withSignal(REPO))
+  const agentRmn = fakeAgent(`sess-${process.pid}-rmiss`, REPO)
+  const rmnOut = await (rmn.events['tools/post-execute'] ?? [])[0](grepExec(agentRmn, 'function telemetry|recent\\.push'), { content: [{ type: 'text', text: '原始 grep 输出两行\n第二行' }], isError: false }, nextPost)
+  let rmnStats = null
+  try { rmnStats = JSON.parse(String(rmnRef.get())) } catch { /* 没推帧 */ }
+  record('T-B 近失记账：混合支放行但 counts.nearMiss.symbol 进账、recent 留痕、输出不动',
+    (rmnStats?.nearMiss?.symbol ?? 0) === 1 &&
+    (rmnStats?.recent ?? []).some((e) => e.outcome === 'near-miss' && /telemetry/.test(String(e.symbol))) &&
+    rmnOut?.content === undefined &&
+    (rmnStats?.recent ?? []).every((e) => e.outcome !== 'replaced-graph'),
+    `nearMiss=${JSON.stringify(rmnStats?.nearMiss ?? null)} recent=${JSON.stringify((rmnStats?.recent ?? []).slice(-1))}`)
+  // enforce=off 不记近失：没有拦截通道就没有"近失"，纯 off 的 profile 不吃噪声。
+  const rmoffRef = mkVolRef('')
+  const rmoff = await mount({ stats: rmoffRef }, makeStubProxy([], { project: `stub-${process.pid}-rmoff` }))
+  await rmoff.tools.get('code_setup').execute({}, withSignal(REPO))
+  await (rmoff.events['tools/post-execute'] ?? [])[0](grepExec(fakeAgent(`sess-${process.pid}-rmoff`, REPO), 'function telemetry|recent\\.push'), { content: [{ type: 'text', text: '原始输出' }], isError: false }, nextPost)
+  let rmoffStats = null
+  try { rmoffStats = JSON.parse(String(rmoffRef.get())) } catch { /* 没推帧 */ }
+  record('T-B enforce=off 档不记近失（无通道即无信号）', (rmoffStats?.nearMiss?.symbol ?? 0) === 0, JSON.stringify(rmoffStats?.nearMiss ?? null))
   // 纯函数单元臂：dropDirtyRows 拿**现场 search_graph 的真实返回体形状**（3 行 / 2 文件）
   // 验四条：只丢脏文件的行、空脏集原样、非 JSON 原样、路径写法差异也能匹配。
   {
@@ -1105,6 +1129,40 @@ async function verify(profile) {
   record('T 热翻 interceptTools 立即开合名单：glob 不在名单不碰，进了名单照换',
     globNarrow?.content === undefined && /stubSymbol/.test(globWide?.content?.[0]?.text ?? ''),
     `['grep']→${JSON.stringify(globNarrow).slice(0, 30)} ['grep,glob']→${JSON.stringify(globWide).slice(0, 40)}`)
+
+  // ── 臂 TD：v0.16 T-D 陈旧旁路——脏台账攒够 staleWarnFiles 个文件时，注入无视
+  // CODE_QUESTION 闸门；旁路有冷却，正门不受冷却；阈值 0 = 关闭旁路。
+  const tdRef = mkVolRef('')
+  const td = await mount({ enforce: 'replace', dirtyTracking: true, stats: tdRef }, makeStubProxy([], { project: `stub-${process.pid}-td` }))
+  await td.tools.get('code_setup').execute({}, withSignal(REPO))
+  // 预热 project 缓存：注入回调是同步的，只认 projectsByCwd——此前得有一次走到
+  // projectFor 的查询（T 臂同款做法）。
+  await (td.events['tools/post-execute'] ?? [])[1](grepExec(fakeAgent(`sess-${process.pid}-tdwarm`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
+  const tdBook = (td.events['tools/post-execute'] ?? [])[0]
+  const agentTd = fakeAgent(`sess-${process.pid}-td`, REPO)
+  const tdHint = (td.contexts ?? []).find((c) => c.name === 'codebase-memory:hint')
+  const tdProse = () => String(tdHint?.text?.({ agent: fakeAgent(`sess-${process.pid}-td`, REPO, proseAsk) }) ?? '')
+  for (let i = 0; i < 7; i++) await tdBook({ name: 'edit', arguments: { file_path: join(REPO, `src/w${i}.ts`) }, agent: agentTd, signal: sig() }, { content: [], isError: false }, nextPost)
+  record('TD 台账未达阈值（7<8）且非结构问句 ⇒ 仍不注入（旁路不误伤闲聊轮）', tdProse() === '', tdProse().slice(0, 70))
+  await tdBook({ name: 'edit', arguments: { file_path: join(REPO, 'src/w7.ts') }, agent: agentTd, signal: sig() }, { content: [], isError: false }, nextPost)
+  const tdWarn = tdProse()
+  record('TD 台账达 staleWarnFiles=8 ⇒ 无视 CODE_QUESTION 注入陈旧命令',
+    /⚠ 已改 8 个文件/.test(tdWarn) && /code_index/.test(tdWarn) && /cbm_check_index_coverage/.test(tdWarn), tdWarn.slice(0, 170))
+  record('TD 旁路冷却：同会话二装配即刻为空（防编辑潮连发）', tdProse() === '', tdProse().slice(0, 70))
+  const tdCode = String(tdHint?.text?.({ agent: fakeAgent(`sess-${process.pid}-td`, REPO, codeAsk) }) ?? '')
+  record('TD 正门不吃冷却：结构问句 + 台账脏 ⇒ 命令句当场再给',
+    /⚠ 已改 8 个文件/.test(tdCode) && /code_find/.test(tdCode), tdCode.slice(0, 120))
+  let tdStats = null
+  try { tdStats = JSON.parse(String(tdRef.get())) } catch { /* 下一条断言报出来 */ }
+  record('TD 旁路计数进 lever.staleWarn（旁路一次 + 正门带病一次 = 2）', (tdStats?.lever?.staleWarn ?? 0) === 2, JSON.stringify(tdStats?.lever ?? null))
+  const tdOffRef = mkVolRef('')
+  const tdOff = await mount({ staleWarnFiles: 0, stats: tdOffRef }, makeStubProxy([], { project: `stub-${process.pid}-tdoff` }))
+  await tdOff.tools.get('code_setup').execute({}, withSignal(REPO))
+  const tdOffBook = (tdOff.events['tools/post-execute'] ?? [])[0]
+  const agentTdOff = fakeAgent(`sess-${process.pid}-tdoff`, REPO)
+  for (let i = 0; i < 9; i++) await tdOffBook({ name: 'edit', arguments: { file_path: join(REPO, `src/v${i}.ts`) }, agent: agentTdOff, signal: sig() }, { content: [], isError: false }, nextPost)
+  const tdOffProse = String((tdOff.contexts ?? []).find((c) => c.name === 'codebase-memory:hint')?.text?.({ agent: fakeAgent(`sess-${process.pid}-tdoff`, REPO, proseAsk) }) ?? '')
+  record('TD staleWarnFiles=0 关闭旁路（台账再脏也只走旧闸门）', tdOffProse === '', tdOffProse.slice(0, 70))
 
   // ── 臂 W：v0.10.1 冷启动预热 + projectFor 的诚实原因 ──────────────────────
   // 验收实测：宿主重启后第一次 list_projects 撞上引擎冷启动，旧版把"查询失败"
@@ -1324,6 +1382,9 @@ async function verify(profile) {
   record('O Config 默认 logRetentionDays=7', /logRetentionDays\s*:\s*z\.number\(\)\.default\(7\)/.test(src))
   record('O Config 默认 recentLimit=100', /recentLimit\s*:\s*z\.number\(\)\.default\(100\)/.test(src))
   record('O Config 默认 markPassthrough=false', /markPassthrough\s*:\s*z\.boolean\(\)\.default\(false\)/.test(src))
+  // v0.16 T-D 的两个旁路默认（页面/文档口径：8 个文件、60s 冷却）
+  record('O Config 默认 staleWarnFiles=8', /staleWarnFiles\s*:\s*z\.number\(\)\.default\(8\)/.test(src))
+  record('O Config 默认 staleWarnMinIntervalSec=60', /staleWarnMinIntervalSec\s*:\s*z\.number\(\)\.default\(60\)/.test(src))
 
   // 轮转：logRetentionDays=7 时，写新日志触发 sweepTelemetry，超期文件被删、当天文件不动
   const o1Dir = join(tmpdir(), `cbm-o1-${process.pid}-${profile}`)

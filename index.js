@@ -128,6 +128,13 @@ export const Config = z.object({
   graphBudgetMs: z.number().default(0).volatile(),
   zgBudgetMs: z.number().default(0).volatile(),
   contextHint: z.boolean().default(true).volatile(),
+  // v0.16 T-D：脏台账攒到 N 个文件就**无视 CODE_QUESTION 闸门**注入陈旧命令（0=关）。
+  // 审计依据（agent-chat 790 调用）：改码密集段模型不问结构问题、埋头 read/edit——
+  // 恰是最需要图谱又最不敢信坐标的时刻，旧闸门把提醒正好挡在那时。
+  staleWarnFiles: z.number().default(8).volatile(),
+  // 旁路注入的最小间隔（秒）：context 每轮装配都求值，无冷却会在编辑潮里连发；
+  // 走 CODE_QUESTION 正门时不占冷却（那时是模型自己要的）。
+  staleWarnMinIntervalSec: z.number().default(60).volatile(),
   telemetry: z.boolean().default(true).volatile(),
   // stats 是**插件→设置页**的读数通道，不是用户配置：pushStats 把计数推进这个引用，
   // 宿主 describe() 用 plainConfig 读同一引用（dsh-settings/lib/index.js:98,436），
@@ -286,6 +293,9 @@ function normalize(config = {}) {
   defineLive(cfg, 'logRetentionDays', () => positiveInt('logRetentionDays', live(config.logRetentionDays), 7, []))
   defineLive(cfg, 'recentLimit', () => positiveInt('recentLimit', live(config.recentLimit), 100, []))
   defineLive(cfg, 'markPassthrough', () => boolOf(live(config.markPassthrough), false, [], 'markPassthrough'))
+  // v0.16 T-D 的两个旁路参数：0 都是合法值（0=关闭），走 positiveInt 的含零语义。
+  defineLive(cfg, 'staleWarnFiles', () => positiveInt('staleWarnFiles', live(config.staleWarnFiles), 8, []))
+  defineLive(cfg, 'staleWarnMinIntervalSec', () => positiveInt('staleWarnMinIntervalSec', live(config.staleWarnMinIntervalSec), 60, []))
   cfg.adapterMjs = join(cfg.adapterDir, 'node_modules', '@njuptlzf', 'mcp-adapter', 'mcp-server.mjs')
   cfg.adapterConfig = join(cfg.adapterDir, 'cbm.json')
   return cfg
@@ -1202,7 +1212,7 @@ const sessionKey = (agent) => agent?.session?.header?.id ?? agent?.session?.head
 function sessionOf(state, key) {
   let s = state.sessions.get(key)
   if (!s) {
-    s = { project: '', dirty: new Set(), blocked: new Set(), lastRefreshAt: 0 }
+    s = { project: '', dirty: new Set(), blocked: new Set(), lastRefreshAt: 0, lastWarnAt: 0 }
     state.sessions.set(key, s)
   }
   return s
@@ -1486,7 +1496,11 @@ function renderStats(cfg, state) {
     replace: { hit: n('intercept-replace'), graph: n('intercept-replace:graph'), zg: n('intercept-replace:zg'), passDirty: n('replace-pass-dirty'), passRefreshing: n('replace-pass-refreshing'), passNoHit: n('replace-pass-no-hit'), passFailed: n('replace-pass-failed'), passFailedGraph: n('replace-pass-failed:graph'), passFailedZg: n('replace-pass-failed:zg'), error: n('replace-error') },
     deny: { blocked: n('intercept-deny'), passDirty: n('intercept-pass-dirty'), passNoHit: n('intercept-pass-no-hit'), passQueryFailed: n('intercept-pass-query-failed'), skipSeen: n('intercept-skip-seen'), error: n('intercept-error') },
     dirty: { record: n('dirty-record'), refreshScheduled: n('dirty-refresh-scheduled'), refreshDone: n('dirty-refresh-done'), refreshFail: n('dirty-refresh-fail') },
-    lever: { wrapperCalls: n('wrapper-call'), hintInjected: n('hint-injected'), codeSearch: n('code-search') },
+    // v0.16 T-B：近失=pattern 里有符号形支但整体照旧放行（混合支 / 超 4 支封顶）。
+    // agent-chat 审计的逃逸通道（110 次 grep 里 11 次这种写法）；只记账不改输出，
+    // 改不改行为是 SKILL 条款和替换钩子的事。
+    nearMiss: { symbol: n('near-miss-symbol') },
+    lever: { wrapperCalls: n('wrapper-call'), hintInjected: n('hint-injected'), codeSearch: n('code-search'), staleWarn: n('stale-warn') },
     // v0.15.0 M1：project 清单的取用方式——hot=热路径现查 list_projects（应趋零），
     // cacheHit=命中预热留下的清单（零成本）。hot 不降就是预热没生效。
     listProjects: { hot: n('list-projects:hot'), cacheHit: n('list-projects:cache-hit') },
@@ -1811,6 +1825,20 @@ function observeCall(ctx, cfg, state, exec, result) {
         sess.dirty.add(rel)
         telemetry(cfg, state, 'dirty-record', { session: key, path: rel, total: sess.dirty.size })
       }
+    }
+  }
+  // v0.16 T-B：近失遥测——pattern 判为字面量照旧放行，但里面有符号形支（混合
+  // alternation / 超 4 支封顶）。agent-chat 审计里这条通道是逃逸主口（110 次 grep
+  // 有 11 次这种写法）。替换钩子**不碰**它（保留模型要的文本检索意图），但报表
+  // 必须看见：只计数 + recent 留痕，不改输出。enforce=off 不记：没有通道的用户
+  // 没有"近失"可言，别让纯 off 的 profile 吃噪声。
+  if (cfg.enforce !== 'off' && !result?.isError && state.ok && isGrepLike(name, cfg.interceptTools)) {
+    const pattern = String(exec?.arguments?.pattern ?? '')
+    const q = classifyPattern(pattern, exec?.arguments?.path)
+    if (q.kind === 'literal' && q.nearMiss && coversWorkspace(exec?.arguments, cwd)) {
+      const project = sess.project || state.projectsByCwd.get(cwd) || ''
+      telemetry(cfg, state, 'near-miss-symbol', { session: key, cwd, project, source: 'grep', pattern: pattern.slice(0, 120) })
+      pushRecent(state, { ts: Date.now(), cwd, project, symbol: pattern.slice(0, 100), source: 'grep', outcome: 'near-miss', snippet: snippet(resultText(result)) })
     }
   }
 }
@@ -2410,11 +2438,25 @@ export async function apply(ctx, config) {
           const key = sessionKey(agent)
           if (!key || !cwd) return ''
           const query = lastUserQuery(agent)
-          if (!query || !CODE_QUESTION.test(query)) return '' // 不像在查代码结构：不注入
           const sess = sessionOf(state, key)
           // 渲染是同步的，所以只能用**已缓存**的 project（同 cwd 解析过就有）。
           const project = sess.project || state.projectsByCwd.get(cwd) || ''
           const dirty = sess.dirty.size
+          // v0.16 T-D 双闸门：正门=CODE_QUESTION（照旧，模型自己在问结构）；旁路=
+          // 脏台账攒够（编辑潮里模型不问结构问题、埋头 read——正是坐标最不可信、
+          // 又最需要一句话说破的时刻）。
+          const normalGate = !!query && CODE_QUESTION.test(query)
+          const bypass = cfg.staleWarnFiles > 0 && dirty >= cfg.staleWarnFiles
+          if (!normalGate && !bypass) return ''
+          let staleCmd = ''
+          if (bypass) {
+            // 冷却只约束旁路：正门那时模型自己要提示，不算打扰；旁路每轮装配都
+            // 求值，无冷却会在编辑潮里连发。
+            if (!normalGate && Date.now() - (sess.lastWarnAt ?? 0) < cfg.staleWarnMinIntervalSec * 1000) return ''
+            sess.lastWarnAt = Date.now()
+            bumpCount(cfg, state, 'stale-warn')
+            staleCmd = ` ⚠ 已改 ${dirty} 个文件：先 code_index 刷新索引、经 cbm_check_index_coverage 验鲜后才能信用图谱坐标；别拿整文件 read 找坐标。`
+          }
           const head = `codebase-memory: project=${project || '(未索引：先 code_index)'}, ${dirty ? `本会话改了 ${dirty} 个文件（坐标可能过期）` : '索引新鲜'}.`
           const tail = project
             ? '找定义/调用关系用 code_find / code_callers；字符串、日志、配置值仍用 grep。'
@@ -2434,7 +2476,7 @@ export async function apply(ctx, config) {
           if (zgNoIndex) bumpCount(cfg, state, 'hint-zg-no-index')
           // 只数真正注入的那一次（每轮装配都调这个回调，注入与否是 ③ 的有效性读数）。
           bumpCount(cfg, state, 'hint-injected')
-          return noVars(`${head} ${tail}${zgFix}${zgNoIndex}`)
+          return noVars(`${head} ${staleCmd}${tail}${zgFix}${zgNoIndex}`)
         } catch {
           return ''
         }
