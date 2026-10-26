@@ -170,11 +170,12 @@ Use when the user wants code-graph understanding before deciding whether to chan
 
 ## 收尾：分层报数表（本 skill 激活时必须交付）
 
-任务收尾的最终回复里放一张三行计数表（参照 dsh-GenUI 的收尾卡做法），让"有没有真走索引"在会话内直接可见，而不是事后翻日志：
+任务收尾的最终回复里放一张四行计数表（参照 dsh-GenUI 的结论卡做法：宿主有 GenUI 渲染时优先出 ```dsh-ui 的 table 围栏，发前过 validate_dsh_ui；无 GenUI 或校验不过就降级成下面的 markdown 表——不硬依赖插件），让"有没有真走索引"在会话内直接可见，而不是事后翻日志：
 
 | 层 | 通道 | 次数 |
 |---|---|---|
-| 结构层 cbm | code_find / code_callers / code_index / cbm_* 代理 | N |
+| 结构层·包装动词 | code_find / code_callers / code_index | N |
+| 结构层·mcp 代理 | mcp__cbm__mcp 的 cbm_* 长尾（mcpScript 内每次 tools.call 也计入） | N |
 | 语义层 zg | code_search / zg_zvec_grep_search | N |
 | 字面量层 | grep / read | N |
 
