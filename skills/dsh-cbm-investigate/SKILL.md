@@ -20,18 +20,9 @@ This skill is a self-contained DSH workflow. It combines:
 
 The plugin repo must remain usable on another DSH install without copying `investigate`. Therefore `investigate` is not a dependency. If `investigate` is missing, continue with this skill. If `investigate` is present, use it only as an optional extension, not as a gate.
 
-## DSH tool surface
+## Tool contract — delegated, not restated
 
-When this skill is active:
-
-- Index current workspace code with `code_index`, not raw `index_repository`.
-- Structural cbm queries use `mcp__cbm__mcp` with `cbm_*` tools.
-- **Never hunt symbols with grep alternation.** `grep "a|b|c"` over several symbol names is the single most common escape hatch away from the index (audited: one session ran 110 greps vs 6 graph calls; the model even noted in its own log that "alternation didn't trigger a replace"). A multi-symbol structural question is NOT a text search — call `code_find`/`code_callers` once per symbol (or one `cbm_query_graph`/trace covering the chain). grep keeps exactly one job here: exact literals, log lines, config keys, regex over prose. If a pattern mixes symbol branches with literal branches, keep the literal hunt in grep and route every symbol branch through the graph — do not "keep it together" by letting the symbols ride the grep.
-- Source snippets use `cbm_get_code_snippet` with `format: "json"`.
-- File coordinates used as edit anchors must be freshness-checked with `cbm_check_index_coverage`; when the worktree is dirty or coverage is not clean, re-read disk bytes before editing.
-- External or sibling repositories are not auto-indexed by the model. If a needed project is missing, state partial scope and ask the user to open that workspace or approve CLI indexing.
-- If cbm queries fail, run `code_setup`. Do not silently fall back to grep/read.
-- When `zg_zvec_grep_search` is present (opt-in semantic layer), it answers natural-language questions ("code that handles X") and hits non-code files the graph does not index; always pass `root` = absolute workspace path. Prefer the wrapper `code_search("<natural language>")` when the plugin exposes it — it fills `root`/`limit` for you. Symbols and callers still go through `code_find`/`code_callers`, exact literals still go through `grep` — three layers, distinct jobs, no substitution. Semantic hits are **leads, not coordinates**: they carry no qualified name and no `file:line`, so never cite them as an edit anchor. A first query in a repo without `.zvec-grep/` fails with `INDEX_MISSING` (upstream authorization gate, not a fault): keep investigating with the other layers and ask the user before building the index. But `Failed to open zvec collection storage` / `ZVEC_OPEN_FAILED` on a repo that **has** `.zvec-grep/` is a different thing — a dead-handle fault with a known self-heal path; go to「zg 语义层：坏死自诊与自动修复」, do not silently fall back to grep.
+This skill owns **routing and process** (Step 0, Entry A/B/C, the output-rewrite decode table, the zg self-heal runbook, the closing count table). The tool-surface rules — which layer answers what, the grep-alternation discipline, `format: "json"`, freshness gates, the stale-ledger directive, the three-layer no-substitution rule — have exactly one written home: **`dsh-codebase-impact-analysis`** (Hard rules 1–7, Preferred tools, Step 0 gate). Step 0 loads it before any structural query. When plugin behavior changes, update that skill and the plugin's injected `usageSection` together — never restate rules here, duplicated rules drift (this file once carried a pre-v0.16 alternation clause while the impact skill and classifier had both moved on).
 
 ## 输出可能被插件改写（先读这一段）
 
@@ -46,13 +37,6 @@ When this skill is active:
 | `dsh-codebase-memory：grep 找符号 "X" 已被拦下…` | `enforce=deny` 档的硬拦截（同一会话同一符号只拦一次）。这是**插件**说的，不是工具报错 | 换 `code_find` / `code_callers`，别重试 grep |
 
 替换**只发生在符号类 pattern** 上：字面量、正则、配置值、日志片段一律原样返回。语义层**不参与**替换——它答的是问题，不是正则。
-
-## 索引与链路的三件事
-
-- `code_index` 一次做三件事：建/刷新图谱、**返回并缓存权威 `project`**、清空本会话的脏台账。所以"改完代码先 `code_index`"不是礼节——它同时让坐标变新、让替换通道重新打开。
-- `code_setup` 的两个动作：`{action:"install-zg"}`（装可选语义层，约 430MB，**必须先问用户**）、`{action:"restart-adapter"}`（重拉适配层清单，秒级；语义层开关切换后必须走这一步才生效，不必重启宿主）。
-- 本会话用 `write`/`edit` 改过文件时，`code_find`/`code_callers` 的输出会带 `⚠ 本会话…这些改动还没进索引`。看到它就先把 `code_index` 跑了再采信行号——插件自己的会话台账比 `cbm_index_status` 可信（后者在引擎 0.11.0 上是全局代际判定，不是逐路径判定）。
-- **陈旧提示是命令不是参考**：系统提示行里出现「本会话改了 N 个文件（坐标可能过期）」或上面那个 ⚠ 台账标记时，任何拿图谱坐标当编辑锚点之前必须先 `code_index`，成功后再 `cbm_check_index_coverage` 验鲜。不许用"整文件重读磁盘"绕开陈旧——实测一次 194 次编辑的会话就是这么烧掉 162 次全文 read、只调了 2 次 `code_index` 的。
 
 ## zg 语义层：坏死自诊与自动修复（修复免确认；首建仍须问）
 
