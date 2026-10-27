@@ -22,7 +22,7 @@ The plugin repo must remain usable on another DSH install without copying `inves
 
 ## Tool contract — delegated, not restated
 
-This skill owns **routing and process** (Step 0, Entry A/B/C, the output-rewrite decode table, the zg self-heal runbook, the closing count table). The tool-surface rules — which layer answers what, the grep-alternation discipline, `format: "json"`, freshness gates, the stale-ledger directive, the three-layer no-substitution rule — have exactly one written home: **`dsh-codebase-impact-analysis`** (Hard rules 1–7, Preferred tools, Step 0 gate). Step 0 loads it before any structural query. When plugin behavior changes, update that skill and the plugin's injected `usageSection` together — never restate rules here, duplicated rules drift (this file once carried a pre-v0.16 alternation clause while the impact skill and classifier had both moved on).
+This skill owns **routing and process** (Step 0, Entry A/B/C, the output-rewrite decode table, the closing count table). The tool-surface rules — which layer answers what, the grep-alternation discipline, `format: "json"`, freshness gates, the stale-ledger directive, the three-layer no-substitution rule — have exactly one written home: **`dsh-codebase-impact-analysis`** (Hard rules 1–7, Preferred tools, Step 0 gate). Step 0 loads it before any structural query. When plugin behavior changes, update that skill and the plugin's injected `usageSection` together — never restate rules here, duplicated rules drift (this file once carried a pre-v0.16 alternation clause while the impact skill and classifier had both moved on).
 
 ## 输出可能被插件改写（先读这一段）
 
@@ -32,45 +32,16 @@ This skill owns **routing and process** (Step 0, Entry A/B/C, the output-rewrite
 |---|---|---|
 | `【替换自 结构层(图谱) · 仓 X · N 行】…原始输出已丢弃` | 你 grep 的是符号，插件把输出换成了图谱命中。**原始 grep 结果不在了** | 直接用这些命中（有 qualified_name + 文件 + 行范围）；要源码就 `code_find`，要调用者就 `code_callers`。别再 grep 一次同样的 pattern |
 | 同上，但第二行是 `（已过滤 N 条本会话改过的文件…）` | 这个会话用 write/edit 改过那些文件，它们的坐标可能过期，**被剔除了**；你看到的是剩下的、仍然可信的命中 | 要那 N 条就先 `code_index` 再查；别把过滤当成"图里没有" |
-| `【替换自 语义层(zg) · …】` | 语义近似片段，**不是**符号定义、没有坐标 | 只当线索；要坐标回 `code_find` |
 | `【未替换 · 原始 grep 输出 · 仓 X】…没被换掉：<原因>` | 插件想换但放弃了（台账脏 / 查询失败 / 无命中），下面是**真的原始 grep 输出** | 原因写在那行里：`台账脏` ⇒ 先 `code_index`；`检索层查询失败` ⇒ `code_setup` 看链路；`无命中` ⇒ 图里确实没有，grep 才是对的工具 |
 | `dsh-codebase-memory：grep 找符号 "X" 已被拦下…` | `enforce=deny` 档的硬拦截（同一会话同一符号只拦一次）。这是**插件**说的，不是工具报错 | 换 `code_find` / `code_callers`，别重试 grep |
 
-替换**只发生在符号类 pattern** 上：字面量、正则、配置值、日志片段一律原样返回。语义层**不参与**替换——它答的是问题，不是正则。
-
-## zg 语义层：坏死自诊与自动修复（修复免确认；首建仍须问）
-
-**触发签名**（任一命中即进入本节，不要静默退回 grep 继续干活）：
-
-- `code_search` / replace 补位报 `Failed to open zvec collection storage`、`ZVEC_OPEN_FAILED`，或 status 里出现 `ZVEC_PERMISSION_DENIED`；
-- `code_setup` 遥测 `zg-index-failed` 在涨、或 `replace-pass-failed` 高企；
-- 查询"成功"但 hits=0 且 Coverage 数字长期不动（索引冻在旧代际）。
-
-区分：`INDEX_MISSING`（本仓没有 `.zvec-grep/`）是上游授权门不是故障——**首建索引仍须用户同意**（430MB 包/opt-in 决策链）。本节只处理"已有索引但坏死"的自动修复：rebuild 是本地 embedding 重算，无网络、无密钥、分钟级，属于可逆修复，直接做。
-
-**核心认知（为什么 daemon 活着却全灭）**：`zg server status: ready` ≠ collection 可开。healthz 只证明进程活着；zvec 的 Windows 锁语义是 **readOnly open 也要排他 LOCK**——长命 daemon 持有 collection 句柄后，它自己的 query/index job 再 open 同一 collection = 自我碰撞，每个 job 必败（8 次重试 ≈4.5s）而 daemon 静默 ready（实测案例：17 天无人察觉，攒了 1800+ 个 0 字节 WAL，268 文件 upsert 全被拒）。
-
-**诊断（成本从低到高，确认即停）**——`$cli` = `code_setup` 报告「语义层(zg)」行给出的 CLI 路径，命令在 workspace 根跑：
-
-1. `node $cli status` —— Coverage 冻在低值 + Queue failed>0 + Problem 含 `OPEN_FAILED`/`UPSERT_FAILED … PERMISSION_DENIED` ⇒ 坏死坐实，直接进修复。
-2. 签名不明时看 daemon 日志（`~\.zvec-grep\daemon\logs\server.log` 尾部）：`"event":"job.finished","state":"failed","error_code":"ZVEC_GREP.ENGINE.STORAGE.ZVEC_OPEN_FAILED"` ⇒ 同上坐实。
-3. 佐证（可选）：`.zvec-grep\index.zvec\` 下 0 字节 `.log` 计数 >100 = WAL 风暴（每次失败 open 产一个）。
-
-**修复（按序执行，全部可逆）**：
-
-1. `node $cli server off` —— 杀坏死 daemon。担心殃及共享它的其他仓？坏死 daemon 对所有仓的 job 都已失败，殃及无损失；存疑先做上面第 2 步看日志。
-2. `node $cli index --rebuild` —— 重建本仓索引；模型缺失等失败 ⇒ 报告原因并停，不循环重试。
-3. `code_setup {action:"restart-adapter"}` —— 让 stdio proxy 重连并自动拉起新 daemon。
-4. `code_search` 复验：**第一次可能因 daemon 冷启动超时（budget 4s），重试一次再下结论**。hits>0 且相关 ⇒ 修复完成。
-
-修完向用户报告证据（修复前后 Coverage / failed 计数），并把「daemon ready ≠ collection 可开」这条写进结论——否则用户会以为监控全绿就是没事。
+替换**只发生在符号类 pattern** 上：字面量、正则、配置值、日志片段一律原样返回。v0.17.0 起图谱是替换的唯一来源（可选语义层已删除）。
 
 ## Step 0 — preflight
 
 1. Confirm the `dsh-codebase-memory` plugin chain.
    - If a structural query is needed, run `code_index` first.
    - If `code_index` or `mcp__cbm__mcp` fails, run `code_setup` and report the concrete failure.
-   - If `code_search` fails with `ZVEC_OPEN_FAILED`-class errors on a repo that has `.zvec-grep/`, that is a dead-handle fault: run the「zg 语义层：坏死自诊与自动修复」flow before concluding the semantic layer is unusable.
 
 2. Load `dsh-codebase-impact-analysis` before structural code queries.
    - This skill owns routing.
@@ -160,7 +131,6 @@ Use when the user wants code-graph understanding before deciding whether to chan
 |---|---|---|
 | 结构层·包装动词 | code_find / code_callers / code_index | N |
 | 结构层·mcp 代理 | mcp__cbm__mcp 的 cbm_* 长尾（mcpScript 内每次 tools.call 也计入） | N |
-| 语义层 zg | code_search / zg_zvec_grep_search | N |
 | 字面量层 | grep / read | N |
 
 - 次数按本会话实际调用自计；不得美化，0 就写 0（写 0 恰恰是复盘信号）。

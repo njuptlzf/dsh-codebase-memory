@@ -21,8 +21,8 @@ The model-facing tool surface is:
 | Build or refresh the current workspace graph | `code_index` | Binds indexing to the current session workspace and returns the authoritative `project` name. |
 | Resolve a symbol → qualified name, file, line range, source | `code_find` | Wrapped high-frequency path; the plugin fills `project` from the session workspace. Prefer it over grep-for-definitions. |
 | Trace callers / callees of one symbol | `code_callers` | Wraps `cbm_trace_path` (default `inbound`). |
-| Semantic search over prose / config / natural language | `code_search` | Wraps `zg_zvec_grep_search` with `root` bound to the workspace. Returns **leads, not coordinates** — never cite them as `file:line`. Only when the semantic layer is enabled. |
-| Repair or inspect plugin chain | `code_setup` | Reports adapter, cbm binary, manifest, the zg semantic layer's three axes (manifest fact `off/ready/missing` vs page toggle vs package probe), and trigger-layer counters. |
+| Search by meaning (natural-language question about code) | proxy `cbm_search_graph` | BM25 symbol lookup (`query`; also `semantic_query`). Hits come back as symbol rows (`qn`/file/lines) — real coordinates, verify freshness before edit anchors. The graph indexes code only; md/config/literals stay `grep`. |
+| Repair or inspect plugin chain | `code_setup` | Reports adapter (process axis `fresh`/`stale`/`no-process`), cbm binary, manifest, and trigger-layer counters. |
 | Run cbm graph queries | `mcp__cbm__mcp` | The plugin compresses cbm MCP tools into a proxy tool. |
 | Batch multi-step cbm queries | `mcp__cbm__mcpScript` | Use when a workflow needs repeated graph calls and you want to avoid round trips. |
 
@@ -47,7 +47,7 @@ Raw cbm tools are still available conceptually, but their names are prefixed and
 
 4. **Use JSON for source snippets.** Always include `format: "json"` in `cbm_get_code_snippet`. The default tree format is a layout envelope and can change line whitespace.
 
-5. **Verify line coordinates before treating them as edit anchors.** The plugin's **session ledger is the first authority**: it records every file this session wrote/edited, and `code_find` / `code_callers` surface that as `⚠ 本会话…这些改动还没进索引`. When you see it, run `code_index` before citing or editing any `file:line` — the graph's coordinates are stale by construction. `cbm_check_index_coverage` is the second opinion, per path: on engine 0.11.0 it reports a global generation change rather than a per-path verdict, so treat `metadata_changed` as "re-index", not as "this file is fine". Semantic hits (`code_search` / `zg_zvec_grep_search`) carry **no coordinates at all** — never promote them to an anchor. The same state also surfaces in the per-turn context hint — `本会话改了 N 个文件（坐标可能过期）`, and once the dirty count reaches `staleWarnFiles` (default 8) a `⚠ 已改 N 个文件：先 code_index 刷新索引…` line lands in the hint **even when no structural question was asked** (bypass cooldown `staleWarnMinIntervalSec`, default 60 s; `0` disables). Treat either marker as a directive: `code_index` first, then re-query the graph — do not route around it by re-reading whole files.
+5. **Verify line coordinates before treating them as edit anchors.** The plugin's **session ledger is the first authority**: it records every file this session wrote/edited, and `code_find` / `code_callers` surface that as `⚠ 本会话…这些改动还没进索引`. When you see it, run `code_index` before citing or editing any `file:line` — the graph's coordinates are stale by construction. `cbm_check_index_coverage` is the second opinion, per path: on engine 0.11.0 it reports a global generation change rather than a per-path verdict, so treat `metadata_changed` as "re-index", not as "this file is fine". The same state also surfaces in the per-turn context hint — `本会话改了 N 个文件（坐标可能过期）`, and once the dirty count reaches `staleWarnFiles` (default 8) a `⚠ 已改 N 个文件：先 code_index 刷新索引…` line lands in the hint **even when no structural question was asked** (bypass cooldown `staleWarnMinIntervalSec`, default 60 s; `0` disables). Treat either marker as a directive: `code_index` first, then re-query the graph — do not route around it by re-reading whole files.
 
 6. **Do not silently degrade to grep/read.** Structural code queries must prefer `code_index` and `cbm_*` tools. Use `grep`/`read` only for literals, non-graph files, explicit user-approved fallback, or after a verified graph failure. **A multi-symbol alternation is not a text search.** `grep "a|b|c"` over symbol names was the classic escape hatch around the index (audited session: 110 greps vs 6 graph calls). Since v0.16 the classifier splits it per branch: every branch symbol-shaped (≤4) ⇒ the grep is swapped for a **union graph query**; any literal-shaped branch — or more than 4 — ⇒ it stays a real grep and is booked as `near-miss-symbol` telemetry. A mixed pattern is never hijacked into a single-symbol swap anymore. Don't gamble on either side: ask one symbol at a time via `code_find`/`code_callers`, or one `cbm_query_graph`/`cbm_trace_path` over the chain; when a pattern genuinely mixes symbol and literal intent, keep the literal hunt in `grep` and route every symbol branch through the graph. If you fall back, begin the answer with the tool path and graph status, for example:
 
@@ -69,7 +69,7 @@ Raw cbm tools are still available conceptually, but their names are prefixed and
 | High-level flow start points | `cbm_get_architecture` with aspects such as `entry_points`, `routes`, `packages`, `clusters`. |
 | Multi-hop or aggregate graph query | `cbm_query_graph` after checking labels via `cbm_get_graph_schema`. |
 | File-level index freshness | `cbm_check_index_coverage` with `paths`. |
-| Natural-language intent; prose/config outside the graph | `code_search("...")` — fills `root` for you; the raw `zg_zvec_grep_search` (with `root`, absolute workspace path) is the fallback when the wrapper is absent. Only when the semantic layer is enabled. **Leads, not anchors.** `code_search` pre-refuses on a repo without `.zvec-grep/` — it never wastes the engine call; the refusal carries the build prescription (`node <zgCli> index`, incremental ≈2 s, first full build ≈23 s; the `.zvec-grep/` artifact must go in `.gitignore`). Ask the user before building; meanwhile fall back to `cbm_search_code`/`grep`. Symbols and callers still belong to `code_find`/`code_callers`; exact literals to `grep`. |
+| Natural-language intent, symbol not in hand | proxy `cbm_search_graph` with `project` + `query` (BM25; `semantic_query` for multi-phrase) — answers are ranked symbol rows, not raw text windows. The graph indexes code only: prose/config/docs and exact literals belong to `grep`/`read`. |
 | Project inventory | `cbm_list_projects` with `detail: "identity"`. |
 
 ## Step 0 — DSH gate
@@ -82,7 +82,7 @@ For work in the current session workspace:
    - `code_index` is blocking and returns `project`, `status`, `nodes`, `edges`, and `root`.
 
 2. If `code_index` fails, run `code_setup` and report the failure. Do not continue as if graph analysis ran.
-   - `code_setup {action:"restart-adapter"}` reloads the adapter manifest (seconds) after a semantic-layer toggle or a manifest drift; `code_setup {action:"install-zg"}` installs the optional semantic layer (~430MB) and **must be approved by the user first**.
+   - `code_setup {action:"restart-adapter"}` reloads the adapter manifest (seconds) after a semantic-layer toggle or a manifest drift; 
 
 3. For an already indexed external project, discover it with:
 

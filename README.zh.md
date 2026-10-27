@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-把 [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) 接进 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 的 host bundle：**为当前会话的工作区建代码知识图谱，让模型按图检索代码，而不是逐文件 grep/read**。它整合了**两个互补的检索层**：结构层（codebase-memory 图谱——符号、调用链、行坐标，常开）+ 可选语义层（[zvec-grep](https://github.com/zvec-ai/zvec-grep) 向量检索——自然语言找代码/文档，~430MB opt-in）。两层并存互补：图谱没答案时语义层补位，谁也不顶替谁。
+把 [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) 接进 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 的 host bundle：**为当前会话的工作区建代码知识图谱，让模型按图检索代码，而不是逐文件 grep/read**。检索源只有一个：**codebase-memory 图谱**（符号、调用链、行坐标，常开）。v0.17.0 删掉了可选语义层（[zvec-grep](https://github.com/zvec-ai/zvec-grep)，~430MB opt-in）——三个月遥测只有 1 次生产调用、自动补刷 72 失败 : 20 成功，制品之外还多一套维护面；"按意思找"现在走图谱的 BM25 腿（`cbm_search_graph`），文档/配置/字面量归 grep。恢复走 `git revert`，或终端独立跑 `zg` CLI。
 
 ## 目录
 
@@ -25,14 +25,11 @@ DSH host 组合（本 bundle 的 cordis.patch.yml 插两行）
 ├─ ④ dsh-codebase-memory          本插件：依赖自举 + 把会话工作区钉死 + 给模型写使用说明
 └─ ③ @deepseek-ai/dsh-mcp-client  官方 MCP 桥
       └─ ② @njuptlzf/mcp-adapter  token 压缩层：模型只看到一个网关工具，
-            │                     网关背后的每个 server 都能到（cbm 17 份 schema、
-            │                     zg 1 份）——插件自举，钉死版本
-            ├─ ① codebase-memory-mcp   索引引擎：162 语言 tree-sitter + Hybrid LSP + 知识图谱（手动安装）
-            └─ ①b zvec-grep [可选]      语义检索层：rg + BM25 + 向量，同一个网关切只露一个工具
-                                        `zg_zvec_grep_search`（见 §①b，默认关）
+            │                     网关背后的每个 server 都能到（cbm 15 份 schema）——插件自举，钉死版本
+            └─ ① codebase-memory-mcp   索引引擎：162 语言 tree-sitter + Hybrid LSP + 知识图谱（手动安装）
 ```
 
-五个都是既有件，**没有任何一个被 fork 或修改**。本插件只做三件事：自举②、给③配好清单、把①的入口按会话工作区钉死。多注册一个 MCP server 并不多出一个代理工具——两个 server 共用同一个网关，模型按 server 键寻址（`cbm_…`、`zg_…`）。①b 由 `zgEnabled` 门控，与①同处一份清单。
+四个都是既有件，**没有任何一个被 fork 或修改**。本插件只做三件事：自举②、给③配好清单、把①的入口按会话工作区钉死。模型经单个网关工具按 server 键寻址引擎能力（`cbm_…`）；v0.17.0 起清单里只有 cbm 一个 server（①b zvec-grep 层与其 `zgEnabled` 门控一并移除，见简介）。
 
 ## 为什么需要它（这个插件存在的全部理由）
 
@@ -62,25 +59,7 @@ Unblock-File .\install.ps1; .\install.ps1 --skip-config
 
 装完后插件会按 官方安装位 → `$DSH_HOME/vendor/codebase-memory-mcp/bin` → PATH 的顺序探测；也可以用 `cbmPath` 配置指死。
 
-### ①b 可选：语义检索层（zvec-grep，默认关）
-
-cbm 图谱**不做向量检索**（0.11.0 实测：`search_graph` 是 BM25/正则，`search_code` 是 graph-ranked text）。要"用自然语言搜代码/文档"就补一层 [zvec-grep](https://github.com/zvec-ai/zvec-grep)——插件把它接成第二个 MCP server，**默认关**，因为它 ~430MB：
-
-```powershell
-# 装包（二选一，都不由开关自动触发——430MB 要人点头）：
-npm run install:zg          # 手动：npm 安装并裁剪（删 transformers.js 不用的推理后端），净 430MB，约 3 分钟
-#   或让 agent 装：对插件说一声，它调 code_setup {action:"install-zg"}——同一版本、同一裁剪、同一自检，
-#   装完报表与设置页状态行当场变绿（包=已装），链路在 telemetry.log 里可追溯（zg-install-start/done/fail）。
-# 开启（二选一）：设置页「检索两层」段的开关（点击有两步确认，写明全部代价），
-#   或在 profile 的 cordis.patch.yml 里给 codebase-memory 行的 config: 加 zgEnabled: true。
-# 两条路都要重建清单（cbm.json 在适配层进程启动时才读）。v0.12.0 起不必重启宿主：
-#   对 agent 说「重启适配层」= code_setup {action:"restart-adapter"}——杀掉老进程，宿主监督器
-#   几秒内自动重拉，新进程读的就是当前清单（重启宿主等价，只是药方开重了）。没重拉之前，
-#   状态行诚实显示「开关已开、清单未重建」（pending-on），不谎称已开启。
-```
-
-开启后 `code_setup` 报表多出 `语义层(zg): ready  包=已装  页面开关=on`，清单（`cbm.json`）里注册 `zg` server（lifecycle `lazy`：首次使用才拉起本地守护进程，约 2.2s，之后热查询 1.4s），模型侧只暴露一个工具 **`zg_zvec_grep_search`**（`agent` 工具集——rg/索引/守护进程管理留在 CLI 侧；**注意代理工具名带 server 键前缀**，直连叫 `zvec_grep_search`，经代理必须叫 `zg_zvec_grep_search`）。调用**必须传 `root`**（工作区绝对路径），没有会报 `root: Invalid input`。索引产物落在被索引仓库的 `.zvec-grep/`（**务必加进 gitignore**——v0.12.0 起这条提示在设置页**常驻**：只要开关开着就一直看得见，因为装包的那个工作区未必是 git 仓库、你的仓库也多是以后才来，一次性弹窗等于没人看见；本仓库已经加了）。裁剪安全性有门禁：`install:zg` 末尾会 `--version` 自检；索引新鲜度复用脏台账链路——`dirtyTracking` 开着时，写文件后的后台补刷会连 `zg index` 一起跑（增量约 2s）。注意一个隐含例外：若该仓还没有 `.zvec-grep/`，同一次后台补刷会**静默完成全量首建**（本仓实测约 23s）——授权点头开在查询侧（见排错表 `INDEX_MISSING` 行），不在这条写路径上。
-
+> **历史（v0.17.0 已移除）：** v0.11–v0.16 曾提供*可选*的第二检索层 [zvec-grep](https://github.com/zvec-ai/zvec-grep)（~430MB，zgEnabled），注册为同一清单里的第二个 MCP server（zg_zvec_grep_search）。三个月遥测：生产环境 code_search 调用 **1** 次；后台补刷链路 72 失败 : 20 成功。上游 README 自己把边界写成「discover by meaning, then verify with exact text」——字面量腿不可替代，装它换来的是一条没人走、还养不活的路。恢复：git revert v0.17.0 提交链，或在终端独立跑 zg CLI——那本来就不需要住在插件里。
 
 ### ② 把 bundle 挂进 profile（②③④全自动）
 
@@ -174,39 +153,15 @@ code_index（建索引 / 改完代码后刷新）
 
 多步查询用 `mcp__cbm__mcpScript` 一次跑完（实测两次 `search_graph` 合计 73ms），别拆成多次往返。
 
-#### 选层速查（人看的；模型只在 zg ready 时看到对应的注入段）
+#### 选型速查（人看的）
 
-**两层是并列入口，不按先后走**——按问题形状选。`enforce=replace` 的替换钩子**只用结构层**：v0.15.0 起语义层退出了替换通道（见下节），写侧补刷仍然对两层并行调度，谁也不顶替谁。
+**入口按问题形状选，不按先后走。** `enforce=replace` 的替换钩子只查图谱；v0.15.0 起语义层退出替换通道，v0.17.0 连层一起删除（历史见上文引用块）。
 
 | 问题长什么样 | 用哪层 | 成本 |
 |---|---|---|
 | X 定义在哪 / 谁调用 Y | `code_find` / `code_callers`（结构层/图谱） | 前置一次 `code_index`；写台账后台补刷维持热度 |
 | 字面量、日志文案、配置值、对文本跑正则 | `grep`（宿主原生） | 零——永远不依赖索引 |
-| 自然语言"做 Z 的代码"；图谱外的文档/配置 | `code_search("自然语言")`（语义层，①b opt-in；无此封装时用 `zg_zvec_grep_search` + `root`） | 一次性 ~430MB 装包 + 本仓首建约 23s；之后热查询约 1.4s |
-| 符号形 grep 而图谱没答案 | **没有自动补位**——保留原 grep 输出 | v0.15.0 起：语义层不参与替换，见下节理由 |
 | 刚写完代码怕坐标过期 | 重跑 `code_index`，或 `cbm_check_index_coverage` 验鲜 | 写台账的后台补刷已覆盖常见情形 |
-
-#### 语义层怎么用（v0.15.0：skill 显式唤醒，不再硬拦截替换）
-
-**结论先说：语义层走「显式调用」，不进 grep 替换。** 三条理由：
-
-1. 替换钩子拿到的输入是**从 grep pattern 里抽出来的裸标识符**。对图谱这是正确输入，对向量检索是最差输入——单个标识符的 embedding 几乎没有语义信号，回来的多是噪声。
-2. 原来那条"图谱没答案才轮到 zg"的补位，**只在图谱确实没有这个符号时启动**，也就是语义最不可能给准答案的时刻。
-3. 代价翻倍：图谱腿 6s 超时后再等语义腿 4s，一次符号类 grep 白等 **10s**，然后多半还是拿回原输出。
-
-所以 v0.15.0 把语义层的正确用法固定成两条：
-
-| 入口 | 什么时候用 | 谁触发 |
-|---|---|---|
-| `code_search("自然语言描述")` | "这块重试逻辑在哪"、"X 是怎么配置的"、md/配置/文档里的东西 | **skill / 提示词显式唤醒**：模型看到这类问题主动调它。`root`、`limit` 由插件填，模型不必知道必填参数 |
-| `zg_zvec_grep_search`（代理工具） | 没有 `code_search` 封装时的长尾（旧 bundle、或要传特殊参数） | 同上，但模型得自己带 `root`（工作区绝对路径） |
-
-**两条纪律**（技能与 usage 段都写了）：
-
-- 语义命中是**线索，不是坐标**：没有 qualified_name、没有 `file:line`，不能当编辑锚点。要坐标回 `code_find`。
-- 前提不成立时 `code_search` **直接报错并给处方**（未开启 / 本仓无 `.zvec-grep/`），不静默降级成 grep——这与 `code_index` 的纪律一致。
-
-**如果确实想让它回到替换通道**：`enforce: replace` 只换符号类 pattern，语义层已不参与；想恢复旧行为只能改代码（`index.js` replace 路径里那段注释说明了为什么删）。替代方案是把 `enforce` 关掉，让 `code_search` 与 `grep` 各自干活。
 
 #### 触发层（该由插件负责的事，不该靠你话术）
 
@@ -214,9 +169,9 @@ code_index（建索引 / 改完代码后刷新）
 
 | 层 | 挂点 | 默认 | 做什么 |
 |---|---|---|---|
-| ① 封装工具 | `ctx.tools.register` | 开 | `code_find` / `code_callers`，以及 v0.15.0 起的 `code_search`（语义层封装：模型只传自然语言，`root`/`limit` 由插件填）。schema 成本实测 **1651 字节 ≈ 每请求 413 tokens**，换来的是代理省下的 ~3200 tokens 不必被话术消耗 |
+| ① 封装工具 | `ctx.tools.register` | 开 | `code_find` / `code_callers`，`code_index` / `code_setup`。schema 成本实测 **1651 字节 ≈ 每请求 413 tokens**，换来的是代理省下的 ~3200 tokens 不必被话术消耗 |
 | ② 拦截 | `tools/pre-execute` | `off`（不拦） | `enforce: deny-once`/`deny` 时（开关在 **设置 → 插件 → dsh-codebase-memory → `codebase-memory` 行「配置」**，改完即时生效不用重启）：pattern 像**符号**的 grep，**同会话同符号只拦一次**，且 deny 的 `reason` 里已经带上 `search_graph` 命中——模型这一轮就拿到答案。代码图对这个符号**无命中时直接放行**：拦一条索引本来就没答案的搜索纯粹是挡路 |
-| ②b 替换 | `tools/post-execute` | 关（`enforce: off`） | `enforce: replace` 时：符号形 grep **照常执行、照常成功**，但模型看到的输出被整体换成**结构层（图谱）**命中；图谱无命中或超时就保留原输出（v0.15.0 起**语义层不参与替换**，理由见「语义层怎么用」）。走宿主 post-execute 的 accept+content 替换通道（"accept keeps the call successful (replacing content when given)"），**不产生 isError**；pre-execute 改不了参数（宿主契约："Input rewriting is excluded"，实参 deepFreeze），所以替换只能后置。脏台账**按命中文件过滤**（v0.15.1）：落在本会话改过的文件里的命中会被剔除并在横幅里注明条数，其余照换——整会话让路的旧行为等于把编辑会话的替换永久关闭（实测 `replace-pass-dirty` 95 : `intercept-replace` 12）；全被剔除才保留原输出 |
+| ②b 替换 | `tools/post-execute` | 关（`enforce: off`） | `enforce: replace` 时：符号形 grep **照常执行、照常成功**，但模型看到的输出被整体换成**结构层（图谱）**命中；图谱无命中或超时就保留原输出（v0.15.0 语义层已退出替换通道；v0.17.0 该层整体移除）。走宿主 post-execute 的 accept+content 替换通道（"accept keeps the call successful (replacing content when given)"），**不产生 isError**；pre-execute 改不了参数（宿主契约："Input rewriting is excluded"，实参 deepFreeze），所以替换只能后置。脏台账**按命中文件过滤**（v0.15.1）：落在本会话改过的文件里的命中会被剔除并在横幅里注明条数，其余照换——整会话让路的旧行为等于把编辑会话的替换永久关闭（实测 `replace-pass-dirty` 95 : `intercept-replace` 12）；全被剔除才保留原输出 |
 | ⑤ 写后记账 | `tools/post-execute` + 会话写入台账 | 开 | 按会话记 `write`/`edit` 的路径（不逐文件建索引），并把**写过代码的会话当作过期**：拦截改为放行，`code_find`/`code_callers` 把结果标成 `stale` 且点名路径，同时调度带冷却的后台补刷。台账**只在补刷真的重建了索引之后**才清空——被闸门挡下等于什么都没做，这时清账就是撒谎。为什么用台账而不是引擎的逐路径结论：引擎 0.11.0 实测，**全量重索引之后**立刻查一个没改过的文件，仍返回 `freshness=metadata_changed` / `read_source_and_reindex`，与改过的完全一样——那是项目代际信号，不是逐路径过期信号。拿它当门的结果是拦截永久失效，外加每条被拦的 grep 调度一次约 20s 重索引。`check_index_coverage` 仍留在 prompt 里当人工证据，只是不再当钩子的门 |
 | ③ 条件注入 | `systemPrompt.context`（order 130） | 开 | 只在上一条用户消息像"谁调用 / 定义在哪 / 重命名 / 影响范围"时注入一行：project + 新鲜度 + 用 code_find。其余轮次一个字符都不占 |
 
@@ -319,7 +274,7 @@ code_index（建索引 / 改完代码后刷新）
 
 ## 配置（可选）
 
-改配置有两条路。**设置 → 插件 → dsh-codebase-memory → `codebase-memory` 行 → 「配置」** 管十一个可改热字段（`enforce`、`telemetry`、`interceptBudgetMs`、`graphBudgetMs`、`zgBudgetMs`、`interceptTools`、`contextHint`、`dirtyTracking`、`logRetentionDays`、`recentLimit`、`markPassthrough`），并显示三块**只读**信息：「检索两层」状态行（结构层恒在；语义层实测 off/ready/missing，来自 `stats.zg`）、「仓库索引状态」表（本进程见过的每个 cwd 的 cbm project + `.zvec-grep` 索引状态 + 替换/拒绝计数）和「运行读数」卡片（拦截/替换/脏台账的实时计数，事件驱动刷新，见 `stats` 行），再加一块「最近替换效果」区（最近 N 条替换/拒绝决策 + 命中文本片段，可按仓库过滤，见 `stats.repos`/`stats.recent` 行）。面板按层排布（v0.10.0）：软引导 → 硬拦截 → 检索两层 → 记账与遥测 → 参数 → 仓库 → 最近效果 → 五卡 → 日志与环形上限，每行标签与控件同行、说明在行下，字段被改过时行内出现「恢复此项」（只恢复那一个字段，没有全局按钮）。**不用重启就生效**：宿主把新值推进拦截钩子正在读的那个 volatile 引用，所以会话中途把 `off` 翻成 `deny-once`，下一条 grep 就按新模式判定；开关即时写，输入框按回车或离开焦点才写（非法值不写）。其余字段照旧写在 composition 的 `codebase-memory` 行的 `config:` 里（**要重启**：配置文档在 boot 时组合）：
+改配置有两条路。**设置 → 插件 → dsh-codebase-memory → `codebase-memory` 行 → 「配置」** 管十个可改热字段（`enforce`、`telemetry`、`interceptBudgetMs`、`graphBudgetMs`、`interceptTools`、`contextHint`、`dirtyTracking`、`logRetentionDays`、`recentLimit`、`markPassthrough`），并显示三块**只读**信息：图谱层状态行（`stats.adapter` 进程裁决；v0.17.0 随语义层移除状态行里的语义档）、「仓库索引状态」表（本进程见过的每个 cwd 的 cbm project + 替换/拒绝计数）和「运行读数」卡片（拦截/替换/脏台账的实时计数，事件驱动刷新，见 `stats` 行），再加一块「最近替换效果」区（最近 N 条替换/拒绝决策 + 命中文本片段，可按仓库过滤，见 `stats.repos`/`stats.recent` 行）。面板按层排布（v0.10.0）：软引导 → 硬拦截 → 图谱层 → 记账与遥测 → 参数 → 仓库 → 最近效果 → 五卡 → 日志与环形上限，每行标签与控件同行、说明在行下，字段被改过时行内出现「恢复此项」（只恢复那一个字段，没有全局按钮）。**不用重启就生效**：宿主把新值推进拦截钩子正在读的那个 volatile 引用，所以会话中途把 `off` 翻成 `deny-once`，下一条 grep 就按新模式判定；开关即时写，输入框按回车或离开焦点才写（非法值不写）。其余字段照旧写在 composition 的 `codebase-memory` 行的 `config:` 里（**要重启**：配置文档在 boot 时组合）：
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
@@ -330,26 +285,23 @@ code_index（建索引 / 改完代码后刷新）
 | `autoIndex` | `true` | 自举时把引擎的 `auto_index` 对齐到该值（先读后写，值相同不重复写）。**作用域警告**：它落在机器级共享的 `~/.cache/codebase-memory-mcp/_config.db`，同机所有 MCP client 共用——不想让本插件替你决定就设成 `false`。实测语义：只给**尚无索引**的项目在会话启动时补一次全量，**不刷新陈旧坐标**，所以它不是防漂移手段（防漂移仍是 `code_index` + `check_index_coverage`） |
 | `sessionRefresh` | `true` | 会话启动（`agent/session-start`）时后台刷新**会话工作区**的索引，闸门为（git 状态变了）∧（该项目已索引过）∧（5 分钟冷却）。用来补引擎 watcher 在多工作区宿主下覆盖不到的洞——见[已知限制](#已知限制与不做)。设 `false` 关闭 |
 | `wrapperTools` | `true` | 层 ①：注册 `code_find` / `code_callers`。设 `false` 只剩代理工具 |
-| `enforce` | `off` | **热改**（设置页）。层 ②/②b：`off` / `deny-once`（符号类 grep 每会话每符号拒一次）/ `deny`（每次都拒）/ `replace`（grep 照常跑，模型看到的输出换成图谱/语义命中，不出错误）。**replace 是"硬替换"的正经档位**：不跟模型打"先查索引"的嘴仗，直接把结果摆它面前。要升 `deny` 先拿遥测证明误拦率可接受。（原 `advise`——post-execute 软提示注入——已于 2026-10-08 撤回；旧配置写 `advise` 会回落到 `off` 并在报表里提示） |
+| `enforce` | `off` | **热改**（设置页）。层 ②/②b：`off` / `deny-once`（符号类 grep 每会话每符号拒一次）/ `deny`（每次都拒）/ `replace`（grep 照常跑，模型看到的输出换成图谱命中，不出错误）。**replace 是"硬替换"的正经档位**：不跟模型打"先查索引"的嘴仗，直接把结果摆它面前。要升 `deny` 先拿遥测证明误拦率可接受。（原 `advise`——post-execute 软提示注入——已于 2026-10-08 撤回；旧配置写 `advise` 会回落到 `off` 并在报表里提示） |
 | `interceptTools` | `grep,glob` | **热改**（设置页）。逗号分隔的内置工具名（裸名小写；`glob` 的 pattern 基本不会被判成符号） |
 | `interceptBudgetMs` | `2500` | **热改**（设置页）。钩子里 cbm 查询的时间预算。实测热链路 29–34ms；v0.10.1 起 bootstrap 在会话外把连接预热（冷启动不再吃这份预算），这个数回归为纯热余量；**超预算就放行 grep** |
 | `contextHint` | `true` | **热改**（设置页）。层 ③：按 query 条件注入一行 `systemPrompt.context`。极简 agent 预设会整块压制 runtime-context，那时它不送达（①②⑤ 不受影响） |
 | `dirtyTracking` | `true` | **热改**（设置页）。层 ⑤：按会话记 `write`/`edit` 路径。**台账本身就是过期信号**（见触发层 ⑤——引擎那个逐路径结论并不是，理由见下表 ⑤ 行）；只有 `code_index`，或**真的跑完的**后台补刷，才会清空它 |
 | `dirtyRefreshCooldownSec` | `120` | 脏路径触发的后台补刷冷却（复用 `sessionRefresh` 那条带闸门的链路，同回合多次写入自然并成一次） |
-| `zgEnabled` | `false` | 语义检索层（①b）。`true` 时清单多注册一个 `zg` server（lifecycle `lazy`），prompt 多四行工具路由（首选 `code_search` 封装，长尾用 `zg_zvec_grep_search`）。**页面可写但延迟生效**：v0.11.0 起标了 volatile，设置页「检索两层」段有它的开关（开启走两步确认，写明体积/时长/`.zvec-grep/`→gitignore 的全部代价）；但 `cbm.json` 在适配层进程启动时才读，所以开关只改"下次清单长什么样"——差的那一步由状态行的 `pending-on`/`pending-off` 诚实报出，`code_setup {action:"restart-adapter"}` 重拉适配层（或重启宿主）才重建清单。前置：包已装（`code_setup {action:"install-zg"}` 或 `npm run install:zg`），否则报表 `语义层(zg): missing` 并指路装它（**绝不自动装**——430MB 是人的决定） |
-| `zgToolset` | `agent` | 传给 `zg server --mcp-toolset` 的工具集：`agent`（只露 `zvec_grep_search`，索引检索一条）/ `full`（另露受管 rg 直通与 4 个索引/状态工具——一般不必给模型） |
-| `zgVendorDir` | `$DSH_HOME/vendor/zvec-grep` | `install:zg` 的落点；CLI 路径 = `<该目录>/node_modules/@zvec/zvec-grep/dist/cli/index.js` |
 | `telemetry` | `true` | **热改**（设置页）。每次拦截 / 放行 / 记账 / 补刷写一行 JSON 到 `$DSH_HOME/vendor/mcp-adapter/`（按天分文件 `telemetry-YYYY-MM-DD.log`，见 `logRetentionDays`），并在 `code_setup` 里给出计数。要不要升 `deny-once`，靠这个数据拍。计数是**跨重启累计**的：每次推送顺带把计数 max 合并进同目录的 `telemetry.counts.json`，下次启动先播种回来（「开 replace 跑几天看占比」不该被重启清零）；v0.13.1 起**读侧也兑现**——报表渲染前先把累计文件里更大的值抬进显示，且每行日志带发出进程 `pid`（多宿主并跑可对账归因）；关掉遥测 ⇒ 停止写日志与累计文件，计数与读数**冻结在最后值**（不是清零），再开继续从累计走 |
 | `logRetentionDays` | `7` | **热改**（设置页）。遥测日志按天分文件（`telemetry-YYYY-MM-DD.log`），超期文件在写新日志时顺手清掉；当天文件仍受 `TELEMETRY_MAX_BYTES`（512KB）上限约束——超上限整份删当天文件，不做按天回退。设 `0` = 关掉轮转，日志无限期保留 |
 | `recentLimit` | `100` | **热改**（设置页）。设置页「最近替换效果」区最多留几条；超过从最旧开始丢（环形）。默认上限 500 条（进程内存，**不落盘**），环形上限只影响页面可见窗口 |
 | `markPassthrough` | `false` | **热改**（设置页）。`enforce=replace` 下 grep 被「让路」（脏台账 / 无命中 / 查询失败）时，是否在**原输出前**加一行「未替换 · 原始 grep 输出」的标记。默认关（模型拿到干净的原输出，不干扰下一步）；打开后模型能一眼看出"这次没被换"，代价是多一行文本 |
 | `staleWarnFiles` | `8` | **页面控件未接**（schema 已标 volatile、决策点现读，但设置页还没有它的输入框）：现况写在 composition 的 `config:` 里（**重启生效**）。层 ③ 旁路阈值：本会话脏台账 ≥ 该文件数时，contextHint **无视 CODE_QUESTION 闸门**注入一句命令「先 `code_index` 刷新、经 `cbm_check_index_coverage` 验鲜后才能信用图谱坐标；别拿整文件 read 找坐标」——动因是 agent-chat 会话审计（194 次 edit 只 2 次 `code_index`，写后不刷新 ⇒ 坐标不可信 ⇒ 整文件 read 绕行）。设 `0` 关闭旁路 |
 | `staleWarnMinIntervalSec` | `60` | 同上（composition，重启生效）。旁路注入的**每会话冷却**秒数；正门（query 命中 CODE_QUESTION）不受冷却限制，脏时照常带命令句 |
-| `stats` | `""` | **插件写的，人不要配**。设置页「运行读数」的数据源：volatile 引用里的全量计数 JSON——`describe()` 直接读 `ref.get()` 把运行期数据推给页面，**不碰持久化文档**（指纹只含文档层值，不涨 revision）；每次推送后 emit `settings/document-updated` 触发浏览器重拉镜像，2 秒节流合并。它是**方向反转的 volatile**（插件→页面）；用户在文档里写什么都会被下一个事件的全量重建覆盖。**开机即推一帧快照**（遥测开时）：计数先从累计文件 `telemetry.counts.json` 播种，所以刚重启、还没事件的设置页也是**带历史数**的五张卡片常驻（真没历史才全零），不是"暂无读数"（design-v2 §6.6/§6.7）。载荷里语义层按**三轴**分开给——`zg`（清单事实 off/ready/missing）、`zgWant`（页面开关）、`zgInstalled`（包实测），「检索两层」状态行由三轴推导（v0.11.0）；`install-zg` 进行中会推 `installing` 帧；zg 探测完成即补推一帧，**遥测关时照旧一帧不推**（页面与日志同一开关）；v0.16 起载荷另有 `nearMiss.symbol`（近失计数：交替式 grep 判字面量但含符号形分支——`enforce=off` 时不记，防纯 off 用户噪声）与 `lever.staleWarn`（旁路陈旧提醒注入次数，见 `staleWarnFiles` 行） |
+| `stats` | `""` | **插件写的，人不要配**。设置页「运行读数」的数据源：volatile 引用里的全量计数 JSON——`describe()` 直接读 `ref.get()` 把运行期数据推给页面，**不碰持久化文档**（指纹只含文档层值，不涨 revision）；每次推送后 emit `settings/document-updated` 触发浏览器重拉镜像，2 秒节流合并。它是**方向反转的 volatile**（插件→页面）；用户在文档里写什么都会被下一个事件的全量重建覆盖。**开机即推一帧快照**（遥测开时）：计数先从累计文件 `telemetry.counts.json` 播种，所以刚重启、还没事件的设置页也是**带历史数**的五张卡片常驻（真没历史才全零），不是"暂无读数"（design-v2 §6.6/§6.7）。载荷带 `adapter` 进程轴（`fresh`/`stale`/`no-process`）供图谱层状态行推导，**遥测关时照旧一帧不推**（页面与日志同一开关）；v0.16 起载荷另有 `nearMiss.symbol`（近失计数：交替式 grep 判字面量但含符号形分支——`enforce=off` 时不记，防纯 off 用户噪声）与 `lever.staleWarn`（旁路陈旧提醒注入次数，见 `staleWarnFiles` 行）；v0.17.0 随语义层撤掉 `zg`/`zgWant`/`zgInstalled` 三轴 |
 
 回滚按杠杆来：`{"enforce":"off","contextHint":false,"dirtyTracking":false,"wrapperTools":false}` 就退回 v0.2 的行为，新开会话即生效。
 
-**为什么页面是一段自己写的代码。** DSH 的设置服务只暴露 schema 里标了 `.volatile()` 的字段，而且**明确不替它们生成页面**（`@deepseek-ai/dsh-settings` README：“Each form reports `autoGenerate` … **no shipped client does so yet**”）。所以可改的六个字段、加一个**可写但延迟生效**的语义层开关 `zgEnabled`（清单要重启才重建——诚实靠状态机的 `pending-on`/`pending-off` 报出，不靠藏开关），再加一条**反向**的读数通道 `stats`，共八个在 `Config` 里标 volatile——`stats` 不是页面写给插件，是插件推给页面：volatile 是 `describe()` 解引用 `ref.get()` 把运行期数据带进页面的唯一通道，且不碰持久化文档。`lib/client.js` —— 一段手写的 `__ModuleLoader__` bundle，没有构建步骤，形状照官方 `dsh-client-ui-settings-agent-loop` —— 把它注册进 `plugins.row.config` 槽，key 是 `<包名>#<row id>`。写入走宿主自己的 `ctx.configForms`/`remote.settings` 通道，落盘位置就是 profile 的 `cordis.patch.yml`。两个后果值得知道，因为它决定了以后能不能往页面上加字段：**没标 volatile 的字段结构上就看不见**（`describe()` 直接跳过没有任何 volatile 字段的条目——这就是当初那个开关"设置里找不到"的原因）；**标了 volatile 的字段必须在决策点用 `.get()` 读**，在 `apply` 里取快照会让页面变成谎言——v0.9.0 把 `interceptTools`/`contextHint`/`dirtyTracking` 升上页面时，同步把它们的**注册期门闸挪进监听器回调**（监听器常驻，回调第一行现读），臂 T 断言的就是"翻引用不重挂载，行为当场跟着变"。`lib/client.js` 在 `RUNTIME_FILES` 里，所以客户端副本过期会和 `index.js` 过期一样被 `code_setup` 报出来。
+**为什么页面是一段自己写的代码。** DSH 的设置服务只暴露 schema 里标了 `.volatile()` 的字段，而且**明确不替它们生成页面**（`@deepseek-ai/dsh-settings` README：“Each form reports `autoGenerate` … **no shipped client does so yet**”）。所以可改的六个字段，再加一条**反向**的读数通道 `stats`，共七个在 `Config` 里标 volatile——`stats` 不是页面写给插件，是插件推给页面：volatile 是 `describe()` 解引用 `ref.get()` 把运行期数据带进页面的唯一通道，且不碰持久化文档。`lib/client.js` —— 一段手写的 `__ModuleLoader__` bundle，没有构建步骤，形状照官方 `dsh-client-ui-settings-agent-loop` —— 把它注册进 `plugins.row.config` 槽，key 是 `<包名>#<row id>`。写入走宿主自己的 `ctx.configForms`/`remote.settings` 通道，落盘位置就是 profile 的 `cordis.patch.yml`。两个后果值得知道，因为它决定了以后能不能往页面上加字段：**没标 volatile 的字段结构上就看不见**（`describe()` 直接跳过没有任何 volatile 字段的条目——这就是当初那个开关"设置里找不到"的原因）；**标了 volatile 的字段必须在决策点用 `.get()` 读**，在 `apply` 里取快照会让页面变成谎言——v0.9.0 把 `interceptTools`/`contextHint`/`dirtyTracking` 升上页面时，同步把它们的**注册期门闸挪进监听器回调**（监听器常驻，回调第一行现读），臂 T 断言的就是"翻引用不重挂载，行为当场跟着变"。`lib/client.js` 在 `RUNTIME_FILES` 里，所以客户端副本过期会和 `index.js` 过期一样被 `code_setup` 报出来。
 
 ## 验收
 
@@ -360,8 +312,8 @@ npm run check   # = check:patch + check:client + check:plugin + check:chain + ch
 | 检查 | 证明什么 |
 |---|---|
 | `check-patch.mjs` | `cordis.patch.yml` 里 3 个 `!!js` 表达式按 Loader 原语义能求值，且指向真实文件；`DSH_HOME` 缺失时的回退同值 |
-| `check-client.mjs` | 不开浏览器也验设置页：在 `node:vm` 里用桩 `__ModuleLoader__` / react / primitives / ctx 加载 `lib/client.js`，断言 package.json 里 `dsh.client`、`exports["./client"]`、`files` 三处声明齐全，**槽 key = `<包名>#<row id>` 是从 `cordis.patch.yml` 反解出来的**（改行 id 忘了改 key，按钮就不出现，而且 GUI 一声不响），served namespace 等于宿主 entry id，`require` 的名字全在宿主 baseline 内（名字打错同样是不出现，不是报错），中英词典覆盖 `ENFORCE_MODES` 的每个模式，五种快照态（ready / writable:false / loading / unavailable / summary）渲染正确，点一下真的落到 `form.set('enforce', …)` / `form.unset(…)`；**运行读数**渲染 dsh-mneme 式卡片栅格（每卡一个大数字 + 指标行，命中率卡带结构层/语义层占比条）；遥测开着时**卡片常驻**——开机先推零值快照，坏 JSON / 缺值按零渲染，空态只属于关了遥测；除既有开关外不新增任何交互件（读数只读）；v0.9.0 起另有三个开关（contextHint/dirtyTracking/telemetry）与两个 blur 输入框（interceptBudgetMs/interceptTools）：非法/空值一个字节都不写、输入框拨回当前值，回车即提交；v0.10.0 布局契约也被断言：五个分层标题按序在场（软引导→硬拦截→检索两层→记账遥测→参数）、开关标签与控件同行（span 自铺，不依赖 primitives.Switch 的 label prop——它在宿主上不渲染可见文字）、「检索两层」状态行常驻且语义层取自 `stats.zg`（没数说「状态未知」）、「恢复此项」按 user 层逐字段行内出现（字典里禁止裸「恢复默认」key）；v0.11.0 起语义层开关也在页上：开启走**两步确认**——确认文案**动作前置**（第一句就指路：开关不装包，装包对 agent 说「装语义检索层」走 `code_setup {action:"install-zg"}` 或终端 `npm run install:zg`；门禁断言 `code_setup` 必须出现在 `430MB` 之前，且**禁止出现 1230**——全装体积是实现细节，用户点头的对象是净开销）、含 32MiB 模型 / `.zvec-grep/`→gitignore / 重启提醒；确认面板在场时一个字节都不写、点「确认开启」才落 `form.set('zgEnabled', true)`、点取消零写入、关闭不经确认直接写；**zg 行永不渲染「恢复此项」**（布尔关掉即默认，user 显式含 zgEnabled 也不出按钮的行为臂钉死）；状态行由三轴推导，`pending-on`/`pending-off`/`installed`/`installing` 各有独立文案；v0.11.2 起状态行按三档着色（异常红/待清橙/常态灰）；v0.12.0 起再加两条：zg 开着时 `.zvec-grep/`→gitignore 提示**常驻**（不随一次性确认面板消失，关了不出现），进程轴 `stats.adapter` 为 `stale`/`no-process` 才出警示行（fresh 沉默——没病别呻吟），两态文案都指路 `restart-adapter` |
-| `check-plugin.mjs` | 假 ctx（镜像真实服务的前提校验，含 `tools.execute` 与 `systemPrompt.section/context`）真实跑 `apply` 与**每一条触发层**：链路就绪、工作区来自会话 cwd、不同工作区→不同 project、cbm 缺失时 throw 并给出安装命令；`classifyPattern` 用 12 个符号类 + 21 个字面量类正反例证伪（**误拦必须为 0**），v0.16 起对交替式逐支判：全支皆符号 ⇒ `symbol-multi` 并集替换（逐支各查一次图谱、混合支/超 4 支封顶整体放行并标近失，动因=agent-chat 审计里 `grep "a|b|c"` 是逃逸主口且首支 def 形会劫持整条 pattern）；近失注入 observeCall 计 `near-miss-symbol`（off 档不记）；旁路陈旧提醒（`staleWarnFiles`）注入臂断言 8 文件阈值触发/60s 冷却/`0` 关闭三态；`deny-once` 拦一次后放行（multi 在 deny 档放行，fail-open）；超预算 / 未索引 / 坐标过期一律 **fail-open**；post-execute 不再追加任何上下文（advise 注入已撤回，臂 G7 断言的就是这一点）；脏路径惰性记账且工作区外不入集合；条件注入命中给一行、不命中给 `""`；**臂 Z**：默认清单**不含** `zg`、prompt 不含 zvec 路由，`zgEnabled` 后临时清单里 `zg` 以 `lazy` 注册且 prompt 出现 `zg_zvec_grep_search`，vendor 缺失只报表提示 `install:zg`（**绝不自动装**——430MB 是人的决定），非法 `zgToolset` 回落 `agent` 并留 note；v0.11.0 起再加三条：报表与 stats 载荷按**三轴**分开报（清单事实 `zg` / 包实测 `zgInstalled` / 页面开关 `zgEnabled`，轴间差必须在报表行写出「重启后生效」的 ⚠，页面与报表都不许把"想开"演成"已开"），`code_setup {action:"install-zg"}` 与 `install:zg` 同版本同裁剪（包已在位**不重复下载**并计 `zg-install-skip`，结果文案必须带重启与 `.zvec-grep`→gitignore 提醒，未知 action 直接抛错），且 `index.js` 与 `scripts/install-zg.mjs` 的包名/版本/裁剪清单被**静态比对钉死**——两条安装路线不许漂移；**臂 G8.5**（v0.11.3）：语义层已开启但缺包时，contextHint 注入行必须带上「问用户是否同意执行 `code_setup {action:"install-zg"}`」的纠正句（命中计 `hint-zg-missing`），开关关着或包在位时必须消失——纠正走既有注入杠杆，不恢复事件注入；**臂 R**（`enforce=replace`）：符号形 grep 照常执行成功、模型看到的输出被整体换成两层检索的命中（结构层=代码图谱先答、语义层=zvec-grep 补位，文案不得写成二选一；无 `additionalContexts`、查询走代理不 spawn CLI），字面量 / 失败结果 / 图谱语义都无命中 / 脏台账会话一律**原样放行**，volatile 开关热翻立即开合替换通道，报表计数 `intercept-replace` 可见；**臂 S**（设置页读数通道）：替换事件后 volatile `stats` 引用里是**从计数全量重建**的 JSON（`replace.hit`/`graph` 拆分 + 顶层 `zg` 状态 + `at` 时间戳），恰好 emit `settings/document-updated`（字符串 ns 首参——cordis 才不会把它当 thisArg 过滤；浏览器端参数被忽略，事件本身即刷新扳机），封装调用与提示注入也进读数，**开机遥测开即先推一帧快照**（刚重启的页面也是卡片），**遥测关时既不推也不 emit（含开机）**；**臂 R2**（作用域，v0.8.2）：`path` 指向工作区**之外**的 grep 原样保留且**不查两层**（图谱/语义都是工作区级的，替换=拿别的仓库坐标伪造答案），工作区内指定文件的 grep 照换不误；**臂 R3**（错误文本，v0.8.2）：代理把底层 MCP 错误包成普通文本返回（`isError` 不置真）时判为**查询失败**——不替换，且计成 `replace-pass-failed` 而非 no-hit（泡数据时这两个占比含义相反）；**臂 S2**（累计计数，v0.8.2）：开机从累计文件播种（文件里 7 ⇒ 第一帧读数就是 7），新事件与文件 **max 合并**落盘（7→8，不是覆盖）——harness 用 `DSH_CBM_COUNTS_FILE` 测试缝给每次 mount 换独立文件，精确数字断言才不被历史污染；**热改契约**：可改字段加读数通道共八个标了 volatile（六个即时热改 + `zgEnabled` 可写但延迟生效 + `stats` 反向通道；且没有多余字段被标——标错等于把需要重启的东西伪装成热改），拦截钩子在 `enforce: off` 时**照样注册但直接放行**，把 volatile 引用在已挂载的插件上从 `off` 翻到 `deny` 再翻回来，判定立刻跟着变；**臂 T**（v0.9.0 新字段的热翻契约）：不重挂载，翻 `dirtyTracking` 引用 ⇒ 记账当场开合（关了新会话的 edit 不入册、替换不再为脏让路），翻 `contextHint` ⇒ 提示回调当场从一行变 `''`，翻 `interceptTools`（`['grep']`→`'grep,glob'`）⇒ glob 调用当场从放行变被替换——**监听器常驻、字段在决策点现读**是这三条成立的前提；**臂 W**（v0.10.1 冷启动契约）：bootstrap 在会话外恰好预热一发 `list_projects`（重复 code_setup 不叠加，报告行可见 `warm=`），且 `projectFor` 查不到 project 时错误消息必须区分**"项目表里没有"**（指向 code_index）与**"查询失败"**（带出代理原文）——引擎冷启动不再谎称工作区没索引；**臂 X**（v0.12.0 进程轴）：枚举解析函数双平台单测（Windows `pid|ISO`、POSIX etime 换算 + `cbm.json` 过滤）；报表进程轴必须给结论——`stale`（清单比活进程新）指路 `restart-adapter`、`fresh` 不吓唬人、`no-process` 另说；`code_setup {action:"restart-adapter"}` 杀老进程等新进程复活（测试缝 `DSH_CBM_KILL_STUB_FILE` 只记账不真杀），转 `fresh` 并计遥测；代理 `Tool "…" not found` 的返回（以 `Tool` 开头，旧嗅探当成功放过——`warm=ok` 撒谎的根因）判失败，`projectFor` 错误文本追加"不在活进程里"并指路；stats 载荷带 `adapter` 轴。harness 里进程枚举一律走罐头（`opts.procTable`），绝不起真 powershell/ps |
+| `check-client.mjs` | 不开浏览器也验设置页：在 `node:vm` 里用桩 `__ModuleLoader__` / react / primitives / ctx 加载 `lib/client.js`，断言 package.json 里 `dsh.client`、`exports["./client"]`、`files` 三处声明齐全，**槽 key = `<包名>#<row id>` 是从 `cordis.patch.yml` 反解出来的**（改行 id 忘了改 key，按钮就不出现，而且 GUI 一声不响），served namespace 等于宿主 entry id，`require` 的名字全在宿主 baseline 内（名字打错同样是不出现，不是报错），中英词典覆盖 `ENFORCE_MODES` 的每个模式，五种快照态（ready / writable:false / loading / unavailable / summary）渲染正确，点一下真的落到 `form.set('enforce', …)` / `form.unset(…)`；**运行读数**渲染 dsh-mneme 式卡片栅格（每卡一个大数字 + 指标行）；遥测开着时**卡片常驻**——开机先推零值快照，坏 JSON / 缺值按零渲染，空态只属于关了遥测；除既有开关外不新增任何交互件（读数只读）；v0.9.0 起另有三个开关（contextHint/dirtyTracking/telemetry）与两个 blur 输入框（interceptBudgetMs/interceptTools）：非法/空值一个字节都不写、输入框拨回当前值，回车即提交；v0.10.0 布局契约也被断言：五个分层标题按序在场（软引导→硬拦截→图谱层→记账遥测→参数）、开关标签与控件同行（span 自铺，不依赖 primitives.Switch 的 label prop——它在宿主上不渲染可见文字）、图谱层状态行常驻（`stats.adapter` 为 stale/no-process 才出警示行，fresh 沉默）、「恢复此项」按 user 层逐字段行内出现（字典里禁止裸「恢复默认」key）；v0.17.0 起语义层开关、两步确认、三轴文案、三档着色、gitignore 常驻提示随该层一并消失（防回潮锁断言 `zg.*`/`layer.zg.*` 键与两步确认组件永不再现）；进程轴警示契约保留：`stats.adapter` 为 `stale`/`no-process` 才出警示行（fresh 沉默），文案指路 `restart-adapter` |
+| `check-plugin.mjs` | 假 ctx（镜像真实服务的前提校验，含 `tools.execute` 与 `systemPrompt.section/context`）真实跑 `apply` 与**每一条触发层**：链路就绪、工作区来自会话 cwd、不同工作区→不同 project、cbm 缺失时 throw 并给出安装命令；`classifyPattern` 用 12 个符号类 + 21 个字面量类正反例证伪（**误拦必须为 0**），v0.16 起对交替式逐支判：全支皆符号 ⇒ `symbol-multi` 并集替换（逐支各查一次图谱、混合支/超 4 支封顶整体放行并标近失，动因=agent-chat 审计里 `grep "a|b|c"` 是逃逸主口且首支 def 形会劫持整条 pattern）；近失注入 observeCall 计 `near-miss-symbol`（off 档不记）；旁路陈旧提醒（`staleWarnFiles`）注入臂断言 8 文件阈值触发/60s 冷却/`0` 关闭三态；`deny-once` 拦一次后放行（multi 在 deny 档放行，fail-open）；超预算 / 未索引 / 坐标过期一律 **fail-open**；post-execute 不再追加任何上下文（advise 注入已撤回，臂 G7 断言的就是这一点）；脏路径惰性记账且工作区外不入集合；条件注入命中给一行、不命中给 `""`；**臂 Z**（v0.17.0 防回潮锁）：默认清单**只有** `cbm`——prompt、`index.js` 均无 zvec / `code_search` / `install-zg` 残留（删掉的层不许被哪次复制配置悄悄招魂）；`code_setup` 对未知 action 直接抛错；临时目录重建清单仍断言单 `cbm` + `scriptMode:true`；**臂 R**（`enforce=replace`）：符号形 grep 照常执行成功、模型看到的输出被整体换成图谱命中（无 `additionalContexts`、查询走代理不 spawn CLI），字面量 / 失败结果 / 图谱无命中 / 脏台账会话一律**原样放行**，volatile 开关热翻立即开合替换通道，报表计数 `intercept-replace` 可见；**臂 S**（设置页读数通道）：替换事件后 volatile `stats` 引用里是**从计数全量重建**的 JSON（`replace.hit`/`graph` 拆分 + `adapter` 进程轴 + `at` 时间戳），恰好 emit `settings/document-updated`（字符串 ns 首参——cordis 才不会把它当 thisArg 过滤；浏览器端参数被忽略，事件本身即刷新扳机），封装调用与提示注入也进读数，**开机遥测开即先推一帧快照**（刚重启的页面也是卡片），**遥测关时既不推也不 emit（含开机）**；**臂 R2**（作用域，v0.8.2）：`path` 指向工作区**之外**的 grep 原样保留且**不查图谱**（图谱是工作区级的，替换=拿别的仓库坐标伪造答案），工作区内指定文件的 grep 照换不误；**臂 R3**（错误文本，v0.8.2）：代理把底层 MCP 错误包成普通文本返回（`isError` 不置真）时判为**查询失败**——不替换，且计成 `replace-pass-failed` 而非 no-hit（泡数据时这两个占比含义相反）；**臂 S2**（累计计数，v0.8.2）：开机从累计文件播种（文件里 7 ⇒ 第一帧读数就是 7），新事件与文件 **max 合并**落盘（7→8，不是覆盖）——harness 用 `DSH_CBM_COUNTS_FILE` 测试缝给每次 mount 换独立文件，精确数字断言才不被历史污染；**热改契约**：可改字段加读数通道共七个标了 volatile（六个即时热改 + `stats` 反向通道；且没有多余字段被标——标错等于把需要重启的东西伪装成热改），拦截钩子在 `enforce: off` 时**照样注册但直接放行**，把 volatile 引用在已挂载的插件上从 `off` 翻到 `deny` 再翻回来，判定立刻跟着变；**臂 T**（v0.9.0 新字段的热翻契约）：不重挂载，翻 `dirtyTracking` 引用 ⇒ 记账当场开合（关了新会话的 edit 不入册、替换不再为脏让路），翻 `contextHint` ⇒ 提示回调当场从一行变 `''`，翻 `interceptTools`（`['grep']`→`'grep,glob'`）⇒ glob 调用当场从放行变被替换——**监听器常驻、字段在决策点现读**是这三条成立的前提；**臂 W**（v0.10.1 冷启动契约）：bootstrap 在会话外恰好预热一发 `list_projects`（重复 code_setup 不叠加，报告行可见 `warm=`），且 `projectFor` 查不到 project 时错误消息必须区分**"项目表里没有"**（指向 code_index）与**"查询失败"**（带出代理原文）——引擎冷启动不再谎称工作区没索引；**臂 X**（v0.12.0 进程轴）：枚举解析函数双平台单测（Windows `pid|ISO`、POSIX etime 换算 + `cbm.json` 过滤）；报表进程轴必须给结论——`stale`（清单比活进程新）指路 `restart-adapter`、`fresh` 不吓唬人、`no-process` 另说；`code_setup {action:"restart-adapter"}` 杀老进程等新进程复活（测试缝 `DSH_CBM_KILL_STUB_FILE` 只记账不真杀），转 `fresh` 并计遥测；代理 `Tool "…" not found` 的返回（以 `Tool` 开头，旧嗅探当成功放过——`warm=ok` 撒谎的根因）判失败，`projectFor` 错误文本追加"不在活进程里"并指路；stats 载荷带 `adapter` 轴。harness 里进程枚举一律走罐头（`opts.procTable`），绝不起真 powershell/ps |
 | `check-chain.mjs` | 真拉起 adapter → cbm 做 MCP 握手：代理工具就位、懒连接被唤醒、`search_graph` 返回真实行、**阶段 3.5 实测钩子的时间预算**，最后 `describe` 出 prompt 承诺的参数形状 |
 | `check-tokens.mjs` | **消融臂**：直连 cbm vs 经代理的 `tools/list` 实际体积；代理不比直连小就 throw |
 
@@ -369,8 +321,8 @@ npm run check   # = check:patch + check:client + check:plugin + check:chain + ch
 
 ```
 PATCH OK
-268/268 臂通过（tauri + web 两个 profile）   PLUGIN OK
-CHAIN OK — 阶段3.5 代理链路延迟 ms: min=28 中位=32 max=34；配了 zg 的临时清单另跑 阶段2b：桥接 + 语义检索返回真实结果
+167/167 臂通过（1 个 profile：web）   PLUGIN OK
+CHAIN OK — 阶段3.5 代理链路延迟 ms: min=28 中位=32 max=34
 臂A 直连 cbm            : 17 工具, 17308 B ≈ 4327 tokens
 臂B 代理·冷缓存         :  2 工具,  4278 B ≈ 1070 tokens  （省 4.0x）
 臂C 代理·缓存含resources:  3 工具,  4871 B ≈ 1218 tokens  （省 3.6x）
@@ -384,15 +336,11 @@ cbm CLI 同一台机器单次 search_graph        : 5491 / 6526 / 8280 ms  ← �
 
 | 症状 | 原因与处置 |
 |---|---|
-| `zg_zvec_grep_search` 报 `root: Invalid input: expected string` | `root` 是**必填**——工作区绝对路径（守护进程可见的那个）。代理不替模型填参数：让模型用它已知的会话工作目录传入即可 |
-| 模型调 `zvec_grep_search` 报 tool_not_found | 代理把 MCP 工具名**按 mcpServers 键加前缀**：经本插件的清单它叫 `zg_zvec_grep_search`（zg 直连才叫裸名）。usage prompt 已给对名字——看到裸名说明会话里是旧 bundle，`npm run sync` + 重启 |
-| 刚开语义层的仓库首查 `zg_zvec_grep_search` 报 `INDEX_MISSING` | 不是故障，是上游守门：建持久索引需要用户显式授权，守护进程在 `activate()` 里直接 throw，**在读 `freshness`/`autoUpdate` 之前**（0.2.2 实证；`autoUpdate: true` 只能对**已有**索引做后台 reconcile，救不了首建）。首建唯一入口是 CLI `node <zgCli> index`——`index` 动词刻意不给 agent。v0.13.3 起 contextHint 事前提示模型（先问用户、再执行命令）；v0.15.0 起 `code_search` 在调引擎**之前**就拦下并给出同一条处方 |
-| 语义层装了、也有索引，但 `enforce=replace` 的替换里再也没有语义结果了 | **v0.15.0 的刻意行为**（M4'）：语义层退出替换通道，改走 `code_search` 显式调用。原因三条——裸标识符是向量检索的最差输入；"图谱没答案才试语义"只在语义最不擅长时启动；6s + 4s 让一次 grep 白等 10s。想恢复只能改代码，`index.js` replace 路径里那段注释写了完整理由 |
 | 某次 grep 返回 `Error: dsh-codebase-memory：…` | 这是层 ② 的**拦截**，不是故障：默认 `enforce=off` 根本不拦，只有你显式设成 `deny-once`/`deny` 才会出现；`deny-once` 对同一会话同一符号**只拦一次**，reason 里已带 `search_graph` 命中。想彻底关掉：设置页一键，或 `{"enforce":"off"}` |
-| grep 的"结果"变成几行检索命中、没有文件内容 | 不是故障：`enforce=replace`（层 ②b）把符号形 grep 的模型可见输出换成了两层检索（结构层图谱/语义层 zvec-grep）的命中，调用本身照常成功、不出错误。想回到原始输出：设置页把 enforce 翻回 `off`，即时生效。本会话台账脏（刚写过代码）时替换会自动让路，这时又是原输出——两种都正常 |
+| grep 的"结果"变成几行检索命中、没有文件内容 | 不是故障：`enforce=replace`（层 ②b）把符号形 grep 的模型可见输出换成了图谱，调用本身照常成功、不出错误。想回到原始输出：设置页把 enforce 翻回 `off`，即时生效。本会话台账脏（刚写过代码）时替换会自动让路，这时又是原输出——两种都正常 |
 | 设置页改了 `enforce`，但 grep 照样不被拦 | 先分清是"没生效"还是"合法放行"。`code_setup` 触发层那行现在报的是**实时值**，跟着设置页变就说明钩子每次调用都在重读配置（报表跟着变本身就是证据）。仍不拦的三种合法情形：pattern 被分成**字面量**（层 ② 只拦符号形）、代码图对该符号**无命中**、当前会话没有可绑定的工作区（cwd 不是路径，比如远程会话）。要确认钩子有没有跑，看 `telemetry.log` 里的 `intercept-*` 行 |
 | 设置页「运行读数」全是零 / 长时间不动 | 卡片常驻（开机即推首帧快照，计数从累计文件播种），所以**全零 = 本次启动没有事件、且没有历史累计文件**：没有符号形 grep、没写代码文件，就不会涨。遥测关着则计数与读数冻结在最后值。改一次配置会把 volatile 引用复位成文档默认——**不是丢数据**，下一个事件即推回全量读数。注意读数是**跨重启累计**的（`telemetry.counts.json`）：想从零开始重新泡数据，删掉这个文件再重启 |
-| `codebase-memory` 行**没有「配置」按钮**（设置 → 插件） | 按钮由 `lib/client.js` 注册，且三个条件同时成立才出现——**每一个失败都不报错**，所以这条单独列出：① 宿主只有在 `describe()` 发现该 entry 有 volatile 字段时才 serve 命名空间，装进去的 `index.js` 若没有 `.volatile()` 就没有按钮（`node scripts/sync.mjs` 后重启）；② 槽 key 必须严格等于 `<包名>#<row id>`（本包是 `dsh-codebase-memory#codebase-memory`），只改 `cordis.patch.yml` 的行 id 不改 key，按钮就消失——所以 `npm run check:client` 从 patch 反解 key，不信 bundle 里的常量；③ bundle 必须是开着的（`@deepseek-ai/dsh-client-ui-plugin-manager` README：“The bundle's patch must declare the row under that id, and the registration exists while the bundle is on”）。客户端副本装歪会被 `code_setup` 的 `fileDrift` 报出来（`lib/client.js` 在 `RUNTIME_FILES` 里），但它不会告诉你按钮不见了。**页面上没有的字段**（`wrapperTools`/`sessionRefresh`/`autoIndex`/`bootstrap`/`dirtyRefreshCooldownSec`/`zgToolset`/`zgVendorDir`）仍是 composition 级：改 patch，重启宿主——`wrapperTools` 与 `zg*` 是**结构上没法热改**（工具注册无注销、清单在适配层进程启动时才读），不是没做；`zgEnabled` 自 v0.11.0 起在页上可写，但正因如此它显示的是 pending 状态机而非"即时生效" |
+| `codebase-memory` 行**没有「配置」按钮**（设置 → 插件） | 按钮由 `lib/client.js` 注册，且三个条件同时成立才出现——**每一个失败都不报错**，所以这条单独列出：① 宿主只有在 `describe()` 发现该 entry 有 volatile 字段时才 serve 命名空间，装进去的 `index.js` 若没有 `.volatile()` 就没有按钮（`node scripts/sync.mjs` 后重启）；② 槽 key 必须严格等于 `<包名>#<row id>`（本包是 `dsh-codebase-memory#codebase-memory`），只改 `cordis.patch.yml` 的行 id 不改 key，按钮就消失——所以 `npm run check:client` 从 patch 反解 key，不信 bundle 里的常量；③ bundle 必须是开着的（`@deepseek-ai/dsh-client-ui-plugin-manager` README：“The bundle's patch must declare the row under that id, and the registration exists while the bundle is on”）。客户端副本装歪会被 `code_setup` 的 `fileDrift` 报出来（`lib/client.js` 在 `RUNTIME_FILES` 里），但它不会告诉你按钮不见了。**页面上没有的字段**（`wrapperTools`/`sessionRefresh`/`autoIndex`/`bootstrap`/`dirtyRefreshCooldownSec）仍是 composition 级：改 patch，重启宿主——`wrapperTools` 与 `sessionRefresh` 是**结构上没法热改**（工具注册无注销、清单在适配层进程启动时才读），不是没做。（v0.17.0：`zg*` 三字段随语义层移除） |
 | `code_find` 提示"坐标很可能已过期" | 层 ⑤ 的自检生效了：返回的源码里没有那个符号名（上游 issue #1750 的静默错位）。跑一次 `code_index`；插件已经在后台补刷，但**别在补刷完成前信这些行号** |
 | 启动后头几次 `code_find` 报"查不到 project（list_projects 查询失败）" | 引擎冷启动：第一发要等 MCP server 进程起来（加载全部 project 的图谱库）。v0.10.1 起 bootstrap 已在会话外恰好预热一发；v0.13.2 起预热**按真实完成落账**——`code_setup` 报表里 `warm=pending` 是开机后头几分钟的常态（引擎还在热），焐好后翻 `warm=ok`（遥测带耗时 ms）；`warm=failed` 才是那发真出了错，按进程轴判词走 restart-adapter。撞上冷引擎重试即可。**注意和"项目表里没有"区分**——那半句才是真没索引，先 `code_index` |
 | 代理工具报 `Tool "cbm_*" not found`，`code_setup` 报 `适配层进程: ⚠ stale` | 清单被重写过、活着的适配层进程还没加载它。v0.13.0 钉的适配层（≥0.0.6）自带清单监听，**几秒内自愈**；持续 stale 说明是老进程/老包（或 `MCP_CONFIG_WATCH` 关了）——对 agent 说「重启适配层」：`code_setup {action:"restart-adapter"}`，杀老进程、宿主监督器几秒内自动重拉，**不必重启宿主**；报表转 `fresh` 即恢复（v0.12.0 事故的 0-server 死锁；`warm=failed` 同因） |
