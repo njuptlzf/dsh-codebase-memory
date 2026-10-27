@@ -157,7 +157,8 @@ for (const lang of ['zh', 'en']) ok(!!dictEntry?.dict?.[lang], `字典有 ${lang
 const keys = Object.keys(dictEntry?.dict?.zh || {})
 for (const key of ['title', 'summary', 'loading', 'unavailable', 'enforce.label', 'telemetry.label', 'resetField', 'saveFailed', 'foot',
   'stats.label', 'stats.empty', 'stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index', 'stats.updated',
-  'stats.r.qfailgraph', 'stats.r.lph', 'stats.r.lpc', 'stats.budget',
+  'stats.r.qfailgraph', 'stats.r.lph', 'stats.r.lpc', 'stats.r.shdone', 'stats.r.shfail', 'stats.r.shnotgit', 'stats.budget',
+  'selfHeal.label', 'selfHeal.hint',
   'hint.label', 'hint.hint', 'dirty.label', 'dirty.hint', 'interceptBudgetMs.label', 'interceptBudgetMs.hint',
   'interceptTools.label', 'interceptTools.hint',
   'sec.soft', 'sec.soft.hint', 'sec.hard', 'sec.hard.hint', 'sec.layers', 'sec.layers.hint',
@@ -167,6 +168,7 @@ for (const key of ['title', 'summary', 'loading', 'unavailable', 'enforce.label'
 }
 for (const key of ['hint.label', 'dirty.label', 'interceptBudgetMs.label', 'interceptTools.label', 'resetField',
   'sec.soft', 'sec.hard', 'sec.layers', 'sec.aux', 'sec.params',
+  'selfHeal.label', 'stats.r.shdone', 'stats.r.shnotgit',
   'layer.graph', 'layer.adapter.stale', 'layer.adapter.noproc']) {
   ok(Object.keys(dictEntry?.dict?.en || {}).includes(key), `en 字典有 key ${key}`)
 }
@@ -202,21 +204,22 @@ ok(JSON.stringify(segValues) === JSON.stringify(modes), '分段控件的选项 =
 ok(seg?.props?.value === 'deny-once', '分段控件当前值取自主机快照', seg?.props?.value)
 ok(seg?.props?.disabled === false, 'writable 时控件可用')
 const switches = flatten(tree).filter((n) => n.type === primitives.Switch)
-ok(switches.length === 4, '渲染出 4 个 Switch（contextHint / markPassthrough / dirtyTracking / telemetry——按层排布）', String(switches.length))
+ok(switches.length === 5, '渲染出 5 个 Switch（contextHint / markPassthrough / dirtyTracking / autoSelfHeal / telemetry——按层排布）', String(switches.length))
 const texts185 = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
 ok(['sec.soft', 'sec.hard', 'sec.layers', 'sec.aux', 'sec.params'].every((k) => texts185.includes(k)),
   '五个分层标题按序在场（软引导→硬拦截→图谱层→记账遥测→参数）', texts185.filter((t) => t.startsWith('sec.')).join('|'))
 ok(texts185.includes('layer.graph.on'),
   '图谱层状态行常驻（语义层移除后没有「状态未知」这一行了）', texts185.filter((t) => t.startsWith('layer.')).join('|'))
-ok(switches[3]?.props?.checked === true, 'telemetry=true → checked', String(switches[3]?.props?.checked))
+ok(switches[4]?.props?.checked === true, 'telemetry=true → checked', String(switches[4]?.props?.checked))
 ok(switches[0]?.props?.checked === true && switches[2]?.props?.checked === true,
   'contextHint / dirtyTracking 缺省即开（!== false 判定）', `${switches[0]?.props?.checked}|${switches[2]?.props?.checked}`)
+ok(switches[3]?.props?.checked === true, 'autoSelfHeal 缺省即开（fixture 未写该字段，!== false 判定为开）', String(switches[3]?.props?.checked))
 ok(flatten(tree).some((n) => n.type === 'span' && n.props?.children === 'telemetry.label'),
   '开关标签与控件同行（span 自铺，不依赖 Switch 的 label prop 渲染）')
 
 // 点击：改写宿主表单，而不是本地状态。
 seg.props.onChange('deny')
-switches[3].props.onChange(false)
+switches[4].props.onChange(false)
 ok(JSON.stringify(calls.set) === JSON.stringify([['enforce', 'deny'], ['telemetry', false]]), 'onChange 直接 form.set(字段, 值)', JSON.stringify(calls.set))
 ok(findType(tree, (n) => n.type === primitives.Button) === undefined, 'user 层为空 → 不显示任何「恢复此项」')
 
@@ -324,7 +327,7 @@ const statsJson = JSON.stringify({
   lever: { wrapperCalls: 12, hintInjected: 3 },
   listProjects: { hot: 0, cacheHit: 5 },
   budget: { graph: 6000 },
-  index: { retryContention: 1 },
+  index: { retryContention: 1, selfHealStart: 4, selfHealDone: 2, selfHealFailed: 1, selfHealSkipNotGit: 1 },
 })
 storeSnapshot = { status: 'ready', value: { enforce: 'replace', telemetry: true, stats: statsJson }, base: {}, user: {}, writable: true, revision: 11 }
 tree = panel.component({ ...props })
@@ -337,6 +340,8 @@ ok(['stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index
 // v0.17.0：语义层整体移除，leg/zg 读数不复存在——图谱腿、预算单腿、缓存命中都要在页上。
 ok(texts.includes('stats.r.qfailgraph'), '失败计数按腿分开（图谱腿行在场）', texts.filter((t) => t.startsWith('stats.r.qfail')).join('|'))
 ok(texts.includes('stats.r.lpc') && texts.includes('stats.r.lph'), '清单缓存命中/现查进索引卡（M1 的验收读数）')
+// v0.18.0 O2：自愈首建的三个结果读数进索引卡（成功/失败/非 git 跳过）。
+ok(texts.includes('stats.r.shdone') && texts.includes('stats.r.shfail') && texts.includes('stats.r.shnotgit'), '自动首建读数三行进索引卡', texts.filter((t) => t.startsWith('stats.r.sh')).join('|'))
 // 夹具的 t() 原样返回 key（不查字典），所以这里断言"渲染了这一行"，
 // 模板占位符由下面的字典断言单独锁（只剩 {graph}；{zg} 若回潮此锁先炸）。
 ok(texts.includes('stats.budget') && /\{graph\}/.test(dictEntry?.dict?.zh?.['stats.budget'] ?? '') && !/\{zg\}/.test(dictEntry?.dict?.zh?.['stats.budget'] ?? ''),

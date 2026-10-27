@@ -123,6 +123,8 @@ function makeStubProxy(calls, opts = {}) {
           if (opts.listError) return { content: [{ type: 'text', text: 'Error: MCP server not running' }] }
           // v0.12.0 臂 X：0-server 活进程的真实返回形态——以 Tool 开头，不是 Error。
           if (opts.listNotFound) return { content: [{ type: 'text', text: 'Tool "cbm_list_projects" not found. Use mcp({ server: "name" }) to list tools, mcp({ search: "..." }) to search' }] }
+          // v0.18.0 臂 N：表是好的、就是没有本工作区——notIndexed 的真实形状（新仓首查）。
+          if (opts.listWithoutMe) return { content: [{ type: 'text', text: 'projects: 1  (cols: name root_path branch)\n  stub-other C:/some-other-repo main' }] }
           // v0.13.2 臂 W：慢引擎——预热不带秒表后，结论必须在真实 settle 处落账。
           if (opts.warmSlowMs) await new Promise((r) => setTimeout(r, opts.warmSlowMs))
           return { content: [{ type: 'text', text: `projects: 1  (cols: name root_path branch)\n  ${project} ${root.replace(/\\/g, '/')} main` }] }
@@ -220,6 +222,21 @@ function makeCtx(tools, sections, events = {}, contexts = [], proxy = null, opts
               stdout: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
               stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
             },
+          }
+        }
+        // v0.18.0 臂 N：自愈首建的那发 index_repository——真索引要秒级且动真引擎
+        // 库，验收用罐头替代；opts.spawns 记下每一发 argv（"每 cwd 只试一次"靠数它证伪）。
+        if (request.argv.some((a) => String(a).includes('index_repository'))) {
+          (opts.spawns ??= []).push(request.argv.join(' '))
+          if (opts.indexCanned) {
+            const text = String(opts.indexCanned.stdout ?? '')
+            return {
+              done: Promise.resolve({ exitCode: opts.indexCanned.exitCode ?? 0, signal: null }),
+              collected: {
+                stdout: { readFrom: () => ({ text, nextOffset: text.length, lossy: false }) },
+                stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+              },
+            }
           }
         }
         if (opts.abortOnce && !abortedOnce && request.argv.some((a) => String(a).includes('index_repository'))) {
@@ -702,7 +719,7 @@ async function verify(profile) {
   // recentLimit / markPassthrough——它们在 Config 里都标了 volatile（页面可写、
   // 决策点现读），名单漏了就会让"标错等于对 UI 撒谎"这条断言失去意义。
   const VOLATILE_KEYS = ['enforce', 'interceptTools', 'interceptBudgetMs', 'contextHint', 'telemetry', 'dirtyTracking', 'stats',
-    'logRetentionDays', 'recentLimit', 'markPassthrough', 'graphBudgetMs', 'staleWarnFiles', 'staleWarnMinIntervalSec']
+    'logRetentionDays', 'recentLimit', 'markPassthrough', 'graphBudgetMs', 'staleWarnFiles', 'staleWarnMinIntervalSec', 'autoSelfHeal']
   // schemastery 的字段表在 `Config.dict`（宿主 dsh-settings 的 volatileForm 也是递归它）。
   const marked = VOLATILE_KEYS.filter((k) => Config?.dict?.[k]?.meta?.volatile === true)
   record('G 即时热改字段 + 观测字段 + 读数通道在 Config 里标了 volatile（宿主才肯 serve/写）', marked.length === VOLATILE_KEYS.length, `标了的是 ${marked.join(',') || '(无)'}`)
@@ -1080,18 +1097,91 @@ async function verify(profile) {
       /warm=(ok|pending)/.test(w2Mid) && /warm=ok/.test(w2Report) && w2Warm?.ok === true && typeof w2Warm?.ms === 'number' && w2Warm.ms >= 40,
       `点火中=${/warm=(\w+)/.exec(w2Mid)?.[1]} 落账=${/warm=(\w+)/.exec(w2Report)?.[1]} 行=${JSON.stringify(w2Warm ?? null).slice(0, 120)}`)
   } finally { rmW2() }
-  const wn = await mount({ enforce: 'off', dirtyTracking: false, telemetry: false },
+  const wn = await mount({ enforce: 'off', dirtyTracking: false, telemetry: false, autoSelfHeal: false },
     makeStubProxy([], { project: `stub-${process.pid}-nowhere`, root: 'C:/nowhere-else' }))
   await wn.tools.get('code_setup').execute({}, withSignal(REPO))
   let wnErr = '(未抛错)'
   try { await wn.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: fakeAgent(`sess-${process.pid}-nowhere`, REPO), signal: sig() }) } catch (error) { wnErr = String(error?.message ?? error) }
-  record('W 表里真没有时报"项目表里没有"并指向 code_index', /项目表里没有/.test(wnErr) && /code_index/.test(wnErr), wnErr.slice(0, 110))
+  // v0.18.0：REPO 是真 git 仓，默认自愈会当场真索引——这条臂要钉的是**关档**的
+  // 旧语义（只提示、处方指 code_index），off 态由它覆盖，正路在臂 N。
+  record('W 表里真没有且显式关自愈时，报"项目表里没有"并指向 code_index', /项目表里没有/.test(wnErr) && /自动首建已关/.test(wnErr) && /code_index/.test(wnErr), wnErr.slice(0, 140))
   const wf = await mount({ enforce: 'off', dirtyTracking: false, telemetry: false },
     makeStubProxy([], { project: `stub-${process.pid}-fail`, listError: true }))
   await wf.tools.get('code_setup').execute({}, withSignal(REPO))
   let wfErr = '(未抛错)'
   try { await wf.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: fakeAgent(`sess-${process.pid}-fail`, REPO), signal: sig() }) } catch (error) { wfErr = String(error?.message ?? error) }
   record('W 查询失败时报"查询失败"并带出代理原文（冷启动不再谎称没索引）', /查询失败/.test(wfErr) && /MCP server not running/.test(wfErr), wfErr.slice(0, 130))
+
+  // ── 臂 N（v0.18.0 O2，拍板 m03299）：查询时自愈首建 ─────────────────────────
+  // 契约：① 封装动词（模型的显式调用）付得起首建——没图当场建完再查，同一次调用出结果；
+  // ② grep 钩子在关键路径，绝不等——后台踢一脚，本次输出原样，下一次吃到建好的图；
+  // ③ 只纳 git 工作区（digest 拿不到⇒not-git 跳过，spawn 一发不发）；
+  // ④ 每 cwd 成败都只试一次（attempted 闸），处方仍指 code_index；
+  // ⑤ 关档=旧语义（只提示不代跑），由臂 W 的 nowhere case 覆盖。
+  // index_repository 一律走 opts.indexCanned 罐头——验收不碰真引擎库；
+  // workspaceDigest 走 makeCtx 真分支（REPO/临时子目录都是真 git 判定，只读无害）。
+  {
+    const nTdir = join(tmpdir(), `cbm-n-${process.pid}-${profile}`)
+    rmSync(nTdir, { recursive: true, force: true })
+    mkdirSync(nTdir, { recursive: true })
+    // 适配层用罐头版本占位（W2 同款）：bootstrap 走"清单已就位"分支，验收不碰真安装。
+    writeFileSync(join(nTdir, 'mcp-server.mjs'), '', 'utf8')
+    writeFileSync(join(nTdir, 'package.json'), `{"version":"${DEFAULT_ADAPTER_VERSION}"}`, 'utf8')
+    try {
+      const healJson = (name, nodes) => JSON.stringify({ project: name, status: 'indexed', nodes, edges: nodes * 2 })
+      const nSpawns = []
+      const n1 = await mount({ enforce: 'off', dirtyTracking: false, telemetry: true, adapterDir: nTdir },
+        makeStubProxy([], { project: `stub-${process.pid}-n`, listWithoutMe: true }),
+        { spawns: nSpawns, indexCanned: { exitCode: 0, stdout: healJson(`stub-${process.pid}-healed`, 7) } })
+      await n1.tools.get('code_setup').execute({}, withSignal(REPO))
+      let n1Err = ''
+      let n1Out = ''
+      try { n1Out = String((await n1.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: fakeAgent(`sess-${process.pid}-n1`, REPO), signal: sig() }))?.text ?? '') } catch (error) { n1Err = String(error?.message ?? error) }
+      record('N1 封装动词当场补建再查：缺图时同一次调用返回命中，index spawn 恰好一发',
+        !n1Err && /stubSymbol/.test(n1Out) && nSpawns.filter((a) => a.includes('index_repository')).length === 1,
+        `err=${n1Err.slice(0, 90)} spawns=${nSpawns.length}`)
+      const nSpawns2 = []
+      const n2 = await mount({ enforce: 'off', dirtyTracking: false, telemetry: true, adapterDir: nTdir },
+        makeStubProxy([], { project: `stub-${process.pid}-n2`, listWithoutMe: true }),
+        { spawns: nSpawns2, indexCanned: { exitCode: 1, stdout: 'boom not json' } })
+      let n2e1 = '(未抛错)'
+      let n2e2 = '(未抛错)'
+      try { await n2.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: fakeAgent(`sess-${process.pid}-n2`, REPO), signal: sig() }) } catch (error) { n2e1 = String(error?.message ?? error) }
+      try { await n2.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: fakeAgent(`sess-${process.pid}-n2`, REPO), signal: sig() }) } catch (error) { n2e2 = String(error?.message ?? error) }
+      record('N2 每目录只试一次：首建失败后同会话第二次不再 spawn，处方仍指 code_index',
+        /自动首建没成（failed）/.test(n2e1) && /自动首建没成（attempted）/.test(n2e2) && /code_index/.test(n2e2) && nSpawns2.filter((a) => a.includes('index_repository')).length === 1,
+        `一=${n2e1.slice(0, 55)} 二=${n2e2.slice(0, 55)} spawns=${nSpawns2.length}`)
+      const nNoGit = join(nTdir, 'not-a-repo')
+      mkdirSync(nNoGit, { recursive: true })
+      const nSpawns3 = []
+      const n3 = await mount({ enforce: 'off', dirtyTracking: false, telemetry: true, adapterDir: nTdir },
+        makeStubProxy([], { project: `stub-${process.pid}-n3`, listWithoutMe: true }),
+        { spawns: nSpawns3, indexCanned: { exitCode: 0, stdout: healJson('never', 1) } })
+      let n3e = '(未抛错)'
+      try { await n3.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: fakeAgent(`sess-${process.pid}-n3`, nNoGit), signal: sig() }) } catch (error) { n3e = String(error?.message ?? error) }
+      record('N3 非 git 工作区不纳入：判词带（not-git）且索引 spawn 一发不发',
+        /自动首建没成（not-git）/.test(n3e) && nSpawns3.filter((a) => a.includes('index_repository')).length === 0,
+        `err=${n3e.slice(0, 110)} spawns=${nSpawns3.length}`)
+      const nSpawns4 = []
+      const n4 = await mount({ enforce: 'replace', dirtyTracking: false, telemetry: true, adapterDir: nTdir },
+        makeStubProxy([], { project: `stub-${process.pid}-n4`, listWithoutMe: true }),
+        { spawns: nSpawns4, indexCanned: { exitCode: 0, stdout: healJson(`stub-${process.pid}-healed4`, 3) } })
+      await n4.tools.get('code_setup').execute({}, withSignal(REPO)) // 点火 bootstrap：钩子自己不跑 bootstrap
+      const agentN4 = fakeAgent(`sess-${process.pid}-n4`, REPO)
+      const n4Post = await (n4.events['tools/post-execute'] ?? [])[1](grepExec(agentN4, 'selfHealIndex'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
+      let n4Kicked = false
+      for (let i = 0; i < 30 && !n4Kicked; i++) { await new Promise((r) => setTimeout(r, 40)); n4Kicked = nSpawns4.some((a) => a.includes('index_repository')) }
+      record('N4 grep 钩子不等首建：本次输出原样放行 + 后台把索引踢起来（下一发 grep 吃到图）',
+        (!n4Post?.content || n4Post.content[0]?.text === 'O') && n4Kicked, `out=${JSON.stringify(n4Post?.content?.[0]?.text ?? n4Post)} kicked=${n4Kicked} spawns=${nSpawns4.length}`)
+      const nlog = readdirSync(nTdir).filter((f) => /^telemetry-\d{4}-\d{2}-\d{2}\.log$/.test(f))
+        .flatMap((f) => readFileSync(join(nTdir, f), 'utf8').trim().split('\n').filter(Boolean))
+        .map((l) => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
+      const nEv = (e) => nlog.some((l) => l.event === e)
+      record('N 自愈事件全谱进遥测（start/done/failed/skip-not-git 各有其一）',
+        nEv('self-heal-start') && nEv('self-heal-done') && nEv('self-heal-failed') && nEv('self-heal-skip-not-git'),
+        `seen=${[...new Set(nlog.filter((l) => String(l.event).startsWith('self-heal')).map((l) => l.event))].join(',') || '(无)'}`)
+    } finally { try { rmSync(nTdir, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 }) } catch { /* 尽力 */ } }
+  }
 
   // ── 臂 X：v0.12.0 进程轴（清单写了 ≠ 活进程加载了）+ restart-adapter ────────
   // 事故原型：宿主开机拉起 adapter 时 cbm.json 还没出生 → 活进程 0-server，

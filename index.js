@@ -123,6 +123,12 @@ export const Config = z.object({
   // 旁路注入的最小间隔（秒）：context 每轮装配都求值，无冷却会在编辑潮里连发；
   // 走 CODE_QUESTION 正门时不占冷却（那时是模型自己要的）。
   staleWarnMinIntervalSec: z.number().default(60).volatile(),
+  // v0.18.0 O2 查询时自愈（2026-10-27 拍板：git 仓 O2+默认开+非 git 不纳入）：
+  // 结构查询命中「未索引」时替用户建一次。当时的授权规则（缺索引须点头）立的
+  // 原是 430MB 制品下载 + .zvec-grep 落仓两个顾虑；cbm 首建=本地引擎、产物在机器
+  // 级目录不落仓——顾虑不成立，用户据此点头默认开。每个 cwd 只试一次（成败都不
+  // 再打扰）；非 git 工作区不碰（digest 闸门，与补偿刷新同一判据）。页面可关。
+  autoSelfHeal: z.boolean().default(true).volatile(),
   telemetry: z.boolean().default(true).volatile(),
   // stats 是**插件→设置页**的读数通道，不是用户配置：pushStats 把计数推进这个引用，
   // 宿主 describe() 用 plainConfig 读同一引用（dsh-settings/lib/index.js:98,436），
@@ -255,6 +261,7 @@ function normalize(config = {}) {
   defineLive(cfg, 'logRetentionDays', () => positiveInt('logRetentionDays', live(config.logRetentionDays), 7, []))
   defineLive(cfg, 'recentLimit', () => positiveInt('recentLimit', live(config.recentLimit), 100, []))
   defineLive(cfg, 'markPassthrough', () => boolOf(live(config.markPassthrough), false, [], 'markPassthrough'))
+  defineLive(cfg, 'autoSelfHeal', () => boolOf(live(config.autoSelfHeal), true, [], 'autoSelfHeal'))
   // v0.16 T-D 的两个旁路参数：0 都是合法值（0=关闭），走 positiveInt 的含零语义。
   defineLive(cfg, 'staleWarnFiles', () => positiveInt('staleWarnFiles', live(config.staleWarnFiles), 8, []))
   defineLive(cfg, 'staleWarnMinIntervalSec', () => positiveInt('staleWarnMinIntervalSec', live(config.staleWarnMinIntervalSec), 60, []))
@@ -931,6 +938,70 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
 }
 
 /**
+ * v0.18.0 O2 查询时自愈：结构查询命中「本工作区没进图」时，替用户把首建跑一次。
+ * 与补偿刷新的分工：refreshSessionWorkspace 管**已索引过**的仓防漂移（git 状态变
+ * 了才重建）；这里管**从没索引过**的仓——正是审计坐实的那道缺口
+ * （dirty-refresh-skipped:not-indexed，以及 194 次编辑只 2 次 code_index）。
+ * 闸门（skip 分支一律静默不计数——off/attempted 会被每次 grep 顶到，计了就是刷屏）：
+ *   1. cfg.autoSelfHeal（volatile，页面热关立即生效）；
+ *   2. 引擎就绪；
+ *   3. 每个 cwd 只试一次（state.selfHealAttempted，成败都不再来）；
+ *   4. 已有索引任务在跑（补刷/手动 code_index）不插队；
+ *   5. **仅 git 工作区**（workspaceDigest===null 即非 git；拍板 m03299：非 git 不
+ *      纳入——变化检测全靠 git，没它得另养一条 mtime 扫描路线，不值）。
+ * 成功后三件套落账：projectsByCwd+session.project（下一次查询零成本命中，不用等
+ * list_projects 清单过期）、refresh-stamps（补刷冷却同源，防止刚建完又被补偿刷新
+ * 重跑一遍全量）、遥测 self-heal-done。
+ */
+async function selfHealIndex(ctx, cfg, state, cwd, sess, signal) {
+  if (!cfg.autoSelfHeal) return { ok: false, skipped: 'off' }
+  if (state.cbm !== 'ready') return { ok: false, skipped: 'engine' }
+  if (state.selfHealAttempted.has(cwd)) return { ok: false, skipped: 'attempted' }
+  if (state.refreshing.has(cwd)) return { ok: false, skipped: 'in-flight' }
+  state.selfHealAttempted.add(cwd)
+  const digest = await workspaceDigest(ctx, cwd, signal)
+  if (digest === null) {
+    telemetry(cfg, state, 'self-heal-skip-not-git', { cwd })
+    return { ok: false, skipped: 'not-git' }
+  }
+  state.refreshing.add(cwd)
+  telemetry(cfg, state, 'self-heal-start', { cwd })
+  try {
+    // 与 code_index 同款形状：不带 --quiet——stdout 的 JSON 里有 project，
+    // 拿来直接进缓存，省一次 8.7~10.8s 的 list_projects 重查。
+    const argv = [state.cbmPath, 'cli', 'index_repository', '--repo-path', cwd]
+    const spec = { cwd, maxBytes: 1024 * 1024, graceMs: 60000, signal }
+    let r = await withIndexLock(state, cwd, () => run(ctx, argv, spec))
+    if (r.exitCode !== 0 && abortedByContention(r)) {
+      r = await withIndexLock(state, cwd, () => run(ctx, argv, spec))
+    }
+    let info = null
+    if (r.exitCode === 0) {
+      try { info = JSON.parse(r.stdout) } catch { info = null }
+    }
+    if (!info || !info.project) {
+      telemetry(cfg, state, 'self-heal-failed', { cwd, exit: r.exitCode, tail: String(r.stderr || r.stdout || '').slice(-160) })
+      return { ok: false, skipped: 'failed' }
+    }
+    state.projectsByCwd.set(cwd, info.project)
+    if (sess) sess.project = info.project
+    const stampPath = join(cfg.adapterDir, 'refresh-stamps.json')
+    try {
+      const stamps = readStamps(stampPath)
+      writeFileSync(stampPath, JSON.stringify({ ...stamps, [cwd]: { at: Date.now(), digest } }, null, 2), 'utf8')
+    } catch { /* 留痕写不进就算了，索引本身已经成功 */ }
+    repoBump(state, cwd, 'self-heal-done')
+    telemetry(cfg, state, 'self-heal-done', { cwd, project: info.project, nodes: info.nodes ?? 0 })
+    return { ok: true, project: info.project }
+  } catch (error) {
+    telemetry(cfg, state, 'self-heal-failed', { cwd, message: String(error?.message ?? error).slice(0, 200) })
+    return { ok: false, skipped: 'failed' }
+  } finally {
+    state.refreshing.delete(cwd)
+  }
+}
+
+/**
  * ── 触发层（docs/design-v2.md 杠杆 ①②③⑤）────────────────────────────────────
  *
  * 一句话：把"该用代码图"从**劝**变成**给结果**——高频动线包成原生工具（①）、
@@ -1246,7 +1317,7 @@ async function projectFor(ctx, exec, cfg, state, session, cwd, budgetMs = budget
     telemetry(cfg, state, 'list-projects:hot', { cwd })
     return { project: found, reason: '' }
   }
-  return { project: '', reason: `项目表里没有 cwd=${cwd}` }
+  return { project: '', reason: `项目表里没有 cwd=${cwd}`, notIndexed: true }
 }
 
 /**
@@ -1350,7 +1421,10 @@ function renderStats(cfg, state) {
     listProjects: { hot: n('list-projects:hot'), cacheHit: n('list-projects:cache-hit') },
     // 图谱腿当前生效的预算（ms）：面板要让"为什么慢"能一眼看到。
     budget: { graph: budgetGraph(cfg) },
-    index: { retryContention: n('index-retry-contention') },
+    // v0.18.0 O2：代跑首建的读数。start=被查询踢起过、done=建图成功、failed=失败
+    // （处方回 code_index）、skipNotGit=非 git 仓没碰。每 cwd 只试一次，
+    // 这行不会因 grep 频繁而虚涨；attempted/off 两条静默闸门故意外。
+    index: { retryContention: n('index-retry-contention'), selfHealStart: n('self-heal-start'), selfHealDone: n('self-heal-done'), selfHealFailed: n('self-heal-failed'), selfHealSkipNotGit: n('self-heal-skip-not-git') },
     // 按仓库的读数（v0.13.4）：面板仓库选择器用。进程内累计、重启归零——落盘会
     // 污染 counts.json 的扁平契约，而趋势看板本来就不跨重启。project 列=该仓
     // 结构层入图名（页面每帧重算，很便宜，不值得单独做失效通知）。
@@ -1572,8 +1646,17 @@ async function runCbmFlow(ctx, cfg, state, exec, work) {
   if (state.adapter !== 'ready') throw new Error('压缩层(②)未就绪，检索无法工作：\n' + report(cfg, state))
   if (state.cbm !== 'ready') throw new Error(cbmInstallHint(state))
   const sess = sessionOf(state, sessionKey(exec.agent))
-  const { project, reason } = await projectFor(ctx, exec, cfg, state, sess, cwd, WRAPPER_BUDGET_MS)
-  if (!project) throw new Error(`封装工具查不到本工作区的 project（${reason}）。不在表里就先 code_index；查询失败多半是引擎冷启动，再试一次即可。`)
+  const { project, reason, notIndexed } = await projectFor(ctx, exec, cfg, state, sess, cwd, WRAPPER_BUDGET_MS)
+  if (!project) {
+    // v0.18.0 O2：封装动词是模型的**显式**调用，付得起首建（实测本仓 ~2s）——
+    // 同步自愈一次，成功就当场把查询跑完，模型不用先 code_index 再重试。
+    if (notIndexed && cfg.autoSelfHeal) {
+      const heal = await selfHealIndex(ctx, cfg, state, cwd, sess, exec.signal)
+      if (heal.ok) return work({ project: heal.project, sess, cwd })
+      throw new Error(`封装工具查不到本工作区的 project（${reason}）。自动首建没成（${heal.skipped}）：先 code_index，它会给出明确报错。`)
+    }
+    throw new Error(`封装工具查不到本工作区的 project（${reason}）。${notIndexed ? '自动首建已关（autoSelfHeal=false）：先 code_index' : '不在表里就先 code_index；查询失败多半是引擎冷启动，再试一次即可。'}`)
+  }
   return work({ project, sess, cwd })
 }
 
@@ -1666,6 +1749,9 @@ export async function apply(ctx, config) {
     adapter: 'unknown', cbm: 'unknown', ok: false, autoIndex: '', refreshing: new Set(), notes: [], lastError: '',
     sessions: new Map(), projectsByCwd: new Map(), counts: {}, indexJobs: new Map(),
     repos: new Map(), recent: [],
+    // v0.18.0 O2：每个 cwd 只自愈一次（成败都不再重试——失败再来一遍只会把
+    // 同一个坑磕出满屏日志，处方仍然是显式 code_index）。
+    selfHealAttempted: new Set(),
     // v0.15.0：预热那一发 list_projects 的**返回体**留在这儿（M1）。它的返回文本
     // 已经付过 10.8s 的开库成本，丢掉等于让每个符号类 grep 再付一次（而钩子预算
     // 根本付不起 ⇒ project 查不到 ⇒ 图谱腿整段跳过）。
@@ -1885,7 +1971,7 @@ export async function apply(ctx, config) {
   if (cfg.wrapperTools) {
     ctx.tools.register(defineTool({
       name: 'code_find',
-      description: 'Locate a SYMBOL (function / class / method / route) in this workspace by name: returns the qualified name, file, line range and the source itself from the code graph. Use it INSTEAD of grep when the question is "where is X defined / what does X look like". NOT for string literals, log messages, config values, URLs or regex over text — keep using grep for those. Returns "not indexed" when the workspace has no graph yet: run code_index first.',
+      description: 'Locate a SYMBOL (function / class / method / route) in this workspace by name: returns the qualified name, file, line range and the source itself from the code graph. Use it INSTEAD of grep when the question is "where is X defined / what does X look like". NOT for string literals, log messages, config values, URLs or regex over text — keep using grep for those. If the workspace has no graph yet, the plugin self-heals: it builds one on the spot (git workspaces only, one attempt per directory) and answers in the same call — only if it still reports "not indexed", run code_index first.',
       parameters: {
         query: { type: 'string', required: true, description: 'Symbol name or a short keyword phrase (BM25 over the graph). Prefer the exact identifier.' },
         limit: { type: 'integer', description: 'Max candidate symbols (default 3, cap 10).' },
@@ -2010,8 +2096,12 @@ export async function apply(ctx, config) {
           repoBump(state, cwd, 'intercept-skip-seen')
           return next()
         }
-        const { project } = await projectFor(ctx, exec, cfg, state, sess, cwd)
-        if (!project) return next()
+        const { project, notIndexed } = await projectFor(ctx, exec, cfg, state, sess, cwd)
+        if (!project) {
+          // v0.18.0 O2：钩子在工具调用关键路径上，绝不等首建——踢后台一把，本次放行。
+          if (notIndexed) void selfHealIndex(ctx, cfg, state, cwd, sess, state.abortSignal).catch(() => {})
+          return next()
+        }
         const fresh = ledgerStale(sess)
         if (fresh !== 'fresh') {
           // 本会话写过代码 ⇒ 图里的坐标不可信，这时拦截就是在骗人：放行 + 后台补刷。
@@ -2096,7 +2186,10 @@ export async function apply(ctx, config) {
             ? { kind: 'accept', content: [{ type: 'text', text: renderPassthroughMark(q.symbol, 'replace-pass-refreshing', cwd) + resultText(result) }] }
             : next()
         }
-        const { project } = await projectFor(ctx, exec, cfg, state, sess, cwd)
+        const { project, notIndexed } = await projectFor(ctx, exec, cfg, state, sess, cwd)
+        // v0.18.0 O2：replace 热路径同样不等——未索引 ⇒ 踢后台首建一把，本次照常
+        // 放行原始 grep 输出；下一次符号类 grep 就吃到自己建好的图。
+        if (!project && notIndexed) void selfHealIndex(ctx, cfg, state, cwd, sess, state.abortSignal).catch(() => {})
         let source = ''
         let text = ''
         // 区分"索引本来没答案"与"层查询失败"（超时/底层错误文本）：前者 grep 才是对的
