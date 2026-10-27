@@ -157,34 +157,21 @@ for (const lang of ['zh', 'en']) ok(!!dictEntry?.dict?.[lang], `字典有 ${lang
 const keys = Object.keys(dictEntry?.dict?.zh || {})
 for (const key of ['title', 'summary', 'loading', 'unavailable', 'enforce.label', 'telemetry.label', 'resetField', 'saveFailed', 'foot',
   'stats.label', 'stats.empty', 'stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index', 'stats.updated',
-  'stats.r.qfailgraph', 'stats.r.codesearch', 'stats.r.lph', 'stats.r.lpc', 'stats.budget',
+  'stats.r.qfailgraph', 'stats.r.lph', 'stats.r.lpc', 'stats.budget',
   'hint.label', 'hint.hint', 'dirty.label', 'dirty.hint', 'interceptBudgetMs.label', 'interceptBudgetMs.hint',
   'interceptTools.label', 'interceptTools.hint',
   'sec.soft', 'sec.soft.hint', 'sec.hard', 'sec.hard.hint', 'sec.layers', 'sec.layers.hint',
   'sec.aux', 'sec.aux.hint', 'sec.params', 'sec.params.hint',
-  'layer.graph', 'layer.graph.on', 'layer.zg', 'layer.zg.off', 'layer.zg.ready', 'layer.zg.missing', 'layer.zg.unknown',
-  'layer.zg.installed', 'layer.zg.installing', 'layer.zg.pending-on', 'layer.zg.pending-off',
-  'layer.zg.gitignore', 'layer.adapter.stale', 'layer.adapter.noproc',
-  'zg.label', 'zg.hint', 'zg.confirm.title', 'zg.confirm.body', 'zg.confirm.yes', 'zg.confirm.no']) {
+  'layer.graph', 'layer.graph.on', 'layer.adapter.stale', 'layer.adapter.noproc']) {
   ok(keys.includes(key), `字典有 key ${key}`)
 }
 for (const key of ['hint.label', 'dirty.label', 'interceptBudgetMs.label', 'interceptTools.label', 'resetField',
   'sec.soft', 'sec.hard', 'sec.layers', 'sec.aux', 'sec.params',
-  'layer.graph', 'layer.zg', 'layer.zg.off', 'layer.zg.ready', 'layer.zg.missing', 'layer.zg.unknown',
-  'layer.zg.installed', 'layer.zg.installing', 'layer.zg.pending-on', 'layer.zg.pending-off',
-  'layer.zg.gitignore', 'layer.adapter.stale', 'layer.adapter.noproc',
-  'zg.label', 'zg.hint', 'zg.confirm.title', 'zg.confirm.body', 'zg.confirm.yes', 'zg.confirm.no']) {
+  'layer.graph', 'layer.adapter.stale', 'layer.adapter.noproc']) {
   ok(Object.keys(dictEntry?.dict?.en || {}).includes(key), `en 字典有 key ${key}`)
 }
-// 确认面板是"人点头"的那一环：文案动作前置（v0.11.x 验收）——第一句就指路装包，
-// 净开销 430MB 是用户点头的对象，全装 1230MB 是实现细节、禁止出现在页面上。
-for (const lang of ['zh', 'en']) {
-  const body = dictEntry?.dict?.[lang]?.['zg.confirm.body'] || ''
-  ok(!/1230/.test(body) && /430MB/.test(body) && /32MiB/.test(body) && /\.zvec-grep\//.test(body) && /gitignore/i.test(body)
-    && /install-zg/.test(body) && /code_setup/.test(body) && body.indexOf('code_setup') < body.indexOf('430MB')
-    && /重启|restart/.test(body),
-    `${lang} 确认文案动作前置（code_setup 先于 430MB、禁 1230、含模型/gitignore/重启）`, body.slice(0, 60))
-}
+// v0.17.0：语义层整体移除——zg 字典键若回潮（复制粘贴旧块），下面这条锁先炸。
+ok(!keys.some((k) => k.startsWith('layer.zg') || k.startsWith('zg.')), 'zg.* / layer.zg.* 字典键不得回潮', keys.filter((k) => k.startsWith('layer.zg') || k.startsWith('zg.')).join('|'))
 ok(!keys.includes('reset'), '没有裸「恢复默认」key——每个字段的恢复按钮必须叫「恢复此项」', keys.filter((k) => k.startsWith('reset')).join('|'))
 for (const mode of modes) {
   ok(keys.includes(`enforce.${mode}`) && keys.includes(`enforce.${mode}.hint`), `字典覆盖模式 ${mode}`)
@@ -218,9 +205,9 @@ const switches = flatten(tree).filter((n) => n.type === primitives.Switch)
 ok(switches.length === 4, '渲染出 4 个 Switch（contextHint / markPassthrough / dirtyTracking / telemetry——按层排布）', String(switches.length))
 const texts185 = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
 ok(['sec.soft', 'sec.hard', 'sec.layers', 'sec.aux', 'sec.params'].every((k) => texts185.includes(k)),
-  '五个分层标题按序在场（软引导→硬拦截→检索两层→记账遥测→参数）', texts185.filter((t) => t.startsWith('sec.')).join('|'))
-ok(texts185.includes('layer.graph.on') && texts185.includes('layer.zg.unknown'),
-  '检索两层状态行常驻；没数时语义层明说「状态未知」', texts185.filter((t) => t.startsWith('layer.')).join('|'))
+  '五个分层标题按序在场（软引导→硬拦截→图谱层→记账遥测→参数）', texts185.filter((t) => t.startsWith('sec.')).join('|'))
+ok(texts185.includes('layer.graph.on'),
+  '图谱层状态行常驻（语义层移除后没有「状态未知」这一行了）', texts185.filter((t) => t.startsWith('layer.')).join('|'))
 ok(switches[3]?.props?.checked === true, 'telemetry=true → checked', String(switches[3]?.props?.checked))
 ok(switches[0]?.props?.checked === true && switches[2]?.props?.checked === true,
   'contextHint / dirtyTracking 缺省即开（!== false 判定）', `${switches[0]?.props?.checked}|${switches[2]?.props?.checked}`)
@@ -257,31 +244,31 @@ ok(JSON.stringify(calls.set) === JSON.stringify([['contextHint', true], ['markPa
   'markPassthrough 开关即时写（不写进 enforce=off 的默认里）', JSON.stringify(calls.set))
 calls.set.length = 0
 const inputs = flatten(tree).filter((n) => n.type === primitives.Input)
-ok(inputs.length === 6, '六个输入框（interceptBudgetMs / graphBudgetMs / zgBudgetMs / interceptTools / logRetentionDays / recentLimit）', String(inputs.length))
+ok(inputs.length === 5, '五个输入框（interceptBudgetMs / graphBudgetMs / interceptTools / logRetentionDays / recentLimit——zgBudgetMs 随语义层删除）', String(inputs.length))
 ok(inputs[0]?.props?.type === 'number' && inputs[0]?.props?.defaultValue === 2500
-  && inputs[1]?.props?.defaultValue === 0 && inputs[2]?.props?.defaultValue === 0
-  && inputs[3]?.props?.defaultValue === 'grep,glob'
-  && inputs[4]?.props?.defaultValue === 7 && inputs[5]?.props?.defaultValue === 100,
-  '输入框回填主机快照当前值', `${inputs[0]?.props?.defaultValue}|${inputs[1]?.props?.defaultValue}|${inputs[2]?.props?.defaultValue}|${inputs[3]?.props?.defaultValue}|${inputs[4]?.props?.defaultValue}|${inputs[5]?.props?.defaultValue}`)
+  && inputs[1]?.props?.defaultValue === 0
+  && inputs[2]?.props?.defaultValue === 'grep,glob'
+  && inputs[3]?.props?.defaultValue === 7 && inputs[4]?.props?.defaultValue === 100,
+  '输入框回填主机快照当前值', `${inputs[0]?.props?.defaultValue}|${inputs[1]?.props?.defaultValue}|${inputs[2]?.props?.defaultValue}|${inputs[3]?.props?.defaultValue}|${inputs[4]?.props?.defaultValue}`)
 inputs[0].props.onBlur({ target: { value: '1800' } })
 ok(JSON.stringify(calls.set) === JSON.stringify([['interceptBudgetMs', 1800]]),
   'blur 且值合法才写表单（数字已解析）', JSON.stringify(calls.set))
 const badNum = { value: 'abc' }
 const badCsv = { value: '   ' }
 inputs[0].props.onBlur({ target: badNum })
-inputs[3].props.onBlur({ target: badCsv })
-// 追加四输入（graphBudgetMs / zgBudgetMs / logRetentionDays / recentLimit）也走 blur 才写；坏值一律不写并拨回默认
+inputs[2].props.onBlur({ target: badCsv })
+// 追加三输入（graphBudgetMs / logRetentionDays / recentLimit）也走 blur 才写；坏值一律不写并拨回默认
 const badDays = { value: 'x' }
 const badLimit = { value: '0' }
-inputs[4].props.onBlur({ target: badDays })
-inputs[5].props.onBlur({ target: badLimit })
+inputs[3].props.onBlur({ target: badDays })
+inputs[4].props.onBlur({ target: badLimit })
 ok(calls.set.length === 1 && badNum.value === '2500' && badCsv.value === 'grep,glob'
   && badDays.value === '7' && badLimit.value === '100',
   '非法/空值一个字节都不写，输入框拨回当前值', `${badNum.value}|${badCsv.value}|${badDays.value}|${badLimit.value}`)
 let blurred = 0
 const fakeTarget = { blur: () => { blurred += 1 } }
-inputs[3].props.onKeyDown({ key: 'Enter', currentTarget: fakeTarget })
-inputs[3].props.onKeyDown({ key: 'a', currentTarget: fakeTarget })
+inputs[2].props.onKeyDown({ key: 'Enter', currentTarget: fakeTarget })
+inputs[2].props.onKeyDown({ key: 'a', currentTarget: fakeTarget })
 ok(blurred === 1, '回车即提交（走 blur），普通按键不打扰表单', String(blurred))
 calls.unset.length = 0
 const btns2 = flatten(tree).filter((n) => n.props && typeof n.props.onClick === 'function')
@@ -289,105 +276,33 @@ ok(btns2.length === 1, 'user 层只有 contextHint ⇒ 恰一个「恢复此项�
 btns2[0].props.onClick()
 ok(JSON.stringify(calls.unset) === JSON.stringify(['contextHint']), '新字段的恢复默认同样走 form.unset', JSON.stringify(calls.unset))
 
-/* ---- 5c. v0.11.0 语义层开关：两步确认 + 三轴状态行（页面不撒谎）---- */
-console.log('\n[语义层开关]')
+/* ---- 5c. v0.17.0：图谱层状态行（语义层移除后不再有开关与五态推导）---- */
+console.log('\n[图谱层状态]')
 const layerText = (v) => {
   storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, ...v }, base: {}, user: {}, writable: true, revision: 16 }
   return flatten(panel.component({ ...props })).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
 }
-ok(layerText({ zgEnabled: false, stats: JSON.stringify({ zg: 'off', zgWant: false, zgInstalled: false }) }).includes('layer.zg.off'),
-  '开关关 + 清单 off ⇒ 状态行「未启用」')
-ok(layerText({ zgEnabled: true, stats: JSON.stringify({ zg: 'off' }) }).includes('layer.zg.pending-on'),
-  '开关已开、清单未重建 ⇒ pending-on（诚实说「重启后生效」，不谎称已开启）')
-ok(layerText({ zgEnabled: false, stats: JSON.stringify({ zg: 'ready' }) }).includes('layer.zg.pending-off'),
-  '开关已关、清单还带着 ⇒ pending-off')
-ok(layerText({ zgEnabled: true, stats: JSON.stringify({ zg: 'missing', zgInstalled: true }) }).includes('layer.zg.installed'),
-  '清单说 missing 但包实测在 ⇒ installed 待重启（两轴分开报，不合成一个谎）')
-ok(layerText({ zgEnabled: true, stats: JSON.stringify({ zg: 'installing' }) }).includes('layer.zg.installing'),
-  'agent 正在装（volatile 推帧）⇒ installing')
 
-/* ---- 5c2. v0.12.0：gitignore 提示常驻 + 适配层进程轴警示行 ---- */
-// 用户验收要求：.zvec-grep/ 的 gitignore 提醒不能只活在确认弹窗里——装 zg 的
-// 工作区可能根本不是仓库，仓库也多是以后才来，开了 zg 就要一直看得见。
-ok(layerText({ zgEnabled: true, stats: JSON.stringify({ zg: 'ready' }) }).includes('layer.zg.gitignore'),
-  'zg 开启 ⇒ gitignore 提示常驻（不随确认面板消失）')
-ok(!layerText({ zgEnabled: false, stats: JSON.stringify({ zg: 'off' }) }).includes('layer.zg.gitignore'),
-  'zg 未开 ⇒ 不出现无关提示')
-ok(layerText({ zgEnabled: false, stats: JSON.stringify({ zg: 'off', adapter: 'stale' }) }).includes('layer.adapter.stale'),
-  '进程轴 stale ⇒ 警示行（数据来自 stats.adapter，与 zg 开关无关）')
-ok(layerText({ zgEnabled: false, stats: JSON.stringify({ zg: 'off', adapter: 'no-process' }) }).includes('layer.adapter.noproc'),
-  'no-process ⇒ 另一句人话（宿主没起不是故障，别拿警示吓人的 stale 文案）')
-ok(!layerText({ zgEnabled: false, stats: JSON.stringify({ zg: 'off', adapter: 'fresh' }) }).some((t) => String(t).startsWith('layer.adapter.')),
+/* ---- 5c2. v0.12.0（v0.17.0 收缩为进程轴）：适配层警示行 ---- */
+ok(layerText({ stats: JSON.stringify({ adapter: 'stale' }) }).includes('layer.adapter.stale'),
+  '进程轴 stale ⇒ 警示行（数据来自 stats.adapter）')
+ok(layerText({ stats: JSON.stringify({ adapter: 'no-process' }) }).includes('layer.adapter.noproc'),
+  'no-process ⇒ 另一句人话（宿主没起不是故障，别拿 stale 文案吓人）')
+ok(!layerText({ stats: JSON.stringify({ adapter: 'fresh' }) }).some((t) => String(t).startsWith('layer.adapter.')),
   'fresh ⇒ 一行都不加（没病别呻吟）')
 for (const lang of ['zh', 'en']) {
-  const gi = dictEntry?.dict?.[lang]?.['layer.zg.gitignore'] || ''
-  ok(/\.zvec-grep/.test(gi) && /gitignore/i.test(gi), `${lang} gitignore 常驻提示含 .zvec-grep + gitignore`, gi.slice(0, 50))
   const st = dictEntry?.dict?.[lang]?.['layer.adapter.stale'] || ''
   ok(/restart-adapter/.test(st), `${lang} stale 警示行指路 restart-adapter（不是只会喊重启宿主）`, st.slice(0, 60))
 }
 
-// v0.11.2：五态文字必须分三档色，否则「开关已开、清单未重建」看起来和「已启用」
-// 一模一样，用户看不出待重启。断言取 zg 那行的 RVAL span 的 color 表达式。
-const zgColor = (v) => {
-  storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, ...v }, base: {}, user: {}, writable: true, revision: 16 }
-  return flatten(panel.component({ ...props }))
-    .filter((n) => typeof n.props?.children === 'string' && n.props.children.startsWith('layer.zg.'))
-    .map((n) => n.props.style?.color)
-    .filter(Boolean)
-    .pop() ?? null
-}
-const C_DEFAULT = 'var(--dsw-alias-label-secondary)'
-const C_WARN = 'var(--dsw-alias-warning, #d97706)'
-const C_ERROR = 'var(--dsw-alias-error, crimson)'
-ok(zgColor({ zgEnabled: false, stats: JSON.stringify({ zg: 'off' }) }) === C_DEFAULT,
-  'off ⇒ 常态灰（不是警示色，避免误报）', String(zgColor({ zgEnabled: false, stats: JSON.stringify({ zg: 'off' }) })))
-ok(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'ready' }) }) === C_DEFAULT,
-  'ready ⇒ 常态灰', String(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'ready' }) })))
-ok(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'off' }) }) === C_ERROR,
-  'pending-on ⇒ 报错红（zgEnabled:true 但清单没生效，用户配置没落地，真异常）', String(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'off' }) })))
-ok(zgColor({ zgEnabled: false, stats: JSON.stringify({ zg: 'ready' }) }) === C_WARN,
-  'pending-off ⇒ 警示橙', String(zgColor({ zgEnabled: false, stats: JSON.stringify({ zg: 'ready' }) })))
-ok(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'missing', zgInstalled: true }) }) === C_WARN,
-  'installed（包在、清单未重建）⇒ 警示橙', String(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'missing', zgInstalled: true }) })))
-ok(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'installing' }) }) === C_WARN,
-  'installing ⇒ 警示橙', String(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'installing' }) })))
-ok(zgColor({ zgEnabled: true, stats: JSON.stringify({ zg: 'missing' }) }) === C_ERROR,
-  'missing（包没装）⇒ 报错红', String(zgColor({ zgEnabled: true, stats: JSON.stringify({zg: 'missing' }) })))
-ok(zgColor({ zgEnabled: true }) === C_ERROR,
-  'unknown（遥测未推帧）⇒ 报错红', String(zgColor({ zgEnabled: true })))
-
-storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, zgEnabled: false, stats: JSON.stringify({ zg: 'off' }) }, base: {}, user: {}, writable: true, revision: 17 }
-tree = panel.component({ ...props })
-const zgEl = findType(tree, (n) => typeof n.type === 'function' && n.type.name === 'ZgToggle')
-ok(!!zgEl, '「检索两层」段渲染出语义层开关组件（ZgToggle）')
-const writes = []
-const zgProps = { ...zgEl.props, onWrite: (v) => writes.push(v) }
-const idleTexts = flatten(zgEl.type(zgProps)).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
-ok(idleTexts.includes('zg.label') && !idleTexts.includes('zg.confirm.title'), '未点击时只有开关行，没有确认面板')
-const zgSwitch = flatten(zgEl.type(zgProps)).find((n) => n.type === primitives.Switch)
-ok(!!zgSwitch && zgSwitch.props.checked === false, '开关态取自 zgEnabled（不是清单事实）', String(zgSwitch?.props?.checked))
-zgSwitch.props.onChange(true)
-ok(writes.length === 0, '点「开」不当场写表单——先停在确认这一步', JSON.stringify(writes))
-reactStub.useState = (init) => [true, () => {}] // 强制 confirming=true，看确认面板
-const confirmTree = zgEl.type(zgProps)
-const cTexts = flatten(confirmTree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
-const cBtns = flatten(confirmTree).filter((n) => n.props && typeof n.props.onClick === 'function')
-ok(cTexts.includes('zg.confirm.title') && cTexts.includes('zg.confirm.body'), '确认面板在场：标题 + 代价文案')
-ok(cBtns.length === 2, '确认面板两个按钮（确认开启 / 取消）', String(cBtns.length))
-cBtns[1].props.onClick()
-ok(writes.length === 0, '点「取消」一个字节都不写', JSON.stringify(writes))
-cBtns[0].props.onClick()
-ok(JSON.stringify(writes) === JSON.stringify([true]), '点「确认开启」才写 zgEnabled=true', JSON.stringify(writes))
-reactStub.useState = (init) => [init, () => {}]
-writes.length = 0
-flatten(zgEl.type(zgProps)).find((n) => n.type === primitives.Switch)?.props.onChange(false)
-ok(JSON.stringify(writes) === JSON.stringify([false]), '关闭不经过确认，直接写（关没有开销）', JSON.stringify(writes))
-// zg 行刻意没有「恢复此项」：布尔关掉即默认，多一个按钮只会暗示开关背后还有状态。
-storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, zgEnabled: true, stats: JSON.stringify({ zg: 'off' }) }, base: {}, user: { zgEnabled: true }, writable: true, revision: 18 }
+// v0.17.0：原 zgColor 五态三档色断言整段删除（ZgToggle 已死）；图谱行常态色由
+// 上面 layer.graph.on 在场断言兜住。
+storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, stats: JSON.stringify({ adapter: 'fresh' }) }, base: {}, user: {}, writable: true, revision: 17 }
 tree = panel.component({ ...props })
 {
   const uTexts = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
-  ok(!uTexts.includes('resetField'), 'user 显式写了 zgEnabled，zg 行也不渲染「恢复此项」', String(uTexts.filter((x) => x.includes('reset')).join('|')))
+  ok(!uTexts.includes('layer.zg.ready') && !uTexts.some((t) => String(t).startsWith('zg.')),
+    'zg 状态行与开关文案彻底不在场（防回潮）', uTexts.filter((t) => t.startsWith('zg.') || t.startsWith('layer.zg')).join('|'))
 }
 
 storeSnapshot = { status: 'loading', value: {}, base: {}, user: {}, writable: false, revision: 0 }
@@ -403,16 +318,15 @@ ok(panel.component({ ...props, view: 'summary' }) === 'summary', 'summary 态返
 /* ---- 6. 读数卡片（stats 只读，样式参考 dsh-mneme 状态页）---- */
 const statsJson = JSON.stringify({
   at: 1791531188925,
-  zg: 'ready',
   replace: { hit: 8, graph: 6, passDirty: 2, passNoHit: 0, passFailed: 0, passFailedGraph: 0, error: 0 },
   deny: { blocked: 3, passDirty: 1, passNoHit: 2, passQueryFailed: 0, skipSeen: 4, error: 0 },
   dirty: { record: 9, refreshScheduled: 5, refreshDone: 4, refreshFail: 1 },
-  lever: { wrapperCalls: 12, hintInjected: 3, codeSearch: 4 },
+  lever: { wrapperCalls: 12, hintInjected: 3 },
   listProjects: { hot: 0, cacheHit: 5 },
-  budget: { graph: 6000, zg: 4000 },
-  index: { retryContention: 1, zgIndexFail: 0 },
+  budget: { graph: 6000 },
+  index: { retryContention: 1 },
 })
-storeSnapshot = { status: 'ready', value: { enforce: 'replace', telemetry: true, zgEnabled: true, stats: statsJson }, base: {}, user: {}, writable: true, revision: 11 }
+storeSnapshot = { status: 'ready', value: { enforce: 'replace', telemetry: true, stats: statsJson }, base: {}, user: {}, writable: true, revision: 11 }
 tree = panel.component({ ...props })
 const texts = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
 console.log('\n[读数]')
@@ -420,15 +334,13 @@ ok(texts.includes('80%'), '命中率大数字 = hit/(hit+让路+无命中+出错
 ok(texts.includes('8/10'), '被替换行 = hit/den', texts.filter((t) => /^\d+\/\d+$/.test(t)).join('|'))
 ok(['stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index'].every((k) => texts.includes(k)), '五张卡片都在')
 // v0.16 死码清理：语义腿自 v0.15.0 M4' 退出替换通道，占比条随 zg/passFailedZg 两计数一并撤下（历史数在 telemetry JSONL 可翻）
-// v0.15.0 M6：分腿失败计数、两条腿的预算、code_search 调用、清单缓存命中都要在页上
+// v0.17.0：语义层整体移除，leg/zg 读数不复存在——图谱腿、预算单腿、缓存命中都要在页上。
 ok(texts.includes('stats.r.qfailgraph'), '失败计数按腿分开（图谱腿行在场）', texts.filter((t) => t.startsWith('stats.r.qfail')).join('|'))
-ok(texts.includes('stats.r.codesearch'), 'code_search 调用进软引导卡（语义层退出钩子后的唯一入口）')
 ok(texts.includes('stats.r.lpc') && texts.includes('stats.r.lph'), '清单缓存命中/现查进索引卡（M1 的验收读数）')
 // 夹具的 t() 原样返回 key（不查字典），所以这里断言"渲染了这一行"，
-// 模板占位符由下面的字典断言单独锁（{graph}/{zg} 必须都在）。
-ok(texts.includes('stats.budget') && /\{graph\}/.test(dictEntry?.dict?.zh?.['stats.budget'] ?? '') && /\{zg\}/.test(dictEntry?.dict?.zh?.['stats.budget'] ?? ''),
-  '两条腿的预算在页上（占位符 {graph}/{zg} 都在模板里）', texts.filter((t) => /budget/.test(t)).join('|').slice(0, 80))
-ok(texts.includes('layer.zg.ready'), '状态行的语义层取自 stats.zg（有数时用实测状态，不再「未知」）', texts.filter((t) => t.startsWith('layer.')).join('|'))
+// 模板占位符由下面的字典断言单独锁（只剩 {graph}；{zg} 若回潮此锁先炸）。
+ok(texts.includes('stats.budget') && /\{graph\}/.test(dictEntry?.dict?.zh?.['stats.budget'] ?? '') && !/\{zg\}/.test(dictEntry?.dict?.zh?.['stats.budget'] ?? ''),
+  '图谱预算在页上（占位符只有 {graph}）', texts.filter((t) => /budget/.test(t)).join('|').slice(0, 80))
 ok(flatten(tree).filter((n) => n.type === primitives.SegmentedControl).length === 1
   && flatten(tree).filter((n) => n.props && typeof n.props.onClick === 'function').length === 0, '读数块不新增交互件（卡片全只读）')
 storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, stats: '{坏' }, base: {}, user: {}, writable: true, revision: 12 }
@@ -460,30 +372,29 @@ ok(textsNoStats.includes('logRetentionDays.label') && textsNoStats.includes('rec
 // 有 repos + recent：表格按 cwd 分列；outcome 徽标按 recent 键渲染；snippet 折叠在场
 const statsWithRepos = JSON.stringify({
   at: 1791531188925,
-  zg: 'ready',
   replace: { hit: 1, graph: 1, passDirty: 0, passNoHit: 0, error: 0 },
   deny: { blocked: 0, passDirty: 0, passNoHit: 0, passQueryFailed: 0, skipSeen: 0, error: 0 },
   dirty: { record: 0, refreshScheduled: 0, refreshDone: 0, refreshFail: 0 },
   lever: { wrapperCalls: 0, hintInjected: 0 },
-  index: { retryContention: 0, zgIndexFail: 0 },
+  index: { retryContention: 0 },
   repos: [
-    { cwd: 'C:/repoA', project: 'repo-a', zg: true, replace: { 'intercept-replace': 3 }, deny: { 'intercept-deny': 1 } },
-    { cwd: 'C:/repoB', project: '', zg: false, replace: {}, deny: {} },
+    { cwd: 'C:/repoA', project: 'repo-a', replace: { 'intercept-replace': 3 }, deny: { 'intercept-deny': 1 } },
+    { cwd: 'C:/repoB', project: '', replace: {}, deny: {} },
   ],
   recent: [
     { ts: 1791531188925, cwd: 'C:/repoA', project: 'repo-a', symbol: 'foo', source: 'graph', outcome: 'replaced-graph', snippet: 'results: 1\n#1 [foo]' },
     { ts: 1791531188924, cwd: 'C:/repoB', project: '', symbol: 'bar', source: 'graph', outcome: 'denied', snippet: 'results: 2\n#1 [bar]\n#2 [baz]' },
   ],
 })
-storeSnapshot = { status: 'ready', value: { enforce: 'replace', telemetry: true, zgEnabled: true, stats: statsWithRepos }, base: {}, user: {}, writable: true, revision: 21 }
+storeSnapshot = { status: 'ready', value: { enforce: 'replace', telemetry: true, stats: statsWithRepos }, base: {}, user: {}, writable: true, revision: 21 }
 tree = panel.component({ ...props })
 const textsRepos = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
 ok(textsRepos.some((t) => /repoA/.test(t)) && textsRepos.some((t) => /repoB/.test(t)),
   '仓库表按 cwd 列出两个仓库（basename 或末两级路径）',
   textsRepos.filter((t) => /repo[AB]/.test(t)).join('|'))
 ok(textsRepos.includes('sec.repos.cbm'), '仓库表有 cbm project 列头')
-ok(textsRepos.includes('sec.repos.zg.yes') && textsRepos.includes('sec.repos.zg.no'),
-  '仓库表 zg 列同时有「有索引 / 无索引」两态')
+ok(!textsRepos.includes('sec.repos.zg.yes') && !textsRepos.includes('sec.repos.zg.no'),
+  'zg 列不得回潮（v0.17.0 语义层移除）', textsRepos.filter((t) => t.startsWith('sec.repos.')).join('|'))
 ok(textsRepos.includes('recent.replaced-graph') && textsRepos.includes('recent.denied'),
   '最近效果区渲染 outcome 徽标（replaced-graph / denied）')
 ok(!textsRepos.includes('sec.repos.empty') && !textsRepos.includes('sec.effect.empty'),
@@ -499,9 +410,9 @@ ok(repoSegs.length === 2,
 ok(repoSegs[1]?.props?.options?.[0]?.label === 'sec.filter.all',
   '仓库筛选器首项为「全部」（值为空字符串），后续每项对应一个 cwd',
   JSON.stringify(repoSegs[1]?.props?.options ?? []).slice(0, 120))
-// 输入框总数应为 6：interceptBudgetMs / graphBudgetMs / zgBudgetMs / interceptTools / logRetentionDays / recentLimit
-ok(flatten(tree).filter((n) => n.type === primitives.Input).length === 6,
-  '总输入框数 = 6（整体预算 + 两条腿预算 + 名单 + 保留天数/环形上限）',
+// 输入框总数应为 5：interceptBudgetMs / graphBudgetMs / interceptTools / logRetentionDays / recentLimit
+ok(flatten(tree).filter((n) => n.type === primitives.Input).length === 5,
+  '总输入框数 = 5（整体预算 + 图谱预算 + 名单 + 保留天数/环形上限；zgBudgetMs 已删）',
   String(flatten(tree).filter((n) => n.type === primitives.Input).length))
 
 console.log(`\n${failed === 0 ? 'check:client 全过' : `${failed} 项失败`}`)

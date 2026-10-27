@@ -47,12 +47,10 @@ const ENFORCE_MODES = ['off', 'deny-once', 'deny', 'replace']
 /**
  * 两条检索腿各自的钩子预算（ms）。为什么要拆：一个 interceptBudgetMs 管两腿时，
  * 图谱实测 ~5000ms、语义层热态 ~376ms，2500ms 的共同预算下**两腿都进不来**——
- * 图谱腿超时 ⇒ project 空串 ⇒ 图谱分支整段跳过；语义腿只在自己热了才够用。
- * 拆开之后每一腿按自己的真实成本定价：图谱给足，语义层用小预算（它热得很快）。
+ * 图谱腿超时 ⇒ project 空串 ⇒ 图谱分支整段跳过。
  * interceptBudgetMs 保留为「跟随」出口：把新项设成 0 就回到它（老配置的唯一出口）。
  */
 const DEFAULT_GRAPH_BUDGET_MS = 8000
-const DEFAULT_ZG_BUDGET_MS = 4000
 /** 预热缓存的 project 清单有效期：root_path 会变，过期就后台刷（热路径不现查）。 */
 const PROJECTS_LISTING_TTL_MS = 10 * 60 * 1000
 /**
@@ -77,14 +75,6 @@ function listingRetryDelays() {
   }
   return LISTING_RETRY_DELAYS_MS
 }
-/** 语义检索层（zvec-grep）的 MCP 工具集：agent 只暴露 zvec_grep_search；rg/index/status 走 CLI 与我们的后台补刷。 */
-const ZG_TOOLSETS = ['agent', 'full']
-/** 语义层包的钉死版本。与 scripts/install-zg.mjs 是两份字面量（仓库没有本地
- * node_modules，脚本 import 不动 index.js），漂移由 check-plugin 的静态比对钉住。 */
-const ZG_PKG = '@zvec/zvec-grep'
-const ZG_VERSION = '0.2.2'
-/** transformers.js + onnxruntime-node 路线永不加载的推理后端，装完即裁（~833MB）。 */
-const ZG_PRUNE = ['node_modules/node-llama-cpp', 'node_modules/@node-llama-cpp', 'node_modules/onnxruntime-web']
 /** 会写文件的内置工具（官方 tool-fs README：路径字段统一 snake_case `file_path`）。 */
 const WRITE_TOOLS = ['write', 'edit']
 const CODE_FILE = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|c|h|cc|cpp|hpp|cs|rb|php|swift|scala|vue|svelte|sql|sh|bash|ps1)$/i
@@ -116,17 +106,15 @@ export const Config = z.object({
   // （dsh-settings 写非 volatile 字段直接 throw），并且改动由 loader 推进同一个
   // 引用、**不用重启**就生效。标 volatile 的前提是**决策点现读**（normalize 里挂
   // getter，钩子每次调用重读）——注册期快照的字段标了就是让页面说谎，所以
-  // wrapperTools（tools.register 只在 apply 跑一次，没有反注册）与 zg*（清单是
-  // bootstrap 写的）等仍留在文件级。其余普通字段改了要重启。
+  // wrapperTools（tools.register 只在 apply 跑一次，没有反注册）仍留在文件级。其余普通字段改了要重启。
   enforce: z.string().default('off').volatile(),
   interceptTools: z.string().default('grep,glob').volatile(),
   // v0.15.0：interceptBudgetMs 的默认从 2500 改成 0，含义从「整体预算」变成
-  // 「未设」——0 时两条腿各按自己的默认预算走（结构层 6000 / 语义层 4000）。
+  // 「未设」——0 时图谱腿按自己的默认预算走。
   // 显式设过它的老 profile 不受影响（它优先于新项），没设过的才吃到新默认。
   interceptBudgetMs: z.number().default(0).volatile(),
-  // 两条检索腿各自的预算；0 = 跟随 interceptBudgetMs（它也是 0 时用各自的默认）。
+  // 图谱腿的独立预算；0 = 跟随 interceptBudgetMs（它也是 0 时用默认）。
   graphBudgetMs: z.number().default(0).volatile(),
-  zgBudgetMs: z.number().default(0).volatile(),
   contextHint: z.boolean().default(true).volatile(),
   // v0.16 T-D：脏台账攒到 N 个文件就**无视 CODE_QUESTION 闸门**注入陈旧命令（0=关）。
   // 审计依据（agent-chat 790 调用）：改码密集段模型不问结构问题、埋头 read/edit——
@@ -153,14 +141,6 @@ export const Config = z.object({
   logRetentionDays: z.number().default(7).volatile(),
   recentLimit: z.number().default(100).volatile(),
   markPassthrough: z.boolean().default(false).volatile(),
-  // ── 语义检索层（zvec-grep，可选，docs/design-v2.md 第 9 节）─────────────────
-  // zgEnabled 标 volatile：设置页的开关写它（v0.11.0）。诚实靠状态机而不是藏开关——
-  // cbm.json 清单仍是 bootstrap 时写的、adapter 进程加载清单要重拉（钉的 ≥0.0.6 有 watcher 秒级自愈；老进程靠 restart-adapter），所以热改只翻转
-  // 页面开关轴（stats.zgWant），清单轴（stats.zg）要等清单重拉——v0.12.0 起用
-  // code_setup {action:"restart-adapter"}（秒级）即可，重启宿主是等价重办法；两轴的差在页面上明说。
-  zgEnabled: z.boolean().default(false).volatile(),
-  zgToolset: z.string().default('agent'),
-  zgVendorDir: z.string().default(''),
 })
 
 const dshHome = () => process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -179,14 +159,14 @@ const live = (value) => (value && typeof value.get === 'function' ? value.get() 
 const defineLive = (cfg, key, read) => Object.defineProperty(cfg, key, { get: read, enumerable: true, configurable: true })
 
 /**
- * 两条检索腿的钩子预算（ms）。优先级：**具体项 > 0 → 旧的整体预算 > 0 → 各自的默认**。
+ * 图谱腿的钩子预算（ms）。优先级：**具体项 > 0 → 旧的整体预算 > 0 → 默认**。
  * 为什么旧字段（interceptBudgetMs）优先于新项的默认值：它是 2026-08 就存在的
  * 字段，老 profile 显式设过它（"我把检索等压到 60ms"），新默认值不能把它顶掉。
  * 而它自己的默认改成 0（=未设），于是没设过它的 profile 自然吃到分项默认。
  *
  * 图谱腿为什么是 8000 而不是更小：实测**经适配层代理**的一次图谱查询要 5.1s
  * （引擎自己答只要 13ms —— 那 5s 是代理层的固定开销）。6000 只剩 900ms 余量，
- * 一次抖动就超时；8000 留 3s 余量。语义层热态 376ms、冷启 3.3s ⇒ 4000 够。
+ * 一次抖动就超时；8000 留 3s 余量。
  */
 const budgetGraph = (cfg) => {
   const specific = Number(live(cfg.graphBudgetMs) ?? 0)
@@ -194,13 +174,6 @@ const budgetGraph = (cfg) => {
   const legacy = Number(live(cfg.interceptBudgetMs) ?? 0)
   if (legacy > 0) return legacy
   return DEFAULT_GRAPH_BUDGET_MS
-}
-const budgetZg = (cfg) => {
-  const specific = Number(live(cfg.zgBudgetMs) ?? 0)
-  if (specific > 0) return specific
-  const legacy = Number(live(cfg.interceptBudgetMs) ?? 0)
-  if (legacy > 0) return legacy
-  return DEFAULT_ZG_BUDGET_MS
 }
 
 /**
@@ -254,14 +227,6 @@ function normalize(config = {}) {
   // 触发层
   cfg.wrapperTools = boolOf(config.wrapperTools, true, cfg.notes, 'wrapperTools')
   cfg.dirtyRefreshCooldownSec = positiveInt('dirtyRefreshCooldownSec', config.dirtyRefreshCooldownSec, 120, cfg.notes)
-  // 语义检索层：非法值一律降级 + note，boot 不抛（与其余字段同一纪律）。
-  boolOf(live(config.zgEnabled), false, cfg.notes, 'zgEnabled')
-  if (config.zgToolset !== undefined && config.zgToolset !== '' && !ZG_TOOLSETS.includes(config.zgToolset)) {
-    cfg.notes.push(`zgToolset="${config.zgToolset}" 非法，已按 agent 处理（可选：${ZG_TOOLSETS.join('|')}）`)
-  }
-  cfg.zgToolset = ZG_TOOLSETS.includes(config.zgToolset) ? config.zgToolset : 'agent'
-  cfg.zgVendorDir = config.zgVendorDir || join(dshHome(), 'vendor', 'zvec-grep')
-  cfg.zgCli = join(cfg.zgVendorDir, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli', 'index.js')
   // 设置页可写字段（enforce/interceptTools/budget/contextHint/telemetry/dirtyTracking）
   // 全部留成 getter 而不是快照：快照一次就等于"UI 里改了、钩子还在用旧值"。
   // 非法值只在归一化这一次记进 notes——getter 会被反复读，往里 push 会把 notes 灌满。
@@ -271,21 +236,18 @@ function normalize(config = {}) {
   }
   positiveInt('interceptBudgetMs', live(config.interceptBudgetMs), 0, cfg.notes)
   positiveInt('graphBudgetMs', live(config.graphBudgetMs), 0, cfg.notes)
-  positiveInt('zgBudgetMs', live(config.zgBudgetMs), 0, cfg.notes)
   boolOf(live(config.telemetry), true, cfg.notes, 'telemetry')
   boolOf(live(config.contextHint), true, cfg.notes, 'contextHint')
   boolOf(live(config.dirtyTracking), true, cfg.notes, 'dirtyTracking')
   defineLive(cfg, 'enforce', () => (ENFORCE_MODES.includes(live(config.enforce)) ? live(config.enforce) : 'off'))
   defineLive(cfg, 'interceptBudgetMs', () => positiveInt('interceptBudgetMs', live(config.interceptBudgetMs), 0, []))
   defineLive(cfg, 'graphBudgetMs', () => positiveInt('graphBudgetMs', live(config.graphBudgetMs), 0, []))
-  defineLive(cfg, 'zgBudgetMs', () => positiveInt('zgBudgetMs', live(config.zgBudgetMs), 0, []))
   defineLive(cfg, 'telemetry', () => boolOf(live(config.telemetry), true, [], 'telemetry'))
   // v0.9.0：这三个也上了设置页 ⇒ 同一纪律。interceptTools 是决策点现读的名单
   // （csv 对任何字符串都成立，非法只可能是"写错工具名"，那本来就是空名单语义）。
   defineLive(cfg, 'interceptTools', () => csv(live(config.interceptTools) || 'grep,glob'))
   defineLive(cfg, 'contextHint', () => boolOf(live(config.contextHint), true, [], 'contextHint'))
   defineLive(cfg, 'dirtyTracking', () => boolOf(live(config.dirtyTracking), true, [], 'dirtyTracking'))
-  defineLive(cfg, 'zgEnabled', () => boolOf(live(config.zgEnabled), false, [], 'zgEnabled'))
   // v0.14.0 的三个观测字段（按天轮转 / recent 环形上限 / 未替换标记）。它们在
   // Config 里标了 volatile、页面也能写，但**归一化时忘了搬进 cfg** ⇒ 运行时恒为
   // undefined：sweepTelemetry 直接 early return（超期日志永不删）、slice(-undefined)
@@ -404,58 +366,6 @@ async function ensureAdapter(ctx, cfg, state, signal) {
     } else {
       push(state, `适配层升级未成功：仍是 ${now || '?'}（钉的是 ${cfg.adapterVersion}，退出码 ${r.exitCode}）——保留旧包继续跑`)
     }
-  }
-}
-
-/** 语义层 CLI 的实测版本；跑不起来/没装返回 ''。 */
-async function zgVersion(ctx, cfg, signal) {
-  const r = await run(ctx, [process.execPath, cfg.zgCli, '--version'], { cwd: cfg.zgVendorDir, signal })
-  return r.exitCode === 0 ? r.stdout.trim() : ''
-}
-
-/**
- * 语义层下载安装（v0.11.0，代理路线）：与 scripts/install-zg.mjs 同一条流程——
- * 全装 → 裁掉 onnxruntime-node 路线永不加载的推理后端（~833MB）→ `--version` 自检当门禁。
- * 设置页开关**不**触发这里（client 没有执行通道）；只有 code_setup {action:'install-zg'}
- * 显式调用才装，绝不自发——430MB 是要人点头的开销。state.zg 一律不动：清单才是
- * 事实（进程加载新清单要重拉：≥0.0.6 的 watcher 秒级自愈，否则 restart-adapter），装完提示重拉。并发调用直接抛，不排队。
- */
-async function installZgLayer(ctx, cfg, state, signal) {
-  if (state.zgInstalling) throw new Error('zg 安装已在进行中（同一时刻只允许一个 install-zg）')
-  if (existsSync(cfg.zgCli) && (await zgVersion(ctx, cfg, signal)) === ZG_VERSION) {
-    telemetry(cfg, state, 'zg-install-skip')
-    return { status: 'already', version: ZG_VERSION }
-  }
-  const npm = npmCliEntry()
-  if (!npm) throw new Error('找不到 npm-cli.js，无法自动安装；请手动跑 npm run install:zg')
-  state.zgInstalling = true // 先立旗再记事件：telemetry 会推 stats，第一帧就得是 installing
-  telemetry(cfg, state, 'zg-install-start', { version: ZG_VERSION })
-  try {
-    mkdirSync(cfg.zgVendorDir, { recursive: true })
-    const pkgJson = join(cfg.zgVendorDir, 'package.json')
-    if (!existsSync(pkgJson)) writeFileSync(pkgJson, JSON.stringify({ name: 'zg-vendor', private: true, version: '0.0.0' }))
-    const r = await run(ctx, [
-      process.execPath, npm, 'install',
-      '--prefix', cfg.zgVendorDir,
-      '--no-audit', '--no-fund', '--loglevel=error',
-      `${ZG_PKG}@${ZG_VERSION}`,
-    ], { cwd: cfg.zgVendorDir, maxBytes: 512 * 1024, signal })
-    if (!existsSync(cfg.zgCli)) {
-      throw new Error(`npm install 退出码 ${r.exitCode}：${(r.stderr || r.stdout).trim().slice(-400) || '(无输出)'}——网络慢可重跑；反复失败就手动 npm run install:zg 看全程输出`)
-    }
-    for (const rel of ZG_PRUNE) rmSync(join(cfg.zgVendorDir, rel), { recursive: true, force: true })
-    const v = await zgVersion(ctx, cfg, signal)
-    if (v !== ZG_VERSION) {
-      throw new Error(`裁剪后自检失败：--version 返回「${v}」（期望 ${ZG_VERSION}）——检查是否用了 --omit=optional 之类跳过可选依赖的安装姿势`)
-    }
-    telemetry(cfg, state, 'zg-install-done', { version: v })
-    return { status: 'installed', version: v }
-  } catch (error) {
-    telemetry(cfg, state, 'zg-install-fail', { error: String(error?.message ?? error).slice(0, 200) })
-    throw error
-  } finally {
-    state.zgInstalling = false
-    if (cfg.telemetry && state.pushStats) state.pushStats()
   }
 }
 
@@ -611,23 +521,6 @@ async function resolveCbm(ctx, cfg, state) {
   state.cbm = 'missing'
 }
 
-/**
- * 语义检索层探测：只查 vendor 里的 CLI 在不在，**不自动安装**。
- * 与 ensureAdapter 的差别是有意的：装 zg 要拖 ~430MB 依赖 + 首次下载嵌入模型，
- * 那是用户的一次显式决定（`npm run install:zg`），后台 bootstrap 不许替用户花带宽。
- */
-function resolveZg(cfg, state) {
-  if (!cfg.zgEnabled) { state.zg = 'off' }
-  else if (existsSync(cfg.zgCli)) { state.zg = 'ready' }
-  else {
-    state.zg = 'missing'
-    push(state, `zgEnabled=true 但找不到 ${cfg.zgCli}——装它：让 agent 调 code_setup {action:"install-zg"}，或手动跑 npm run install:zg`)
-  }
-  // 页面「检索两层」状态行消费这个字段：探测完立刻推一帧，别等下一个遥测事件。
-  // 遥测关时一帧都不推——「关了就冻结」是 S 臂锁住的契约（页面与日志同一开关）。
-  if (cfg.telemetry && state.pushStats) state.pushStats()
-}
-
 /** 写 adapter 的服务器清单。二进制用绝对 .exe，绕开 .cmd shim。 */
 function writeAdapterConfig(cfg, state) {
   const doc = {
@@ -656,19 +549,6 @@ function writeAdapterConfig(cfg, state) {
         excludeTools: EXCLUDE_TOOLS,
       },
     },
-  }
-  // 语义检索层（可选）。`server --stdio` 是 zg 自带的 MCP 桥——"安全地拉起或复用共享
-  // daemon，代理完 MCP 后让 daemon 继续活着"——所以生命周期零代码。lifecycle 用 lazy
-  // 而不是 cbm 那条 keep-alive：zg 没有 auto_index/watcher 会抢跑，不存在启动竞态，
-  // 换来的是 daemon（含模型池）只在第一次用时才起（实测 2.2s），不常驻吃内存。
-  // toolset=agent：只暴露 1 个 zvec_grep_search；rg/index/status 是 CLI 与后台补刷的，不给模型。
-  if (state.zg === 'ready') {
-    doc.mcpServers.zg = {
-      command: process.execPath,
-      args: [cfg.zgCli, 'server', '--stdio', '--mcp-toolset', cfg.zgToolset],
-      lifecycle: 'lazy',
-      exposeResources: false,
-    }
   }
   mkdirSync(cfg.adapterDir, { recursive: true })
   writeFileSync(cfg.adapterConfig, JSON.stringify(doc, null, 2) + '\n', 'utf8')
@@ -709,7 +589,6 @@ async function bootstrap(ctx, cfg, state, signal, { force = false } = {}) {
   if (state.ok && !force) return state
   await ensureAdapter(ctx, cfg, state, signal)
   await resolveCbm(ctx, cfg, state)
-  resolveZg(cfg, state)
   if (state.cbm === 'ready') {
     const r = await run(ctx, [state.cbmPath, '--version'], { maxBytes: 64 * 1024, signal })
     state.cbmVersion = (r.stdout || r.stderr).trim().split('\n')[0]
@@ -887,14 +766,6 @@ function adapterLine(state) {
 
 function report(cfg, state) {
   liftCounts(cfg, state) // 读侧 lift：报表的「累计」承诺要能在读路径兑现（v0.13.1）
-  // 语义层三轴（清单事实 / 包实测 / 页面开关）不一致时把待办动作写进后缀，别让用户猜。
-  const zgInstalled = existsSync(cfg.zgCli)
-  const zgSuffix = state.zgInstalling ? '  [install-zg 安装中]'
-    : cfg.zgEnabled && state.zg === 'off'
-      ? '  ⚠ 页面已开启，清单重拉（restart-adapter）后才生效' + (zgInstalled ? '' : '（包未装：code_setup {action:"install-zg"}）')
-      : !cfg.zgEnabled && state.zg !== 'off'
-        ? '  ⚠ 页面已关闭，清单重拉（restart-adapter）后才移除'
-        : ''
   const lines = [
     `status: ${state.ok ? 'OK' : 'NOT READY'}`,
     `压缩层(②): ${state.adapter}  ${cfg.adapterMjs}`,
@@ -903,11 +774,10 @@ function report(cfg, state) {
     `清单: ${state.configPath ?? '(未写)'}  exclude=${JSON.stringify(EXCLUDE_TOOLS)}`,
     `代理工具: ${PROXY_TOOL}  bootstrap=${cfg.bootstrap}  adapterVersion=${cfg.adapterVersion}  warm=${state.warm ? (state.warmOk === true ? 'ok' : state.warmOk === false ? 'failed' : `pending(${state.warmStartedAt ? Math.round((Date.now() - state.warmStartedAt) / 1000) : 0}s)`) : 'off'}`,
     `适配层进程: ${adapterLine(state)}`,
-    `触发层: wrapper=${cfg.wrapperTools ? 'on' : 'off'}  enforce=${cfg.enforce}  intercept=${cfg.interceptTools.join('+') || '(无)'}  budget=graph:${budgetGraph(cfg)}ms/zg:${budgetZg(cfg)}ms(intercept=${cfg.interceptBudgetMs > 0 ? `${cfg.interceptBudgetMs}ms` : '未设'})  dirty=${cfg.dirtyTracking ? 'on' : 'off'}(冷却 ${cfg.dirtyRefreshCooldownSec}s)  context=${cfg.contextHint ? 'on' : 'off'}`,
-    `语义层(zg): ${state.zgInstalling ? 'installing' : state.zg}  包=${zgInstalled ? '已装' : '未装'}  页面开关=${cfg.zgEnabled ? 'on' : 'off'}  toolset=${cfg.zgToolset}  ${cfg.zgCli}${zgSuffix}`,
-    // 六个即时热字段 + zgEnabled（v0.11.0 起页面可写）；清单重建不用重启宿主——
+    `触发层: wrapper=${cfg.wrapperTools ? 'on' : 'off'}  enforce=${cfg.enforce}  intercept=${cfg.interceptTools.join('+') || '(无)'}  budget=graph:${budgetGraph(cfg)}ms(intercept=${cfg.interceptBudgetMs > 0 ? `${cfg.interceptBudgetMs}ms` : '未设'})  dirty=${cfg.dirtyTracking ? 'on' : 'off'}(冷却 ${cfg.dirtyRefreshCooldownSec}s)  context=${cfg.contextHint ? 'on' : 'off'}`,
+    // 六个即时热字段；清单重建不用重启宿主——
     // code_setup {action:"restart-adapter"} 重拉适配层即可（宿主监督器自动重生进程）。
-    '热改: enforce / telemetry / contextHint / dirtyTracking / interceptBudgetMs / interceptTools / graphBudgetMs / zgBudgetMs → 设置 → 插件 → dsh-codebase-memory → codebase-memory 行「配置」（不用重启）；zgEnabled 也在页面上改，重启适配层进程（restart-adapter）或重启宿主后进清单；其余字段改 profile 的 cordis.patch.yml 并重启',
+    '热改: enforce / telemetry / contextHint / dirtyTracking / interceptBudgetMs / interceptTools / graphBudgetMs → 设置 → 插件 → dsh-codebase-memory → codebase-memory 行「配置」（不用重启）；其余字段改 profile 的 cordis.patch.yml 并重启',
     `遥测计数(跨重启累计): ${Object.entries(state.counts).map(([k, v]) => `${k}=${v}`).join(' ') || '(无事件)'}`,
     `auto_index: ${state.autoIndex || '(未设置)'}（期望 ${cfg.autoIndex ? 'true' : 'false'}；机器级共享配置，只补"无索引的新项目"，不刷新陈旧坐标）`,
     syncStatusLine(),
@@ -917,8 +787,7 @@ function report(cfg, state) {
   if (state.lastError) lines.push('error: ' + state.lastError)
   if (state.cbm !== 'ready') lines.push('', cbmInstallHint(state))
   // 按仓库索引状态（v0.13.4）：只有本进程见过的 cwd 才在这里列——没见过的仓库
-  // 本插件一无所知，不假装知道。cbm=是否已入图（cwd 在 projectsByCwd 里），
-  // zg=该仓 .zvec-grep 目录是否存在。
+  // 本插件一无所知，不假装知道。cbm=是否已入图（cwd 在 projectsByCwd 里）。
   const cwds = new Set([
     ...state.projectsByCwd.keys(),
     ...state.sessions.values().map((s) => s?.cwd).filter(Boolean),
@@ -928,13 +797,12 @@ function report(cfg, state) {
     lines.push(`仓库索引状态(本进程见过 ${cwds.size} 个 cwd):`)
     for (const cwd of [...cwds].sort()) {
       const project = state.projectsByCwd.get(cwd) || ''
-      const zg = existsSync(join(cwd, '.zvec-grep'))
       const hit = state.repos.get(cwd)
       const r = hit?.replace || {}
       const d = hit?.deny || {}
       const repl = `${(r['intercept-replace'] ?? 0)}`
       const dny = `${(d['intercept-deny'] ?? 0)}`
-      lines.push(`  ${basename(cwd)}  cbm=${project || '未入图'}  zg=${zg ? '有索引' : '无索引'}  替换=${repl}  拒绝=${dny}`)
+      lines.push(`  ${basename(cwd)}  cbm=${project || '未入图'}  替换=${repl}  拒绝=${dny}`)
     }
   }
   return lines.join('\n')
@@ -949,13 +817,7 @@ function usageSection(state) {
     ].join('\n')
   }
   const lines = [
-    // 首句是 agent 每会话第一眼读到的锚定文案：zg ready 时报双层组成并写明归属
-    // （ruankao 案：agent 说"zg 不是 dsh-codebase-memory 插件，是独立 MCP server"，
-    // 窄化判词就漏在这句只报 code 索引 + zg 段不讲归属）。zg 没就绪一个字不提——
-    // 不画饼纪律不变（:838 注释 + 断言「Z 默认 prompt 不提 zg」）。
-    (state.zg === 'ready'
-      ? '本工作区已接入两层代码检索——结构层 cbm（codebase-memory 图谱）+ 语义层 zg（zvec-grep，server 由本插件清单注册）——都经 mcp-adapter 压成单个代理工具。'
-      : '本工作区已接入 codebase-memory 代码索引（经 mcp-adapter 压成单个代理工具）。'),
+    '本工作区已接入 codebase-memory 代码索引（经 mcp-adapter 压成单个代理工具）。',
     '',
     '**首选封装动词**（project 与参数形状由插件填，你只管说要找什么）：',
     '- `code_find("符号")` → qualified_name + 文件 + 行范围 + 源码，代替"用 grep 猜定义在哪"。',
@@ -967,6 +829,7 @@ function usageSection(state) {
     '- 验鲜 {"tool":"cbm_check_index_coverage","args":{"project":"<p>","paths":["<相对路径>"]}}',
     '- 取原文 {"tool":"cbm_get_code_snippet","args":{"project":"<p>","qualified_name":"<qn>","format":"json"}}',
     '- 多跳 {"tool":"cbm_query_graph",...}；{"server":"cbm"} 列工具，{"describe":"..."} 看参数',
+    '- 按意思找（自然语言问代码）{"tool":"cbm_search_graph","args":{"project":"<p>","query":"..."}}——引擎的 BM25 符号检索（还有 semantic_query 参数）；图谱只含代码，md/配置/文档仍用 grep。',
     '',
     '两个坑性质相反，处置不同：',
     '- **取原文务必带 format:"json"**：默认 tree 是排版信封，照抄当锚点必不匹配，但会当场报错。',
@@ -975,19 +838,6 @@ function usageSection(state) {
     '',
     '偏移量、实测样本与上游 issue 见本仓库 README 的「已知限制」。',
   ]
-  // 语义路由段只在 zg 真的 ready 时出现：图谱引擎（0.11.0 实测）没有任何向量检索，
-  // 这段是唯一能说出"自然语言/文档检索"的地方——zg 没装就一个字都不提，不画饼。
-  // v0.15.0：语义层从替换钩子里退出来了（M4'），所以这段要同时说清"它不参与 grep
-  // 替换"——否则模型会以为 grep 被换掉的可能是语义结果，从而不敢信替换后的坐标。
-  if (state.zg === 'ready') {
-    lines.push(
-      '',
-      '**语义/文档检索**（图谱只索引代码，这一层补的是自然语言问题与 md/配置/文档）：',
-      '首选 `code_search("自然语言描述")`——root 与 limit 由插件填；没有这个封装时才用代理工具调 `zg_zvec_grep_search`（args 必须带 root）。',
-      '它回的是**近似片段、没有坐标**：要 file:line 用 code_find，要精确字面量用 grep——三者各有分工，别互相顶替。',
-      '注意：enforce=replace 只换**符号类** grep（走图谱）；语义层不参与 grep 替换——它答的是问题，不是正则。',
-    )
-  }
   return lines.join('\n')
 }
 
@@ -1084,8 +934,8 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
  * ── 触发层（docs/design-v2.md 杠杆 ①②③⑤）────────────────────────────────────
  *
  * 一句话：把"该用代码图"从**劝**变成**给结果**——高频动线包成原生工具（①）、
- * 符号类 grep 可拦截（②，deny 系）或直接把输出换成两层检索的命中（replace，
- * 见下：结构层=代码图谱先答，语义层=zvec-grep 补位——两层是并存能力，不是二选一）、
+ * 符号类 grep 可拦截（②，deny 系）或直接把输出换成图谱的命中（replace，
+ * 结构层=代码图谱唯一来源）、
  * 按 query 注入 1–2 行状态（③）、写后记账保证前两者的结果可信（⑤）。
  * 每一条都可关，且全部 fail-open：hook 里出错一律放行。
  *
@@ -1192,7 +1042,7 @@ export function normPath(p, cwd = '') {
 
 /**
  * 搜索目标是否落在本工作区内：没有 path 参数 = 全仓搜索（属工作区）；给了 path
- * 只有解析后仍在工作区内才算。图谱与 zg 都是**工作区级**的，越界的 grep（比如
+ * 只有解析后仍在工作区内才算。图谱是**工作区级**的，越界的 grep（比如
  * 去搜宿主依赖目录）它们答不了——替换=拿本仓的命中伪造越界文件的坐标（实测
  * 遥测：path=AppData\… 的 grep 被换成本仓图谱命中）。导出以便验收直接证伪。
  */
@@ -1249,13 +1099,13 @@ function resultText(res) {
  * budgetMs ≤ 0 = 不带秒表，等真实 settle（v0.13.2，预热用：没有人在等回话，
  * race 的"超时"只是放弃等待、调用还在跑，用它落账会把焐好的引擎报成失败）。
  */
-async function cbmCall(ctx, exec, tool, args, budgetMs, namePrefix = 'cbm') {
+async function cbmCall(ctx, exec, tool, args, budgetMs) {
   if (typeof ctx?.tools?.execute !== 'function') return { ok: false, text: '' }
   const signal = exec?.signal ?? new AbortController().signal
   const input = {
     callId: randomUUID(),
     name: PROXY_TOOL,
-    arguments: { tool: `${namePrefix}_${tool}`, args },
+    arguments: { tool: `cbm_${tool}`, args },
     signal,
     ...(exec?.agent ? { agent: exec.agent } : {}),
   }
@@ -1266,8 +1116,7 @@ async function cbmCall(ctx, exec, tool, args, budgetMs, namePrefix = 'cbm') {
   if (outcome.isError) return { ok: false, text: resultText(outcome) }
   const text = resultText(outcome)
   // 代理工具会把**底层 MCP 工具的错误包成普通文本**返回（outcome.isError 仍是 false）：
-  // 实测 zg 守护打不开 collection 时返回 "Error: Failed to open zvec collection storage…"，
-  // 若不识别，错误文本会被当成命中去替换原始输出（遥测里 source=zg 的 intercept-replace）。
+  // 若不识别，错误文本会被当成命中去替换原始输出。
   // Error 开头的文本 = 失败，由调用方放行；图谱树以 project:/total:/rows 或 JSON 开头，安全。
   // v0.12.0 补第二种失败形态：清单里 0 个 server 时 adapter 回的是
   // `Tool "cbm_list_projects" not found. Use mcp({ server: … })…`——以 Tool 开头不以 Error
@@ -1486,11 +1335,6 @@ function renderStats(cfg, state) {
   const n = (k) => state.counts[k] ?? 0
   return JSON.stringify({
     at: Date.now(),
-    // 三轴：zg=清单事实（bootstrap 时定），zgWant=页面开关，zgInstalled=包实测。
-    // 面板靠三轴差值推导五态；安装中把 zg 顶成 installing（瞬时态，不是实测结果）。
-    zg: state.zgInstalling ? 'installing' : state.zg,
-    zgWant: cfg.zgEnabled === true,
-    zgInstalled: existsSync(cfg.zgCli),
     // 进程轴（v0.12.0）：面板 stale 行靠它——清单写了 ≠ 活进程加载了。null=还没量过。
     adapter: state.adapterFresh ? state.adapterFresh.verdict : null,
     replace: { hit: n('intercept-replace'), graph: n('intercept-replace:graph'), passDirty: n('replace-pass-dirty'), passRefreshing: n('replace-pass-refreshing'), passNoHit: n('replace-pass-no-hit'), passFailed: n('replace-pass-failed'), passFailedGraph: n('replace-pass-failed:graph'), error: n('replace-error') },
@@ -1500,24 +1344,22 @@ function renderStats(cfg, state) {
     // agent-chat 审计的逃逸通道（110 次 grep 里 11 次这种写法）；只记账不改输出，
     // 改不改行为是 SKILL 条款和替换钩子的事。
     nearMiss: { symbol: n('near-miss-symbol') },
-    lever: { wrapperCalls: n('wrapper-call'), hintInjected: n('hint-injected'), codeSearch: n('code-search'), staleWarn: n('stale-warn') },
+    lever: { wrapperCalls: n('wrapper-call'), hintInjected: n('hint-injected'), staleWarn: n('stale-warn') },
     // v0.15.0 M1：project 清单的取用方式——hot=热路径现查 list_projects（应趋零），
     // cacheHit=命中预热留下的清单（零成本）。hot 不降就是预热没生效。
     listProjects: { hot: n('list-projects:hot'), cacheHit: n('list-projects:cache-hit') },
-    // 两条腿当前生效的预算（ms）：面板要让"为什么慢"能一眼看到是哪一腿的锅。
-    budget: { graph: budgetGraph(cfg), zg: budgetZg(cfg) },
-    index: { retryContention: n('index-retry-contention'), zgIndexFail: n('zg-index-fail') },
+    // 图谱腿当前生效的预算（ms）：面板要让"为什么慢"能一眼看到。
+    budget: { graph: budgetGraph(cfg) },
+    index: { retryContention: n('index-retry-contention') },
     // 按仓库的读数（v0.13.4）：面板仓库选择器用。进程内累计、重启归零——落盘会
-    // 污染 counts.json 的扁平契约，而趋势看板本来就不跨重启。project / zg 两列是
-    // 该仓的索引状态：project=结构层入图名，zg=语义层目录是否存在（页面每帧重算，
-    // 一次 existsSync 很便宜，不值得单独做失效通知）。
+    // 污染 counts.json 的扁平契约，而趋势看板本来就不跨重启。project 列=该仓
+    // 结构层入图名（页面每帧重算，很便宜，不值得单独做失效通知）。
     repos: Array.from(state.repos.entries()).map(([cwd, r]) => ({
       cwd,
       project: state.projectsByCwd.get(cwd) || '',
-      zg: existsSync(join(cwd, '.zvec-grep')),
       ...r,
     })),
-    // 最近 N 条替换/拒绝决策（带命中文本片段）：「换成 zg 返回了什么」就靠它。
+    // 最近 N 条替换/拒绝决策（带命中文本片段）：「换成图谱返回了什么」就靠它。
     recent: state.recent.slice(-live(cfg.recentLimit)),
   })
 }
@@ -1618,8 +1460,8 @@ function renderInterceptHint(symbol, project, hits) {
 }
 
 /**
- * 命中条数：图谱 tree / zg 输出都按「非空行」粗数——只要够模型与人判断量级，
- * 不追求精确（精确要解析两种表形状，得不偿失）。
+ * 命中条数：图谱 tree 输出按「非空行」粗数——只要够模型与人判断量级，
+ * 不追求精确（精确要解析表形状，得不偿失）。
  */
 const hitCount = (text) => String(text ?? '').split('\n').filter((l) => l.trim()).length
 
@@ -1634,39 +1476,30 @@ function renderPassthroughMark(symbol, outcome, cwd) {
     : outcome === 'replace-pass-refreshing' ? '引擎正在为本工作区重建索引，查询会排队超时'
     : outcome === 'replace-pass-failed' ? '检索层查询失败'
     : '索引里没有这个符号'
-  return `【未替换 · 原始 grep 输出 · 仓 ${repo}】grep "${symbol}" 没被换掉：${why}。enforce=replace 下这是原始结果，不是图谱/zg 命中。\n`
+  return `【未替换 · 原始 grep 输出 · 仓 ${repo}】grep "${symbol}" 没被换掉：${why}。enforce=replace 下这是原始结果，不是图谱命中。\n`
 }
 
 /**
- * replace 档（enforce=replace）的模型可见内容：原始 grep 输出整体换成两层检索的
- * 命中（结构层优先、语义层补位是**单次替换内**的取数顺序，不代表两层能力二选一——
- * code_find 与 zvec_grep_search 作为常规工具始终并存可用，本档只改 grep 的可见输出）。
+ * replace 档（enforce=replace）的模型可见内容：原始 grep 输出整体换成图谱命中。
  * 走的是宿主 post-execute 的 accept+content 替换通道（契约：dsh-tools
  * index.d.ts PostToolDecision——"accept keeps the call successful (replacing
  * content when given)"；pre-execute 不能改写参数，参数在执行前已被 deepFreeze）。
  * 不留原输出是刻意的：两者都给，模型（和人）的习惯会赢回 grep——用户验收结论
  * （m00773"还是软限制"）要的是换了就真换了。
  *
- * 首行是**来源徽标**（v0.13.4）：层 + 仓库 + 条数三件套，让「这是 grep 还是 zg」
- * 在文本最前端就分清——徽标放在第一行、用方括号包裹，扫一眼就能定位。
+ * 首行是**来源徽标**（v0.13.4）：层 + 仓库 + 条数三件套。徽标放第一行、方括号包裹。
+ * v0.15.0 M5' 文案分层：图谱给的是符号坐标（qualified_name + 文件 + 行范围），
+ * 可以当锚点用；但坐标来自索引——本会话改过的文件已按脏台账过滤（dropped）。
  */
-function renderReplacement(symbol, source, project, hits, cwd, dropped = 0) {
-  const layer = source === 'graph' ? '结构层(图谱)' : '语义层(zg)'
+function renderReplacement(symbol, project, hits, cwd, dropped = 0) {
   const repo = cwd ? basename(cwd) : project || '未知仓'
-  // v0.15.0 M5'：两层文案必须分层，不能同构——
-  //  · 结构层给的是符号坐标（qualified_name + 文件 + 行范围），可以当锚点用；
-  //  · 语义层给的是**近似片段**，没有坐标，拿它当 file:line 就是伪造。
-  // 替换钩子现在只产出结构层（M4'），但函数保持通用：以后若从别的通道进来，
-  // 文案仍然要说真话。
   return truncateCodepoints([
-    `【替换自 ${layer} · 仓 ${repo} · ${hitCount(hits)} 行】grep "${symbol}" 的原始输出已丢弃。要看原始 grep 结果，把 enforce 改回 off。`,
+    `【替换自 结构层(图谱) · 仓 ${repo} · ${hitCount(hits)} 行】grep "${symbol}" 的原始输出已丢弃。要看原始 grep 结果，把 enforce 改回 off。`,
     // 被脏台账过滤掉的行必须说破：模型看到的命中是"过滤后"的，不是全部。
     dropped > 0 ? `（已过滤 ${dropped} 条本会话改过的文件——那些坐标可能过期；要它们就先 code_index）` : '',
-    source === 'graph' ? `project=${project} 的 search_graph 命中（坐标来自索引）：` : 'zvec_grep_search 命中（语义近似，不是字面匹配、不是符号定义，不能当 file:line 锚点）：',
+    `project=${project} 的 search_graph 命中（坐标来自索引）：`,
     (hits || '(无命中)').trim(),
-    source === 'graph'
-      ? `下一步：code_find("${symbol}") 拿源码，或 code_callers("<qualified_name>") 拿调用者；本会话改过代码就先 code_index 再采信行号。`
-      : '下一步：要坐标用 code_find / code_callers，要精确字面量用 grep；这一段只能当线索。',
+    `下一步：code_find("${symbol}") 拿源码，或 code_callers("<qualified_name>") 拿调用者；本会话改过代码就先 code_index 再采信行号。`,
   ].filter(Boolean).join('\n'), HINT_MAX_CODEPOINTS)
 }
 
@@ -1745,19 +1578,6 @@ async function runCbmFlow(ctx, cfg, state, exec, work) {
 }
 
 /**
- * 双驱动台账的后半：同一份"本会话写过代码"的事实，图谱补刷之外也喂给 zg 的增量
- * index（实测 18 文件 ~2s；首次全量 22.7s）。不进图谱那条 withIndexLock——两条索引
- * 互不相干，撞车的代价只是多跑一次 CLI。失败静默：查询会退回 eventual freshness，
- * 结果里的 freshness 行自己会说话，不假装刷新过。
- */
-async function refreshZgIndex(ctx, cfg, cwd, signal) {
-  const r = await run(ctx, [process.execPath, cfg.zgCli, 'index'], {
-    cwd, maxBytes: 256 * 1024, graceMs: 120000, signal,
-  })
-  return r.exitCode === 0
-}
-
-/**
  * 脏路径触发的后台补刷：冷却期内合并（同回合的多次写入自然并成一次）。
  * 复用 H2 那条带闸门的 refreshSessionWorkspace——它自己会验 git 状态是否真变了。
  */
@@ -1767,13 +1587,6 @@ function scheduleDirtyRefresh(ctx, cfg, state, sess, exec) {
   sess.lastRefreshAt = now
   const paths = [...sess.dirty]
   telemetry(cfg, state, 'dirty-refresh-scheduled', { paths: paths.length })
-  // zg 那半边不看 git 闸门：台账里有写入就值得刷（工作区甚至可以不是 git 仓库）。
-  const zgCwd = exec?.agent?.session?.header?.cwd
-  if (state.zg === 'ready' && zgCwd) {
-    void refreshZgIndex(ctx, cfg, zgCwd, state.abortSignal)
-      .then((ok) => telemetry(cfg, state, ok ? 'zg-index-done' : 'zg-index-failed', { paths: paths.length }))
-      .catch((error) => telemetry(cfg, state, 'zg-index-fail', { message: String(error?.message ?? error).slice(0, 200) }))
-  }
   void refreshSessionWorkspace(ctx, cfg, state, exec?.agent, state.abortSignal)
     .then((outcome) => {
       // 只有**真的重建过**才清账：被闸门挡下（非 git / 冷却 / 未索引）等于什么都没做，
@@ -1851,7 +1664,6 @@ export async function apply(ctx, config) {
   const cfg = normalize(config)
   const state = {
     adapter: 'unknown', cbm: 'unknown', ok: false, autoIndex: '', refreshing: new Set(), notes: [], lastError: '',
-    zg: 'off', zgInstalling: false,
     sessions: new Map(), projectsByCwd: new Map(), counts: {}, indexJobs: new Map(),
     repos: new Map(), recent: [],
     // v0.15.0：预热那一发 list_projects 的**返回体**留在这儿（M1）。它的返回文本
@@ -1945,11 +1757,11 @@ export async function apply(ctx, config) {
 
   ctx.tools.register(defineTool({
     name: 'code_setup',
-    description: 'Check and repair the codebase-memory code-index chain for this DSH host: the pinned mcp-adapter token-compression layer (auto-bootstrapped) and the codebase-memory-mcp binary (manual install). Reports exact paths, versions, the adapter-process freshness axis (manifest written vs actually loaded by the running process) and a copy-pasteable install command when something is missing. Only side effect is installing the pinned adapter package when it is absent. Pass action "install-zg" to install the optional semantic retrieval layer (~430MB after pruning) — explicit opt-in only, never automatic. Pass action "restart-adapter" to reload the MCP server manifest without a host restart: kills the adapter process and lets the host supervisor respawn it (seconds; use when the report says stale / tools report "not found" although the manifest is on disk).',
+    description: 'Check and repair the codebase-memory code-index chain for this DSH host: the pinned mcp-adapter token-compression layer (auto-bootstrapped) and the codebase-memory-mcp binary (manual install). Reports exact paths, versions, the adapter-process freshness axis (manifest written vs actually loaded by the running process) and a copy-pasteable install command when something is missing. Only side effect is installing the pinned adapter package when it is absent. Pass action "restart-adapter" to reload the MCP server manifest without a host restart: kills the adapter process and lets the host supervisor respawn it (seconds; use when the report says stale / tools report "not found" although the manifest is on disk).',
     parameters: {
       action: {
         type: 'string',
-        description: 'Optional. "install-zg" = download and prune the pinned @zvec/zvec-grep into the vendor dir (long-running, hundreds of MB; ask the user first). "restart-adapter" = kill the adapter process so the host supervisor respawns it with the current manifest (use after install-zg or a zgEnabled toggle instead of restarting the whole host). Omit to just check and report the chain.',
+        description: 'Optional. "restart-adapter" = kill the adapter process so the host supervisor respawns it with the current manifest (use instead of restarting the whole host). Omit to just check and report the chain.',
       },
     },
     output: {
@@ -1959,23 +1771,6 @@ export async function apply(ctx, config) {
     },
     async execute(args = {}) {
       const action = String(args?.action ?? '').trim()
-      if (action === 'install-zg') {
-        // 不跑 bootstrap：state.zg 是清单事实，进程启动前不会变——装完就改它，
-        // usageSection 会对着还没加载 zg 的 adapter 撒谎。重拉进程后 bootstrap 会探到。
-        const r = await installZgLayer(ctx, cfg, state, ac.signal)
-        const head = r.status === 'already'
-          ? `zvec-grep ${r.version} 已就位（${cfg.zgCli}），没有重复下载。`
-          : `zvec-grep ${r.version} 安装并裁剪完成（净 ~430MB）：${cfg.zgCli}。`
-        return [
-          head,
-          cfg.zgEnabled
-            ? '下一步：code_setup {action:"restart-adapter"} 重拉适配层（几秒），清单会加入 zg server，语义层生效；重启宿主是等价的重办法。'
-            : '下一步：设置 → 插件 → dsh-codebase-memory → 配置里打开语义层开关，再 code_setup {action:"restart-adapter"}（或重启宿主）。',
-          '提醒：zg 的索引产物 .zvec-grep/ 会落进每个被索引仓库——把它加进 .gitignore。',
-          '',
-          report(cfg, state),
-        ].join('\n')
-      }
       if (action === 'restart-adapter') {
         // 杀进程 → 宿主监督器（dsh-mcp-client 断连即重启）自动重拉 → 新进程读当前清单。
         // 等完新进程再 force 量一次新鲜度：报表里的适配层进程行必须是重启后的实况。
@@ -1991,7 +1786,7 @@ export async function apply(ctx, config) {
           report(cfg, state),
         ].filter(Boolean).join('\n')
       }
-      if (action) throw new Error(`未知 action "${action}"（可选：install-zg / restart-adapter；留空 = 只检查并汇报链路）`)
+      if (action) throw new Error(`未知 action "${action}"（可选：restart-adapter；留空 = 只检查并汇报链路）`)
       await bootstrap(ctx, cfg, state, ac.signal).catch((error) => {
         state.lastError = String(error?.message ?? error)
         state.ok = false
@@ -2191,69 +1986,6 @@ export async function apply(ctx, config) {
         })
       },
     }))
-
-    // ── 杠杆 ①b：语义层封装工具（v0.15.0 M4b）────────────────────────────────
-    // 为什么需要它：语义层从替换钩子退出之后（M4'），模型若只能通过代理工具调
-    // `zg_zvec_grep_search`，就得自己知道三件事——工具名带 server 前缀、root 必填
-    // 且是绝对路径、本仓有没有 `.zvec-grep`。三件都是模型容易错的（实测：工具在
-    // 手时 code_find 的调用次数是 0，"知道有"不等于"会用"）。这个封装与 code_find
-    // 同一条纪律：把路由键从模型手里拿走，它只管说人话。
-    ctx.tools.register(defineTool({
-      name: 'code_search',
-      description: 'Semantic search over THIS workspace: use it for natural-language questions ("where does X get retried / how is Y configured") and for prose or config files (md / yaml / json) that the code graph does not index. Returns semantically similar snippets — they are LEADS, not coordinates: there is no qualified name and no file:line you may cite. For definitions and call relations use code_find / code_callers; for exact literals, log lines and config keys keep using grep. Requires the optional semantic layer; when it is off or this repo has no index, the tool says so instead of degrading silently.',
-      parameters: {
-        query: { type: 'string', required: true, description: 'Natural-language description of what the code does. Keywords are fine; a bare identifier is a poor query here (use code_find for that).' },
-        limit: { type: 'integer', description: 'Max snippets (default 8, cap 20).' },
-      },
-      output: {
-        schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            text: { type: 'string', required: true },
-            status: { type: 'string', required: true },
-          },
-        },
-        render: (_args, value) => [{ type: 'text', text: value.text }],
-      },
-      async execute(args, exec) {
-        const cwd = exec?.agent?.session?.header?.cwd
-        if (!cwd) throw new Error('code_search 需要会话工作区：exec.agent.session.header.cwd 为空')
-        await bootstrap(ctx, cfg, state, exec.signal).catch((error) => {
-          state.lastError = String(error?.message ?? error)
-          state.ok = false
-        })
-        // 前提不成立即 throw，不静默降级成 grep（与 code_index/code_find 同一条纪律）。
-        if (state.zg !== 'ready') {
-          throw new Error(cfg.zgEnabled
-            ? `语义层包已开启但没就绪（state=${state.zg}）：先 code_setup {action:"install-zg"} 装包（约 430MB，需用户点头），再 code_setup {action:"restart-adapter"} 重拉清单。`
-            : '语义层未开启（zgEnabled=false）：这是可选层，装它约 430MB。要开就去设置页打开「检索两层 → 语义层」，或让用户在 profile 里设 zgEnabled: true；不想开就用 code_find / grep。')
-        }
-        // 本仓没有语义索引：上游 activate() 在读任何参数之前就 throw INDEX_MISSING
-        // （0.2.2 实证），所以这一枪注定失败——不如直接说清怎么建。
-        if (!existsSync(join(cwd, '.zvec-grep'))) {
-          throw new Error(`本工作区还没有语义索引（缺 ${join(cwd, '.zvec-grep')}）：先问用户是否同意建索引，同意后跑 node "${cfg.zgCli}" index（增量约 2s、首建全量约 23s；产物目录务必进 .gitignore）。这是上游的显式授权门，不是故障。`)
-        }
-        const limit = Math.min(Math.max(Number.isInteger(args.limit) ? args.limit : 8, 1), 20)
-        const query = String(args.query ?? '').trim()
-        if (!query) throw new Error('code_search 需要 query（自然语言描述）')
-        const r = await cbmCall(ctx, exec, 'zvec_grep_search', { query, root: cwd, limit }, budgetZg(cfg), 'zg')
-        if (!r.ok) throw new Error(`zvec_grep_search 调用失败（链路或引擎异常）：${(r.text || '超时').slice(0, 300)}`)
-        const hits = String(r.text ?? '')
-        telemetry(cfg, state, 'code-search', { cwd, chars: hits.length })
-        if (noHits(hits)) {
-          return { status: 'empty', text: `语义层（root=${cwd}）没有匹配 "${truncateCodepoints(query, 80)}" 的片段。\n这是语义检索的空答案，不代表代码里没有——换个说法，或改用 code_find（符号）/ grep（字面量）。` }
-        }
-        return {
-          status: 'ok',
-          text: truncateCodepoints([
-            `code_search 语义命中（root=${cwd}，${hitCount(hits)} 行）：`,
-            '⚠ 这是**语义近似片段**，不是符号定义、也没有坐标：不能当 file:line 引用。要坐标用 code_find / code_callers。',
-            hits.trim(),
-          ].join('\n'), 6000),
-        }
-      },
-    }))
   }
   // ── 杠杆 ②：tools/pre-execute 拦截符号类 grep/glob（仅 deny-once / deny）──────
   // 关键路径上的同步钩子：只做纯本地判断，必要才查（实测代理查询 ~30–60ms，
@@ -2392,14 +2124,8 @@ export async function apply(ctx, config) {
           }
           if (texts.length) { source = 'graph'; text = texts.join('\n') }
         }
-        // v0.15.0 M4'：**语义层退出替换钩子**。这里原来还有一段"图谱没答案就轮到
-        // zg 补位"，三个理由拆掉它：
-        //   ① 喂进去的是同一个裸标识符（q.symbol）。对图谱这是正确输入，对向量检索
-        //      是最差输入——单个标识符的 embedding 几乎没有语义信号，回来的多是噪声。
-        //   ② 它只在"图谱没这个符号"时启动，也就是语义最不可能给准答案的时刻。
-        //   ③ 代价翻倍：图谱腿 6s 超时后再等语义腿 4s，一次符号类 grep 白等 10s。
-        // 语义层的正确输入是**用户的问题**（自然语言、md/配置/文档），那些不以 grep
-        // pattern 的形态出现 ⇒ 走显式入口 code_search（v0.15.0 M4b），不进热路径。
+        // v0.15.0 M4'：语义层从来、现在都不进替换钩子。v0.17.0 删 zg 后本钩子的
+        // 唯一来源就是图谱；对向量检索最差输入的讨论见 commit 96f2c44 前的历史。
         if (!text) {
           // 失败按**腿**归因（M3）。全被脏过滤掉是第三种情况：有答案、但坐标都不可信
           // ⇒ 记 pass-dirty（语义是"有命中但不该换"），不是 no-hit。
@@ -2413,8 +2139,8 @@ export async function apply(ctx, config) {
         }
         telemetry(cfg, state, 'intercept-replace', { session: key, cwd, project, symbol: q.symbol, source, ...(dropped ? { dropped } : {}) })
         repoBump(state, cwd, 'intercept-replace')
-        pushRecent(state, { ts: Date.now(), cwd, project, symbol: q.symbol, source, outcome: source === 'graph' ? 'replaced-graph' : 'replaced-zg', snippet: snippet(text) })
-        return { kind: 'accept', content: [{ type: 'text', text: renderReplacement(q.symbol, source, project, text, cwd, dropped) }] }
+        pushRecent(state, { ts: Date.now(), cwd, project, symbol: q.symbol, source, outcome: 'replaced-graph', snippet: snippet(text) })
+        return { kind: 'accept', content: [{ type: 'text', text: renderReplacement(q.symbol, project, text, cwd, dropped) }] }
       } catch (error) {
         telemetry(cfg, state, 'replace-error', { message: String(error?.message ?? error).slice(0, 200) })
       }
@@ -2461,22 +2187,9 @@ export async function apply(ctx, config) {
           const tail = project
             ? '找定义/调用关系用 code_find / code_callers；字符串、日志、配置值仍用 grep。'
             : '第一步：code_index。'
-          // 语义层缺包（页面开关已开、包没装）：让 agent 主动征求用户同意后时代装——
-          // 一次性纠正动作而非状态播报：装好或关掉即自动消失，走已验收的注入通道（v0.11.3）。
-          const zgFix = cfg.zgEnabled && !existsSync(cfg.zgCli)
-            ? ' 语义层已开启但缺包——问用户是否同意执行 code_setup {action:"install-zg"}（约 430MB）安装；装完 code_setup {action:"restart-adapter"} 重拉清单（秒级，不必重启宿主）。'
-            : ''
-          if (zgFix) bumpCount(cfg, state, 'hint-zg-missing')
-          // 包已装、清单 ready，但**本仓从未建过语义索引**：上游 activate() 在读任何
-          // freshness/autoUpdate 参数之前就 throw INDEX_MISSING（0.2.2 源码实证，参数
-          // 绕不过），首查必撞墙。与缺包句互斥（缺包先于缺索引）；代建同样要用户点头。
-          const zgNoIndex = cfg.zgEnabled && !zgFix && state.zg === 'ready' && !existsSync(join(cwd, '.zvec-grep'))
-            ? ' 本仓尚未建语义索引：zg_zvec_grep_search 首查会报 INDEX_MISSING（上游守门、非故障，参数绕不过）——问用户是否同意代建，同意后跑 node ' + cfg.zgCli + ' index（增量约 2s、首建全量约 23s），产物 .zvec-grep/ 务必进 .gitignore。'
-            : ''
-          if (zgNoIndex) bumpCount(cfg, state, 'hint-zg-no-index')
           // 只数真正注入的那一次（每轮装配都调这个回调，注入与否是 ③ 的有效性读数）。
           bumpCount(cfg, state, 'hint-injected')
-          return noVars(`${head} ${staleCmd}${tail}${zgFix}${zgNoIndex}`)
+          return noVars(`${head} ${staleCmd}${tail}`)
         } catch {
           return ''
         }

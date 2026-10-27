@@ -53,7 +53,7 @@ const profiles = existsSync(PROFILES_DIR)
  * 名字必须出现在 composition 里。两个落点都要认（宿主版本不同写法不同）：
  *   · 新版：profile 的 package.json → dsh.profile.bundles（cordis.yml 只剩一个空 `[]`）；
  *   · 老版：cordis.yml 里物化的完整插件树。
- * 不认这个，验一个装了但没接线的 profile 只会产出"链路 NOT READY / 清单里多了 zg"
+ * 不认这个，验一个装了但没接线的 profile 只会产出"链路 NOT READY"
  * 的假红灯（清单是跨 profile 共享的，谁最后 bootstrap 就写谁那份）。
  * 显式传 profile 参数时不做这个过滤。
  */
@@ -75,7 +75,7 @@ if (targets.length === 0) {
 }
 
 // 一个 profile 一个进程。为什么：所有 profile 共享同一个 adapterDir 与 cbm.json，
-// 同一进程里连跑会互相污染——前一个 profile 的臂会把清单写成"带 zg"、把真引擎的
+// 同一进程里连跑会互相污染——前一个 profile 的臂会把真引擎的
 // 索引任务占住，后一个 profile 的 A（链路就绪）/Z（默认清单无 zg）就误判。
 // 实测 2026-10-24：tauri+web 同进程 = 一串假红灯；各自单独跑 = 169/169。
 if (!profileArg && targets.length > 1) {
@@ -127,19 +127,12 @@ function makeStubProxy(calls, opts = {}) {
           if (opts.warmSlowMs) await new Promise((r) => setTimeout(r, opts.warmSlowMs))
           return { content: [{ type: 'text', text: `projects: 1  (cols: name root_path branch)\n  ${project} ${root.replace(/\\/g, '/')} main` }] }
         case 'cbm_search_graph':
-          // 代理工具会把底层 MCP 错误包成**普通文本**（isError 不置真）——实测
-          // zg 打不开 collection 时返回 "Error: Failed to open…"。错误文本不是命中。
-          if (opts.errorSearch) return { content: [{ type: 'text', text: 'Error: Failed to open zvec collection storage\n\nExpected parameters:\n  root (string) *required*' }] }
+          // 代理工具会把底层 MCP 错误包成**普通文本**（isError 不置真）——错误文本
+          // 不是命中，cbmCall 的嗅探必须判失败。
+          if (opts.errorSearch) return { content: [{ type: 'text', text: 'Error: Failed to open collection storage\n\nExpected parameters:\n  project (string) *required*' }] }
           return { content: [{ type: 'text', text: JSON.stringify(opts.emptySearch
             ? { cols: ['qn', 'label', 'file', 'lines', 'rank'], rows: [], total: 0, returned: 0, has_more: false }
             : { cols: ['qn', 'label', 'file', 'lines', 'rank'], rows: [[`${project}.stubSymbol`, 'Function', 'index.js', '42-44', -1.2]], total: 1, returned: 1, has_more: false }) }] }
-        case 'zg_zvec_grep_search':
-          // 模拟上游守门（v0.13.3 实证的形状）：root 下没有 .zvec-grep 时，activate()
-          // 在读任何参数之前就 throw INDEX_MISSING——文本以 Error 开头，cbmCall 的
-          // 错误嗅探判失败；有目录才返回命中。这样"缺索引别白打"的守卫臂是真命题。
-          if (opts.zgGate && !existsSync(join(String(q.root ?? ''), '.zvec-grep')))
-            return { content: [{ type: 'text', text: 'Error: INDEX_MISSING: no persistent index under this root. Creating or rebuilding a persistent index requires explicit user authorization (CLI: index).' }] }
-          return { content: [{ type: 'text', text: 'results: 1\n#1 [global_fill] matchedBy=fts+vector stub/index.js:42-44' }] }
         case 'cbm_get_code_snippet':
           return { content: [{ type: 'text', text: JSON.stringify({ name: 'stubSymbol', qualified_name: `${project}.stubSymbol`, file_path: 'x/index.js', start_line: 42, end_line: 44, source: 'function stubSymbol() {\n  return 1;\n}\n' }) }] }
         case 'cbm_check_index_coverage':
@@ -398,98 +391,41 @@ async function verify(profile) {
   record('E 非 git 工作区被闸门跳过', mine.some((line) => /非 git 工作区/.test(line)), (mine.at(-1) ?? '(日志里没有本次记录)').slice(0, 130))
   rmSync(nonGit, { recursive: true, force: true })
 
-  // ── 臂 Z：语义检索层（zg）——清单接线与降级，全在临时目录，不碰真引擎 ─────────
-  // 引擎没有任何向量工具（0.11.0 实测 15 工具面），zg 是补位；这组臂证明
-  // "zgEnabled ⇒ cbm.json 出现第二个 server"以及所有降级路径，且默认关时清单干净。
+  // ── 臂 Z（v0.17.0 起语义层整体移除）：原「zgEnabled 三态接线」臂改成防回潮锁。
+  // 删的依据：telemetry 三个月 code-search=1 次生产调用、zg 索引维护失败率 72:20、
+  // 430MB 制品 + 三轴状态机的维护面——为一条没人走的腿永久收税。恢复路径=git revert。
   record('Z 默认（真实清单）没有 zg server', manifest.mcpServers?.zg === undefined,
     `实际: ${JSON.stringify(manifest.mcpServers?.zg ?? null)}`)
-  record('Z 默认 prompt 不提 zg（未装不画饼）', !prompt.includes('zvec_grep_search'))
-  // v0.13.5 回归锁：两层组成句只在 zg ready 时出现——默认路径若带上"两层"就是画饼。
-  record('Z 默认 prompt 不提两层组成（画饼回归锁）', !prompt.includes('两层代码检索'))
-  const zgHome = join(tmpdir(), `cbm-check-zg-${process.pid}`)
+  record('Z prompt 不提 zvec / code_search（删净且不留「已移除」空句）',
+    !prompt.includes('zvec_grep_search') && !/\bcode_search\b/.test(prompt), prompt.slice(0, 120))
+  record('Z code_search 封装动词未注册', a.tools.has('code_search') === false)
+  const idxSrc = readFileSync(join(REPO, 'index.js'), 'utf8')
+  record('Z index.js 无 zgEnabled / ZG_PKG / install-zg / code_search 残留',
+    !idxSrc.includes('zgEnabled') && !idxSrc.includes('ZG_PKG') && !idxSrc.includes('install-zg') && !idxSrc.includes('code_search'),
+    idxSrc.match(/zgEnabled|ZG_PKG|install-zg|code_search/)?.[0] ?? '')
+  const zgHome = join(tmpdir(), `cbm-check-z-${process.pid}`)
   rmSync(zgHome, { recursive: true, force: true })
   const zgAdapter = join(zgHome, 'adapter')
-  const zgVendor = join(zgHome, 'vendor')
   mkdirSync(join(zgAdapter, 'node_modules', '@njuptlzf', 'mcp-adapter'), { recursive: true })
-  mkdirSync(join(zgVendor, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli'), { recursive: true })
   writeFileSync(join(zgAdapter, 'node_modules', '@njuptlzf', 'mcp-adapter', 'mcp-server.mjs'), '', 'utf8')
   // v0.13.0：版本对账看的是包元数据——没有这份 package.json，固件会被当成"实装 ''"
   // 而触发真 npm install（依赖网络，还把它覆盖成实包）。钉版本从插件导出取，升 pin 不改这里。
   writeFileSync(join(zgAdapter, 'node_modules', '@njuptlzf', 'mcp-adapter', 'package.json'),
     `{"name":"@njuptlzf/mcp-adapter","version":"${DEFAULT_ADAPTER_VERSION}"}`, 'utf8')
-  writeFileSync(join(zgVendor, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli', 'index.js'), '', 'utf8')
   // cbm 探测只验 existsSync，但 bootstrap 会真的 spawn 它——0 字节假 exe 会让
   // --version 当场抛错、清单永远写不出来。cmd.exe 是"存在的合法可执行文件"的最小
   // 形态：喂给它 --version/config 只会快速非零退出，没有任何副作用。
   const fakeExe = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe')
-  const zgBase = { adapterDir: zgAdapter, cbmPath: fakeExe }
-  const zReady = await mount({ ...zgBase, zgEnabled: true, zgVendorDir: zgVendor })
-  const zSetup = await zReady.tools.get('code_setup').execute({}, withSignal(REPO))
-  record('Z 就绪报表列出语义层状态', /语义层\(zg\): ready/.test(zSetup), /^语义层\(zg\):.*$/m.exec(zSetup)?.[0]?.slice(0, 120) ?? '(没有 zg 行)')
-  record('Z 就绪报表三轴齐全（清单事实 / 包实测 / 页面开关）', /ready  包=已装  页面开关=on/.test(zSetup), /^语义层\(zg\):.*$/m.exec(zSetup)?.[0]?.slice(0, 140) ?? '(没有 zg 行)')
-  record('Z 就绪 prompt 给出 zvec_grep_search 路由', /zvec_grep_search/.test(zReady.sections.map((s) => s.text?.()).join('\n')))
-  // v0.13.5：zg 就绪时首句必须报双层组成 + 归属（ruankao 案：agent 把 zg 当成
-  // "独立的 MCP server"而非本插件的一部分，病根是首句只报 codebase-memory）。
-  const zPromptText = zReady.sections.map((s) => s.text?.()).join('\n')
-  record('Z 就绪 prompt 首句报双层组成与归属',
-    /两层代码检索[\s\S]*结构层 cbm[\s\S]*语义层 zg[\s\S]*本插件清单注册/.test(zPromptText),
-    zPromptText.slice(0, 90))
+  const zMount = await mount({ adapterDir: zgAdapter, cbmPath: fakeExe })
+  await zMount.tools.get('code_setup').execute({}, withSignal(REPO)) // 惰 bootstrap：跑一次才写 cbm.json
   const zDoc = JSON.parse(readFileSync(join(zgAdapter, 'cbm.json'), 'utf8'))
-  record('Z 清单第二 server 走自带 stdio 桥', zDoc.mcpServers?.zg?.args?.includes('--stdio') === true
-    && zDoc.mcpServers?.zg?.args?.includes('server') === true, JSON.stringify(zDoc.mcpServers?.zg?.args ?? null))
-  record('Z zg 用 lazy（无启动竞态，daemon 按需起）', zDoc.mcpServers?.zg?.lifecycle === 'lazy'
-    && zDoc.mcpServers?.cbm?.lifecycle === 'keep-alive', `zg=${zDoc.mcpServers?.zg?.lifecycle} cbm=${zDoc.mcpServers?.cbm?.lifecycle}`)
+  record('Z 临时目录生成的清单只有 cbm（语义层第二 server 接线已删）',
+    Object.keys(zDoc.mcpServers).join() === 'cbm', Object.keys(zDoc.mcpServers).join())
   record('Z 清单写 settings.scriptMode（mcpScript 显式准入，与真清单同源同构）',
     zDoc.settings?.scriptMode === true, `实际=${JSON.stringify(zDoc.settings ?? null)}`)
-  const zOff = await mount({ ...zgBase })
-  await zOff.tools.get('code_setup').execute({}, withSignal(REPO)) // bootstrap 是惰性的：不跑一次工具，清单还是上一条写的
-  const zOffDoc = JSON.parse(readFileSync(join(zgAdapter, 'cbm.json'), 'utf8'))
-  record('Z zgEnabled=false 清单只有 cbm', Object.keys(zOffDoc.mcpServers).join() === 'cbm')
-  const zMissing = await mount({ ...zgBase, zgEnabled: true, zgVendorDir: join(zgHome, 'nope') })
-  const zMSetup = await zMissing.tools.get('code_setup').execute({}, withSignal(REPO))
-  record('Z 装了开关但没装包 ⇒ missing + 指路 install:zg',
-    /语义层\(zg\): missing/.test(zMSetup) && /install:zg/.test(zMSetup),
-    /^语义层\(zg\):.*$/m.exec(zMSetup)?.[0]?.slice(0, 100) ?? '(没有 zg 行)')
-  const zBad = await mount({ ...zgBase, zgEnabled: true, zgVendorDir: zgVendor, zgToolset: 'turbo' })
-  const zBadSetup = await zBad.tools.get('code_setup').execute({}, withSignal(REPO))
-  record('Z 非法 toolset 降级 agent 且留 note', /zgToolset="turbo" 非法/.test(zBadSetup) && /已按 agent/.test(zBadSetup))
-
-  // ── v0.11.0：三轴读数 / 页面开关的延迟态 / agent 安装路线（全在临时目录，already 分支不触网）──
-  const zWantRef = mkVolRef(false)
-  const zStats = mkVolRef('')
-  const zPend = await mount({ ...zgBase, zgEnabled: zWantRef, zgVendorDir: join(zgHome, 'nope'), stats: zStats })
-  let zp = null
-  try { zp = JSON.parse(String(zStats.get())) } catch { /* 下一条断言会报出来 */ }
-  record('Z stats 载荷三轴齐全（zg / zgWant / zgInstalled）',
-    !!zp && typeof zp.zg === 'string' && typeof zp.zgWant === 'boolean' && typeof zp.zgInstalled === 'boolean', String(zStats.get()).slice(0, 140))
-  await zPend.tools.get('code_setup').execute({}, withSignal(REPO)) // 先跑一次：清单按"开关=关"定成 off
-  zWantRef[Symbol.for('cosmokit.volatile.write')](true) // 再模拟页面开关：loader 把新值推进同一引用
-  const zPendSetup = await zPend.tools.get('code_setup').execute({}, withSignal(REPO))
-  record('Z 开关已开而清单未重建 ⇒ 报表明说「重拉清单后才生效」并指路 install-zg',
-    /页面已开启.*(重拉|重启)/.test(zPendSetup) && /restart-adapter/.test(zPendSetup) && /install-zg/.test(zPendSetup) && /包=未装  页面开关=on/.test(zPendSetup),
-    /^语义层\(zg\):.*$/m.exec(zPendSetup)?.[0]?.slice(0, 150) ?? '(没有 zg 行)')
-  const zgVendor2 = join(zgHome, 'vendor2')
-  mkdirSync(join(zgVendor2, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli'), { recursive: true })
-  writeFileSync(join(zgVendor2, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli', 'index.js'), "console.log('0.2.2')\n", 'utf8')
-  const zAlready = await mount({ ...zgBase, zgEnabled: true, zgVendorDir: zgVendor2 })
-  const zIns = await zAlready.tools.get('code_setup').execute({ action: 'install-zg' }, withSignal(REPO))
-  record('Z install-zg 探到包已就位 ⇒ 不重复下载（already + zg-install-skip 计数）',
-    /已就位/.test(zIns) && /zg-install-skip=1/.test(zIns) && !/npm install/.test(zIns), zIns.slice(0, 110))
-  record('Z install-zg 结果文案带重启与 .zvec-grep gitignore 提醒', /\.gitignore/.test(zIns) && /重启/.test(zIns), zIns.split('\n')[0]?.slice(0, 90) ?? '')
   let zActErr = ''
-  try { await zAlready.tools.get('code_setup').execute({ action: 'nope' }, withSignal(REPO)) } catch (e) { zActErr = String(e?.message ?? e) }
-  record('Z 未知 action 直接抛错（绝不静默走回检查路线）', /未知 action/.test(zActErr), zActErr.slice(0, 90))
-  const idxSrc = readFileSync(join(REPO, 'index.js'), 'utf8')
-  const scrSrc = readFileSync(join(REPO, 'scripts', 'install-zg.mjs'), 'utf8')
-  const idxPkg = /const ZG_PKG = '([^']+)'/.exec(idxSrc)?.[1]
-  const scrPkg = /const PKG = '([^']+)'/.exec(scrSrc)?.[1]
-  const idxVer = /const ZG_VERSION = '([^']+)'/.exec(idxSrc)?.[1]
-  const scrVer = /const VERSION = '([^']+)'/.exec(scrSrc)?.[1]
-  const idxPrune = (/const ZG_PRUNE = \[([^\]]*)\]/.exec(idxSrc)?.[1] ?? '').replace(/\s/g, '')
-  const scrPrune = (/const PRUNE = \[([^\]]*)\]/.exec(scrSrc)?.[1] ?? '').replace(/\s/g, '')
-  record('Z 两条安装路线钉同一版本（index.js ↔ install-zg.mjs 三对字面量一致）',
-    idxPkg === scrPkg && idxVer === scrVer && idxPrune === scrPrune,
-    `index=${idxPkg}@${idxVer} script=${scrPkg}@${scrVer} prune 一致=${idxPrune === scrPrune}`)
+  try { await zMount.tools.get('code_setup').execute({ action: 'nope' }, withSignal(REPO)) } catch (e) { zActErr = String(e?.message ?? e) }
+  record('Z code_setup 未知 action 直接抛错（restart-adapter 之外不认）', /未知 action/.test(zActErr), zActErr.slice(0, 90))
   rmSync(zgHome, { recursive: true, force: true })
 
   // ── 臂 V（v0.13.0）：适配层版本对账——"唯一升级入口"必须真的生效 ──────────────
@@ -755,19 +691,18 @@ async function verify(profile) {
   const dirtyFind = await v.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: agentV, signal: sig() })
   record('G 默认 off 下写后记账照常工作（台账仍会把坐标标脏）', dirtyFind?.status === 'stale' && /index\.js/.test(dirtyFind?.text ?? ''), JSON.stringify(dirtyFind?.status))
 
-  // G7.5 volatile 契约（设置页的写路径 + 读数通道）：七个设置页可写字段（enforce / interceptTools /
-  // interceptBudgetMs / contextHint / telemetry / dirtyTracking / zgEnabled——最后一个页内可写
-  // 但清单重启才重建）必须①在 schema 上标 volatile——dsh-settings 只把 volatile 字段放进表单，写非 volatile
+  // G7.5 volatile 契约（设置页的写路径 + 读数通道）：设置页可写字段（enforce / interceptTools /
+  // interceptBudgetMs / contextHint / telemetry / dirtyTracking）必须①在 schema 上标 volatile——dsh-settings 只把 volatile 字段放进表单，写非 volatile
   // 字段直接抛 "Config field ... is not volatile"；②在钩子里读**引用当前值**——apply 时
   // 快照的话，UI 改了、拦截行为还是旧的，那比没有 UI 更糟。这里用假引用模拟 loader 的
   // _commitVolatile（它就是把新快照 updateVolatile 进同一个引用）。
   // stats 方向相反：不是用户可写项，是插件→页面的只读读数通道，但它同样必须 volatile
   // ——describe() 只把 volatile 字段解引用进快照，标错（或漏标）页面就永远看不到读数。
-  // v0.15.0 增补 graphBudgetMs / zgBudgetMs；v0.14.0 增补 logRetentionDays /
+  // v0.15.0 增补 graphBudgetMs；v0.14.0 增补 logRetentionDays /
   // recentLimit / markPassthrough——它们在 Config 里都标了 volatile（页面可写、
   // 决策点现读），名单漏了就会让"标错等于对 UI 撒谎"这条断言失去意义。
-  const VOLATILE_KEYS = ['enforce', 'interceptTools', 'interceptBudgetMs', 'contextHint', 'telemetry', 'dirtyTracking', 'stats', 'zgEnabled',
-    'logRetentionDays', 'recentLimit', 'markPassthrough', 'graphBudgetMs', 'zgBudgetMs', 'staleWarnFiles', 'staleWarnMinIntervalSec']
+  const VOLATILE_KEYS = ['enforce', 'interceptTools', 'interceptBudgetMs', 'contextHint', 'telemetry', 'dirtyTracking', 'stats',
+    'logRetentionDays', 'recentLimit', 'markPassthrough', 'graphBudgetMs', 'staleWarnFiles', 'staleWarnMinIntervalSec']
   // schemastery 的字段表在 `Config.dict`（宿主 dsh-settings 的 volatileForm 也是递归它）。
   const marked = VOLATILE_KEYS.filter((k) => Config?.dict?.[k]?.meta?.volatile === true)
   record('G 即时热改字段 + 观测字段 + 读数通道在 Config 里标了 volatile（宿主才肯 serve/写）', marked.length === VOLATILE_KEYS.length, `标了的是 ${marked.join(',') || '(无)'}`)
@@ -806,64 +741,6 @@ async function verify(profile) {
     typeof hintText === 'string' && hintText.includes(`stub-${process.pid}-adv`), hintText.slice(0, 80))
   record('G 条件注入：不像时返回空串（宿主按空串跳过）', hintEmpty === '', JSON.stringify(hintEmpty))
   record('G 注入文本不含宿主会插值的 {{var}}', !/[{]{2}[a-z][a-z0-9_]*[}]{2}/.test(hintPlanted + hintText), '')
-  // G8.5 语义层缺包注入句（v0.11.3）：只在「开关已开 + 包没装」这一具体状态注入，
-  // 任一条件变化自动消失——它是纠正动作不是状态播报（播报归设置页状态行）。
-  // 三臂都传临时 adapterDir + zgVendorDir：bootstrap 会写 cbm.json / 找 vendor 包，绝不许碰真机目录。
-  const zgmDir = join(tmpdir(), `cbm-zgm-${process.pid}`)
-  mkdirSync(zgmDir, { recursive: true })
-  // 缺包/有包用 zgVendorDir 表达（zgCli 是派生值，不是可配置字段——传了会被 zod 剥掉）。
-  const zgmAbsent = join(zgmDir, 'no-such-vendor')
-  const zgmVendor = join(zgmDir, 'vendor')
-  mkdirSync(join(zgmVendor, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli'), { recursive: true })
-  writeFileSync(join(zgmVendor, 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli', 'index.js'), '', 'utf8')
-  const zgmCalls = []
-  const zHintOf = (m) => (m.contexts ?? []).find((c) => c.name === 'codebase-memory:hint')
-  const zm = await mount({ telemetry: false, adapterDir: zgmDir, zgEnabled: true, zgVendorDir: zgmAbsent }, makeStubProxy(zgmCalls, { project: `stub-${process.pid}-zgm` }), { npmInstall: npmStub })
-  const zgmSetup = await zm.tools.get('code_setup').execute({}, withSignal(REPO))
-  const zTextMissing = zHintOf(zm)?.text?.({ agent: fakeAgent(`sess-${process.pid}-zgm1`, REPO, codeAsk) }) ?? 'x'
-  record('G zg 缺包+开关开 ⇒ 注入句让 agent 征求同意后时代装（写明体积与重启）',
-    typeof zTextMissing === 'string' && /code_setup \{action:"install-zg"\}/.test(zTextMissing) && /430MB/.test(zTextMissing) && /重启/.test(zTextMissing),
-    `setup=${String(zgmSetup).split('\n').filter((l) => /语义层|status|热改/.test(l)).join(' | ').slice(0, 220)}  hint=${zTextMissing.slice(-110)}`)
-  const zo = await mount({ telemetry: false, adapterDir: zgmDir, zgEnabled: false, zgVendorDir: zgmAbsent }, makeStubProxy(zgmCalls, { project: `stub-${process.pid}-zgm` }))
-  await zo.tools.get('code_setup').execute({}, withSignal(REPO))
-  const zTextOff = zHintOf(zo)?.text?.({ agent: fakeAgent(`sess-${process.pid}-zgm2`, REPO, codeAsk) }) ?? 'x'
-  record('G zg 开关关 ⇒ 不注入缺包句（包真缺也不越权）', typeof zTextOff === 'string' && !/install-zg/.test(zTextOff), zTextOff.slice(-80))
-  const zi = await mount({ telemetry: false, adapterDir: zgmDir, zgEnabled: true, zgVendorDir: zgmVendor }, makeStubProxy(zgmCalls, { project: `stub-${process.pid}-zgm` }))
-  await zi.tools.get('code_setup').execute({}, withSignal(REPO))
-  const zTextReady = zHintOf(zi)?.text?.({ agent: fakeAgent(`sess-${process.pid}-zgm3`, REPO, codeAsk) }) ?? 'x'
-  record('G zg 包已装 ⇒ 注入句自动消失（不留常驻唠叨）', typeof zTextReady === 'string' && !/install-zg/.test(zTextReady), zTextReady.slice(-80))
-  // G8.6 缺索引注入句 + replace 守卫（v0.13.3）：包已装、清单 ready，但**本仓从未建过
-  // 语义索引**——上游 activate() 在读 freshness/autoUpdate 任何参数之前就 throw
-  // INDEX_MISSING（0.2.2 源码实证：参数救不了首建，唯一入口是 CLI index）。事前一句
-  // 话带处方（先点头、后代建、产物进 gitignore），比首查撞墙便宜；replace 通道则
-  // 干脆跳过这一发注定失败的查询。工作区用临时目录造两种状态，不依赖仓库自身。
-  const zgNoWs = join(zgmDir, 'ws-no-index')
-  const zgYesWs = join(zgmDir, 'ws-indexed')
-  mkdirSync(zgNoWs, { recursive: true })
-  mkdirSync(join(zgYesWs, '.zvec-grep'), { recursive: true })
-  const zTextNoIdx = zHintOf(zi)?.text?.({ agent: fakeAgent(`sess-${process.pid}-zgnoidx1`, zgNoWs, codeAsk) }) ?? 'x'
-  record('G zg ready 且本仓无 .zvec-grep ⇒ 注入句事前报 INDEX_MISSING 并给带点头前置的代建 CLI',
-    typeof zTextNoIdx === 'string' && /INDEX_MISSING/.test(zTextNoIdx) && /node .* index/.test(zTextNoIdx) && /\.gitignore/.test(zTextNoIdx),
-    String(zTextNoIdx).slice(-150))
-  const zTextHasIdx = zHintOf(zi)?.text?.({ agent: fakeAgent(`sess-${process.pid}-zgnoidx2`, zgYesWs, codeAsk) }) ?? 'x'
-  record('G 本仓有 .zvec-grep ⇒ 缺索引句自动消失（不唠叨已建好的仓）', typeof zTextHasIdx === 'string' && !/INDEX_MISSING/.test(zTextHasIdx), String(zTextHasIdx).slice(-70))
-  record('G 缺包句与缺索引句互斥（包没装时只谈装包，不两条处方打架）', typeof zTextMissing === 'string' && !/INDEX_MISSING/.test(zTextMissing), zTextMissing.slice(-60))
-  const zrCalls = []
-  const zr = await mount({ enforce: 'replace', dirtyTracking: false, telemetry: false, zgEnabled: true, adapterDir: zgmDir, zgVendorDir: zgmVendor }, makeStubProxy(zrCalls, { project: `stub-${process.pid}-zrguard`, zgGate: true }))
-  await zr.tools.get('code_setup').execute({}, withSignal(REPO))
-  const postZr = (zr.events['tools/post-execute'] ?? [])[1]
-  const zgSkip = await postZr(grepExec(fakeAgent(`sess-${process.pid}-zrguard-a`, zgNoWs), 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
-  record('R replace 对本仓无索引的 grep 直接保留原输出（不发注定 INDEX_MISSING 的白枪）',
-    zgSkip?.kind === 'accept' && zgSkip?.content === undefined && !zrCalls.some((x) => x.tool === 'zg_zvec_grep_search'),
-    `calls=${zrCalls.map((x) => x.tool).join(',') || '(无)'}`)
-  const zgSwap = await postZr(grepExec(fakeAgent(`sess-${process.pid}-zrguard-b`, zgYesWs), 'usageSection'), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
-  // v0.15.0 M4'：语义层退出替换钩子——即使包已装、清单 ready、本仓有 .zvec-grep，
-  // 符号类 grep 也只走图谱。理由：同一个裸标识符喂给向量检索是最差输入，而"图谱
-  // 没答案才试语义"恰好只在语义最不擅长时启动，还让一次 grep 白等 6s+4s。
-  record('R 语义层退出替换钩子：包就绪 + 有索引也不查 zg（M4′）',
-    !zrCalls.some((x) => x.tool === 'zg_zvec_grep_search') && !/语义层/.test(zgSwap?.content?.[0]?.text ?? ''),
-    `calls=${zrCalls.map((x) => x.tool).join(',') || '(无)'} out=${String(zgSwap?.content?.[0]?.text ?? '(原样)').slice(0, 40)}`)
-  rmSync(zgmDir, { recursive: true, force: true })
   // G9 索引任务串行化 + 被并发中止后重试（这条臂来自一次真实失败：后台补刷与
   // code_index 撞上引擎 watcher ⇒ 退出码 1 + aborted_previous_preserved）。
   // v0.14.0 起遥测日志按天轮转（telemetry-YYYY-MM-DD.log）——读旧名 telemetry.log
@@ -1028,8 +905,8 @@ async function verify(profile) {
   sHint?.text({ agent: fakeAgent(`sess-${process.pid}-stats`, REPO, codeAsk) })
   let sp = null
   try { sp = JSON.parse(String(sRef.get())) } catch { /* 下一行断言会把它报出来 */ }
-  record('S 替换事件把全量读数推进 volatile stats 引用（hit + graph 拆分 + zg 状态 + at）',
-    sp?.replace?.hit === 1 && sp?.replace?.graph === 1 && sp?.zg === 'off' && typeof sp?.at === 'number', String(sRef.get()).slice(0, 170))
+  record('S 替换事件把全量读数推进 volatile stats 引用（hit + graph 拆分 + at；zg 键不得回潮）',
+    sp?.replace?.hit === 1 && sp?.replace?.graph === 1 && sp?.zg === undefined && typeof sp?.at === 'number', String(sRef.get()).slice(0, 170))
   const sEmit = (s.emits ?? []).find((x) => x[0] === 'settings/document-updated')
   record('S 推送后 emit settings/document-updated（首参是字符串 ns，cordis 才不会把它当 thisArg 过滤）',
     !!sEmit && sEmit[1] === 'codebase-memory' && typeof sEmit[2] === 'number', JSON.stringify(sEmit ?? null))
@@ -1043,7 +920,7 @@ async function verify(profile) {
     sOff.get() === '' && !(so.emits ?? []).some((x) => x[0] === 'settings/document-updated'), String(sOff.get()).slice(0, 40))
 
   // ── 臂 R2/R3：泡数据完整性两修（遥测里抓到的真 bug 的回归锁）──────────────────
-  // R2 越界：图谱/zg 都是工作区级的，path 指到工作区外的 grep 被替换=伪造坐标
+  // R2 越界：图谱是工作区级的，path 指到工作区外的 grep 被替换=伪造坐标
   //     （实测遥测：path=AppData\… 的 grep 换成了本仓命中）。
   const r2Calls = []
   const r2 = await mount({ enforce: 'replace', dirtyTracking: false, telemetry: false }, makeStubProxy(r2Calls, { project: `stub-${process.pid}-rscope` }))
@@ -1051,14 +928,14 @@ async function verify(profile) {
   const postR2 = (r2.events['tools/post-execute'] ?? [])[1]
   const agentR2 = fakeAgent(`sess-${process.pid}-rscope`, REPO)
   const outSwap = await postR2(grepExec(agentR2, 'usageSection', { path: ADAPTER_DIR }), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
-  record('R2 搜工作区之外的 grep 原样保留（不查两层、不换）',
+  record('R2 搜工作区之外的 grep 原样保留（不发图谱查询、不换）',
     outSwap?.kind === 'accept' && outSwap?.content === undefined && !r2Calls.some((x) => x.tool === 'cbm_search_graph'),
     `${JSON.stringify(outSwap).slice(0, 50)} calls=${r2Calls.map((x) => x.tool).join(',') || '(无)'}`)
   const inSwap = await postR2(grepExec(agentR2, 'usageSection', { path: join(REPO, 'index.js') }), { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
   record('R2 工作区内指定文件的 grep 照换（作用域门不误伤正路）', /stubSymbol/.test(inSwap?.content?.[0]?.text ?? ''), JSON.stringify(inSwap).slice(0, 60))
   // R3 错误文本：代理把底层 MCP 错误包成普通文本返回（isError 假），错误被当命中
-  //     替换了原输出（实测遥测 source=zg）。且「查询失败」与「无命中」分开计数——
-  //     泡数据时这两个占比含义相反。
+  //     替换了原输出（历史实测遥测 source=zg，同一形状对图谱腿同样成立）。且「查询
+  //     失败」与「无命中」分开计数——泡数据时这两个占比含义相反。
   const r3Ref = mkVolRef('')
   const r3 = await mount({ enforce: 'replace', dirtyTracking: false, stats: r3Ref }, makeStubProxy([], { project: `stub-${process.pid}-rerr`, errorSearch: true }))
   await r3.tools.get('code_setup').execute({}, withSignal(REPO))
@@ -1427,18 +1304,18 @@ async function verify(profile) {
     record('O1 logRetentionDays=0 关掉轮转：超期文件仍留', stillThere)
   } finally { rmO1b() }
 
-  // repos[] 带 cwd + project + zg + per-repo 计数：一个 replace 事件后应有完整行
+  // repos[] 带 cwd + project + per-repo 计数：一个 replace 事件后应有完整行（zg 列不得回潮）
   const o2Ref = mkVolRef('')
   const o2 = await mount({ enforce: 'replace', dirtyTracking: false, stats: o2Ref }, makeStubProxy([], { project: `stub-${process.pid}-o2` }))
   await o2.tools.get('code_setup').execute({}, withSignal(REPO))
   await (o2.events['tools/post-execute'] ?? [])[1](grepExec(fakeAgent(`sess-${process.pid}-o2`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
   let o2Stats = null
   try { o2Stats = JSON.parse(String(o2Ref.get())) } catch { }
-  record('O2 repos[] 带 cwd + project + zg + 替换计数（按仓库观测）',
+  record('O2 repos[] 带 cwd + project + 替换计数（按仓库观测；zg 字段已删）',
     Array.isArray(o2Stats?.repos) && o2Stats.repos.length === 1
       && o2Stats.repos[0].cwd === REPO
       && typeof o2Stats.repos[0].project === 'string' && o2Stats.repos[0].project.length > 0
-      && typeof o2Stats.repos[0].zg === 'boolean'
+      && o2Stats.repos[0].zg === undefined
       && (o2Stats.repos[0].replace?.['intercept-replace'] ?? 0) === 1,
     JSON.stringify({ repos: o2Stats?.repos ?? null, replace: o2Stats?.replace ?? null }).slice(0, 300))
 
@@ -1617,55 +1494,9 @@ async function verify(profile) {
   record('M2 graphBudgetMs=0 ⇒ 跟随 interceptBudgetMs（老配置的唯一出口，且默认 6000 不偷跑）',
     m2bSwap?.content === undefined, JSON.stringify(m2bSwap).slice(0, 90))
 
-  // M4′（v0.15.0）：图谱腿失败**不再**转语义腿。这条臂在 v0.15.0 之前断言的是
-  // 反面（"语义腿仍能替换"）——那条行为被拆掉了，理由见 index.js replace 路径的
-  // 注释：裸标识符喂向量检索是最差输入，而且 6s 超时再叠 4s 让一次 grep 白等 10s。
-  const zgCliPresent = existsSync(join(DSH_HOME, 'vendor', 'zvec-grep', 'node_modules', '@zvec', 'zvec-grep', 'dist', 'cli', 'index.js'))
-  if (zgCliPresent) {
-    const m2dCalls = []
-    const m2d = await mount({ enforce: 'replace', dirtyTracking: false, zgEnabled: true, graphBudgetMs: 200 },
-      makeStubProxy(m2dCalls, { project: `stub-${process.pid}-m2d`, errorSearch: true }))
-    await m2d.tools.get('code_setup').execute({}, withSignal(REPO))
-    await new Promise((r) => setTimeout(r, 80))
-    const m2dSwap = await (m2d.events['tools/post-execute'] ?? [])[1](
-      grepExec(fakeAgent(`sess-${process.pid}-m2d`, REPO), 'usageSection'),
-      { content: [{ type: 'text', text: '原始 grep 输出' }], isError: false }, nextPost)
-    record('M4′ 图谱腿失败不再转语义腿：一次 grep 只等一腿（zg 一枪不发）',
-      m2dSwap?.content === undefined && !m2dCalls.some((x) => x.tool === 'zg_zvec_grep_search'),
-      `calls=${m2dCalls.map((x) => x.tool).join(',') || '(无)'}`)
-  } else {
-    record('M4′ 图谱腿失败不再转语义腿：一次 grep 只等一腿（zg 一枪不发）', true, '跳过：语义层包未装')
-  }
-
-  // ── 臂 C：语义层封装工具 code_search（v0.15.0 M4b）────────────────────────
-  // 语义层退出替换钩子之后（M4'），它是唯一的"正路"入口。三条契约：
-  // ① root/limit 由插件填（模型不必知道必填参数与绝对路径）；
-  // ② 输出必须自称"语义近似、不是锚点"（否则模型会拿片段当 file:line）；
-  // ③ 前提不成立即 throw（未开启 / 本仓无索引），不静默降级成 grep。
-  const csCalls = []
-  const csWs = join(tmpdir(), `cbm-cs-${process.pid}`)
-  const csNoIdxWs = join(tmpdir(), `cbm-cs-noidx-${process.pid}`)
-  mkdirSync(join(csWs, '.zvec-grep'), { recursive: true })
-  mkdirSync(csNoIdxWs, { recursive: true })
-  try {
-    const cs = await mount({ telemetry: false, zgEnabled: true }, makeStubProxy(csCalls, { project: `stub-${process.pid}-cs` }))
-    await cs.tools.get('code_setup').execute({}, withSignal(csWs))
-    const csExec = (ws) => ({ agent: fakeAgent(`sess-${process.pid}-cs-${basename(ws)}`, ws), signal: sig() })
-    const csOut = await cs.tools.get('code_search').execute({ query: 'how are retries handled' }, csExec(csWs))
-    record('C code_search 走代理调 zg，root 由插件填（模型不必知道必填参数）',
-      csCalls.some((x) => x.tool === 'zg_zvec_grep_search' && x.args.root === csWs && /retries/.test(String(x.args.query))),
-      JSON.stringify(csCalls.find((x) => x.tool === 'zg_zvec_grep_search') ?? null).slice(0, 150))
-    record('C code_search 输出自称"语义近似、不是锚点"（M5 的同一条纪律）',
-      /语义近似/.test(csOut?.text ?? '') && /不能当 file:line/.test(csOut?.text ?? ''),
-      String(csOut?.text ?? '(空)').slice(0, 110))
-    let csNoIdx = '(未抛错)'
-    try { await cs.tools.get('code_search').execute({ query: 'retry' }, csExec(csNoIdxWs)) } catch (error) { csNoIdx = String(error?.message ?? error) }
-    record('C 本仓无 .zvec-grep ⇒ 直接给建索引的处方，不白打注定 INDEX_MISSING 的一枪',
-      /语义索引/.test(csNoIdx) && /index/.test(csNoIdx) && /gitignore/.test(csNoIdx), csNoIdx.slice(0, 130))
-  } finally {
-    try { rmSync(csWs, { recursive: true, force: true }) } catch { /* 尽力 */ }
-    try { rmSync(csNoIdxWs, { recursive: true, force: true }) } catch { /* 尽力 */ }
-  }
+  // M4′（v0.15.0）/M4″（v0.17.0）：原「图谱腿失败不再转语义腿」守卫并入 R3——
+  // 语义层整体移除后"第二腿"不复存在，errorSearch ⇒ 不替换 + passFailedGraph=1
+  // 那组断言（见上）就是这条纪律的唯一遗存，不再另起一臂。
 
   // ── 臂 D：前提不成立即 throw（不静默降级）──────────────────────────────────
   const savedHome = process.env.DSH_HOME
