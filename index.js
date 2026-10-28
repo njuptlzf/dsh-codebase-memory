@@ -1217,13 +1217,17 @@ export function projectFromListing(text, cwd) {
  * projectFromListing 解析（纯本地、零成本），过期就在后台刷，不占用钩子预算。
  *
  * budget=0 = 不带秒表，等真实 settle（预热是后台投资，不是需要回话的同步查询）。
+ *
+ * v0.18.1（验收教训 99cb596d）：默认列族带 branch ⇒ 引擎逐仓活读 git，9 个项目实测
+ * 18~27s，把 projectFor 的现查腿拖爆 20s 预算。metadata_only 只回 name+root_path
+ * （实测 ~0.1s），而清单唯一消费方 projectFromListing 吃的正是这两列，无损。
  */
 function refreshProjectsListing(ctx, cfg, state, attempt = 0) {
   // 共享在飞的那一发：v0.15.0 实机教训（2026-10-24 19:19）——预热那一发正在跑时
   // 热路径又发了一发，两发 list_projects 抢同一个守护进程，后到的排队，20s 预算
   // 整点超时（第一次 code_find 就是这么失败的）。共享 promise 就只占引擎一次。
   if (state.listingPromise) return state.listingPromise
-  const p = cbmCall(ctx, {}, 'list_projects', {}, 0)
+  const p = cbmCall(ctx, {}, 'list_projects', { metadata_only: true }, 0)
     .then((r) => {
       if (r.ok && r.text) {
         state.projectsListing = r.text
@@ -1250,7 +1254,8 @@ function refreshProjectsListing(ctx, cfg, state, attempt = 0) {
 }
 
 /**
- * project 名：会话缓存 → code_index 落过的记录 → 预热清单（本地解析）→ 现查 list_projects。
+ * project 名：会话缓存 → code_index 落过的记录 → 预热清单（本地解析）→ 共享的最新
+ * 一发 list_projects（v0.18.1：metadata_only、只发一发，绝不在同一请求里补第二发）。
  * 返回 `{ project, reason }`：查不到时 reason 必须区分**为什么**查不到——
  * 实测教训（v0.10.0 验收）：引擎冷启动时 list_projects 会失败，旧版把"查询失败"
  * 和"不在表里"都报成"还没进代码图"，把一个假消息塞进了真错误里，排障的人被带去
@@ -1260,34 +1265,14 @@ async function projectFor(ctx, exec, cfg, state, session, cwd, budgetMs = budget
   if (session.project) return { project: session.project, reason: '' }
   const cached = state.projectsByCwd.get(cwd)
   if (cached) { session.project = cached; return { project: cached, reason: '' } }
-  // v0.15.0 M1：先用预热留下的清单解析（纯本地、零成本）。过期就在后台刷一把，
-  // 热路径不等——现查要 8.7~10.8s，钩子预算根本付不起。
+  // v0.15.0 M1：先用预热留下的清单解析（纯本地、零成本）。
   const listing = state.projectsListing
-  if (!listing) {
-    // 清单空：预热多半还在跑。**共享它**，绝不再发第二发（两发抢守护进程=排队超时）。
-    const inFlight = state.listingPromise
-    if (inFlight) {
-      const waited = await withBudget(budgetMs, () => inFlight)
-      if (waited?.ok && waited.text) {
-        const fromWarm = projectFromListing(waited.text, cwd)
-        if (fromWarm) {
-          session.project = fromWarm
-          state.projectsByCwd.set(cwd, fromWarm)
-          bumpCount(cfg, state, 'list-projects:cache-hit')
-          return { project: fromWarm, reason: '' }
-        }
-      }
-      if (waited && !waited.ok) {
-        return { project: '', reason: `预热那一发 list_projects 失败（${waited.timeout ? '超时' : '错误'}）：${String(waited.text || '(空输出)').slice(0, 120)}` }
-      }
-      // 预算内没等到：给出**可执行**的处方，而不是让模型等满 20s 换一句"超时"。
-      const ran = state.warmStartedAt ? Math.round((Date.now() - state.warmStartedAt) / 1000) : 0
-      return { project: '', reason: `引擎正在预热（list_projects 还没跑完${ran ? `，已跑 ${ran}s` : ''}）——先跑 code_index（项目级、约 10s），或稍后重试` }
-    }
-    void refreshProjectsListing(ctx, cfg, state).catch(() => {})
-  } else {
+  let inFlight = null
+  if (listing) {
+    // 过期就踢一把刷新；v0.18.1：把这一发的 promise 留握——解析 miss 时共享它，
+    // 而不是旧版的「后台一发 + :1300 现查第二发」（两发在守护进程串行=超预算）。
     if (Date.now() - (state.projectsListingAt || 0) >= PROJECTS_LISTING_TTL_MS) {
-      void refreshProjectsListing(ctx, cfg, state).catch(() => {})
+      inFlight = refreshProjectsListing(ctx, cfg, state)
     }
     const fromListing = projectFromListing(listing, cwd)
     if (fromListing) {
@@ -1297,27 +1282,35 @@ async function projectFor(ctx, exec, cfg, state, session, cwd, budgetMs = budget
       return { project: fromListing, reason: '' }
     }
   }
-  const r = await cbmCall(ctx, exec, 'list_projects', {}, budgetMs)
-  if (!r.ok) {
+  // miss（没有清单，或清单里没有本 cwd）：唯一可信的是最新清单。旧版不信缓存、
+  // 落一笔独立现查；v0.18.1 起现查=共享的 listingPromise（metadata_only ~0.1s，
+  // 连钩子的 2.5s 预算都付得起），一个请求内 list_projects 最多一发。
+  const shot = inFlight ?? refreshProjectsListing(ctx, cfg, state)
+  const waited = await withBudget(budgetMs, () => shot)
+  if (waited?.ok && waited.text) {
+    const found = projectFromListing(waited.text, cwd)
+    if (found) {
+      session.project = found
+      state.projectsByCwd.set(cwd, found)
+      telemetry(cfg, state, 'list-projects:hot', { cwd })
+      return { project: found, reason: '' }
+    }
+    // 清单新鲜且确实没有本 cwd = 真没进图（v0.18.0 自愈门挂这个旗标）。
+    return { project: '', reason: `项目表里没有 cwd=${cwd}`, notIndexed: true }
+  }
+  if (waited && !waited.ok) {
     // 事故教训（v0.12.0）：not-found 是"清单没被活进程加载"的签名，不是查询失败——
     // 判词直接给到 restart-adapter，别让 agent 在"重试/重建索引"里空转。用缓存的
     // 进程轴结论，绝不在拦截热路径上现枚举进程（那是 code_setup 的活）。
-    const notFound = /tool\s+"[^"]*"\s+not found/i.test(r.text || '')
+    const notFound = /tool\s+"[^"]*"\s+not found/i.test(waited.text || '')
     const axis = notFound
       ? `——代理工具不在活进程里（清单未加载，进程判定=${state.adapterFresh?.verdict ?? '待测'}）：code_setup {action:"restart-adapter"}`
       : ''
-    return { project: '', reason: `list_projects 查询失败（${r.timeout ? '超时' : '代理报错'}）：${(r.text || '').trim().slice(0, 120) || '(空输出)'}${axis}` }
+    return { project: '', reason: `list_projects 查询失败（${waited.timeout ? '超时' : '代理报错'}）：${(waited.text || '').trim().slice(0, 120) || '(空输出)'}${axis}` }
   }
-  const found = projectFromListing(r.text, cwd)
-  if (found) {
-    session.project = found
-    state.projectsByCwd.set(cwd, found)
-    state.projectsListing = r.text
-    state.projectsListingAt = Date.now()
-    telemetry(cfg, state, 'list-projects:hot', { cwd })
-    return { project: found, reason: '' }
-  }
-  return { project: '', reason: `项目表里没有 cwd=${cwd}`, notIndexed: true }
+  // 预算内没等到：给出**可执行**的处方，而不是让模型等满 20s 换一句"超时"。
+  const ran = state.warmStartedAt ? Math.round((Date.now() - state.warmStartedAt) / 1000) : 0
+  return { project: '', reason: `引擎正在预热（list_projects 还没跑完${ran ? `，已跑 ${ran}s` : ''}）——先跑 code_index（项目级、约 10s），或稍后重试` }
 }
 
 /**
