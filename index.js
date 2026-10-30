@@ -130,6 +130,11 @@ export const Config = z.object({
   // 再打扰）；非 git 工作区不碰（digest 闸门，与补偿刷新同一判据）。页面可关。
   autoSelfHeal: z.boolean().default(true).volatile(),
   telemetry: z.boolean().default(true).volatile(),
+  // v0.19.0 会话收尾报数表（2026-10-28 拍板：跨重启累计没意义，只要会话内实时）。
+  // 开：每轮 turn-stopping 检查本会话计数，**自上一张表以来有新活动**才 steer 一条
+  // 转录指令（数字由插件算好写死在指令里，模型只转录、不自计——自计就有美化空间）。
+  // 纯聊天回合零 steer、零开销。关：不打表；会话计数照记（本来就在内存里）。
+  sessionReport: z.boolean().default(true).volatile(),
   // stats 是**插件→设置页**的读数通道，不是用户配置：pushStats 把计数推进这个引用，
   // 宿主 describe() 用 plainConfig 读同一引用（dsh-settings/lib/index.js:98,436），
   // 浏览器收到转发的 settings/document-updated 后重读。写成 JSON 字符串是为了让
@@ -243,12 +248,14 @@ function normalize(config = {}) {
   positiveInt('interceptBudgetMs', live(config.interceptBudgetMs), 0, cfg.notes)
   positiveInt('graphBudgetMs', live(config.graphBudgetMs), 0, cfg.notes)
   boolOf(live(config.telemetry), true, cfg.notes, 'telemetry')
+  boolOf(live(config.sessionReport), true, cfg.notes, 'sessionReport')
   boolOf(live(config.contextHint), true, cfg.notes, 'contextHint')
   boolOf(live(config.dirtyTracking), true, cfg.notes, 'dirtyTracking')
   defineLive(cfg, 'enforce', () => (ENFORCE_MODES.includes(live(config.enforce)) ? live(config.enforce) : 'off'))
   defineLive(cfg, 'interceptBudgetMs', () => positiveInt('interceptBudgetMs', live(config.interceptBudgetMs), 0, []))
   defineLive(cfg, 'graphBudgetMs', () => positiveInt('graphBudgetMs', live(config.graphBudgetMs), 0, []))
   defineLive(cfg, 'telemetry', () => boolOf(live(config.telemetry), true, [], 'telemetry'))
+  defineLive(cfg, 'sessionReport', () => boolOf(live(config.sessionReport), true, [], 'sessionReport'))
   // v0.9.0：这三个也上了设置页 ⇒ 同一纪律。interceptTools 是决策点现读的名单
   // （csv 对任何字符串都成立，非法只可能是"写错工具名"，那本来就是空名单语义）。
   defineLive(cfg, 'interceptTools', () => csv(live(config.interceptTools) || 'grep,glob'))
@@ -772,7 +779,6 @@ function adapterLine(state) {
 }
 
 function report(cfg, state) {
-  liftCounts(cfg, state) // 读侧 lift：报表的「累计」承诺要能在读路径兑现（v0.13.1）
   const lines = [
     `status: ${state.ok ? 'OK' : 'NOT READY'}`,
     `压缩层(②): ${state.adapter}  ${cfg.adapterMjs}`,
@@ -785,7 +791,7 @@ function report(cfg, state) {
     // 六个即时热字段；清单重建不用重启宿主——
     // code_setup {action:"restart-adapter"} 重拉适配层即可（宿主监督器自动重生进程）。
     '热改: enforce / telemetry / contextHint / dirtyTracking / interceptBudgetMs / interceptTools / graphBudgetMs → 设置 → 插件 → dsh-codebase-memory → codebase-memory 行「配置」（不用重启）；其余字段改 profile 的 cordis.patch.yml 并重启',
-    `遥测计数(跨重启累计): ${Object.entries(state.counts).map(([k, v]) => `${k}=${v}`).join(' ') || '(无事件)'}`,
+    `遥测计数(进程内累计·重启归零): ${Object.entries(state.counts).map(([k, v]) => `${k}=${v}`).join(' ') || '(无事件)'}`,
     `auto_index: ${state.autoIndex || '(未设置)'}（期望 ${cfg.autoIndex ? 'true' : 'false'}；机器级共享配置，只补"无索引的新项目"，不刷新陈旧坐标）`,
     syncStatusLine(),
   ]
@@ -1129,14 +1135,54 @@ export function coversWorkspace(args, cwd) {
 /** 会话键：优先 session id（resume/多标签下 cwd 可能相同），退回 cwd。 */
 const sessionKey = (agent) => agent?.session?.header?.id ?? agent?.session?.header?.cwd ?? ''
 
-/** 每会话状态：project 缓存、脏路径、已拦过的符号（同符号只拦一次）。 */
+/** 每会话状态：project 缓存、脏路径、已拦过的符号（同符号只拦一次）、会话内报数四桶。 */
 function sessionOf(state, key) {
   let s = state.sessions.get(key)
   if (!s) {
-    s = { project: '', dirty: new Set(), blocked: new Set(), lastRefreshAt: 0, lastWarnAt: 0 }
+    // tally：会话内实时报数（v0.19.0，跨重启归零是本意——累计文件已删，只留内存）。
+    //   wrapper=包装动词命中 / proxy=cbm_* 代理长尾 / intervene=替换·拒绝 / literal=grep·read。
+    // reportedTally：上一张收尾表打出来的四桶快照，turn-stopping 门闩比它判"有没有新活动"。
+    s = {
+      project: '', dirty: new Set(), blocked: new Set(), lastRefreshAt: 0, lastWarnAt: 0,
+      tally: { wrapper: 0, proxy: 0, intervene: 0, literal: 0 },
+      reportedTally: null,
+    }
     state.sessions.set(key, s)
   }
   return s
+}
+
+/**
+ * 收尾报数的桶归属（v0.19.0）：工具名 → 会话计数四桶之一，不相关返回 null。
+ * wrapper=注册的三个包装动词；proxy=mcp__cbm__* 代理面（含 mcpScript）；
+ * literal=字面量检索（grep/glob/read，外加用户自定义 interceptTools 里的名字）。
+ * 插件干预（intervene）不在这判——它发生在 deny/replace 钩子的决策点上，那边直接 bump。
+ */
+function tallyBucket(name, cfg) {
+  if (name === 'code_find' || name === 'code_callers' || name === 'code_index') return 'wrapper'
+  if (String(name).startsWith('mcp__cbm__')) return 'proxy'
+  if (name === 'grep' || name === 'glob' || name === 'read' || isGrepLike(name, cfg.interceptTools)) return 'literal'
+  return null
+}
+
+/**
+ * 收尾报数表的 steer 指令文本（v0.19.0）：数字**烧死在文本里**，模型只转录——
+ * 「模型自计」给了美化空间，这正是 SKILL §收尾 原来钉不住的东西。交叉校验口径
+ * 随表下发：日粒度对账翻 telemetry-*.log JSONL，回合粒度以这张表为准。
+ */
+function renderSessionReport(t) {
+  return [
+    '[cbm 收尾报数·插件实测] 请把下面这张本会话计数表原样放进本轮最终回复：宿主有 GenUI 时优先转成 ```dsh-ui 的 table 围栏（发前过 validate_dsh_ui），否则用 markdown 表。数字是插件钩子对本会话的实测值：不得改动、不得自计、不得并入其他会话；0 就写 0。',
+    '',
+    '| 通道 | 本会话累计 |',
+    '|---|---|',
+    `| 结构层·包装动词（code_find / code_callers / code_index） | ${t.wrapper} |`,
+    `| 结构层·mcp 代理（mcp__cbm__* 长尾） | ${t.proxy} |`,
+    `| 插件干预（grep 替换 · 符号拒绝） | ${t.intervene} |`,
+    `| 字面量层（grep / glob / read） | ${t.literal} |`,
+    '',
+    '表下补一行口径说明：「以上为 dsh-codebase-memory 插件钩子实测（仅本会话，重启归零），非模型自报」。若字面量层明显高于结构层且本轮含符号问题，表后必须给一句原因（新会话未 code_index / 图无该符号 / 纯字面量任务）。',
+  ].join('\n')
 }
 
 /** 时间预算：超时返回 null，钩子里绝不因为查询把工具调用卡死。 */
@@ -1363,34 +1409,6 @@ function sweepTelemetry(cfg) {
 }
 
 /**
- * 累计计数文件 = telemetry.log 同目录的 telemetry.counts.json。「开 replace 跑几天
- * 看占比」要熬得过宿主重启：启动播种、每次推送与文件 max 合并。
- * DSH_CBM_COUNTS_FILE 是测试缝——验收 harness 必须把它指到临时文件，否则会污染
- * 用户的真实累计数；宿主不会设置这个变量。
- */
-const countsPath = (cfg) => process.env.DSH_CBM_COUNTS_FILE || join(cfg.adapterDir, 'telemetry.counts.json')
-function loadCounts(cfg) {
-  try {
-    const parsed = JSON.parse(readFileSync(countsPath(cfg), 'utf8'))
-    return parsed && typeof parsed === 'object' ? parsed : {}
-  } catch {
-    return {}
-  }
-}
-
-/**
- * 读侧 lift（v0.13.1）：别的宿主/实例写了计数文件、本实例内存没跟上的增量，
- * 报表读之前先从文件捞回来——「跨重启累计」这句话得在读路径也可证伪，
- * 不能只写在启动播种和 max 写上（2026-10-14 验收：log 有 5 行、报表只走 9→10，
- * 归因不了的差距就是语义洞）。max 合并幂等，不虚增本进程自己的数。
- */
-function liftCounts(cfg, state) {
-  if (!cfg.telemetry) return
-  const f = loadCounts(cfg)
-  for (const [k, v] of Object.entries(f)) if (typeof v === 'number' && v > (state.counts[k] ?? 0)) state.counts[k] = v
-}
-
-/**
  * state.counts → 设置页读数（JSON 字符串）。**每次全量重建**：用户任何一次配置写
  * 都会让 loader 把这个 volatile 字段复位成 schema 默认（_commitVolatile 只认文档
  * 层），下一个事件回填，所以绝不能做增量。键名是面板的契约，改键要同步 lib/client.js。
@@ -1418,8 +1436,8 @@ function renderStats(cfg, state) {
     // （处方回 code_index）、skipNotGit=非 git 仓没碰。每 cwd 只试一次，
     // 这行不会因 grep 频繁而虚涨；attempted/off 两条静默闸门故意外。
     index: { retryContention: n('index-retry-contention'), selfHealStart: n('self-heal-start'), selfHealDone: n('self-heal-done'), selfHealFailed: n('self-heal-failed'), selfHealSkipNotGit: n('self-heal-skip-not-git') },
-    // 按仓库的读数（v0.13.4）：面板仓库选择器用。进程内累计、重启归零——落盘会
-    // 污染 counts.json 的扁平契约，而趋势看板本来就不跨重启。project 列=该仓
+    // 按仓库的读数（v0.13.4）：面板仓库选择器用。进程内累计、重启归零（v0.19.0
+    // 拍板：运行读数只要会话/进程轴，落盘累计已整块撤下）。project 列=该仓
     // 结构层入图名（页面每帧重算，很便宜，不值得单独做失效通知）。
     repos: Array.from(state.repos.entries()).map(([cwd, r]) => ({
       cwd,
@@ -1704,6 +1722,10 @@ function observeCall(ctx, cfg, state, exec, result) {
   if (!key || !cwd) return
   const sess = sessionOf(state, key)
   const name = String(exec?.name ?? '').toLowerCase()
+  // v0.19.0 收尾报数：每次工具调用按通道进会话桶（失败也算——模型确实用过这条通道，
+  // 表要反映尝试而不只是成功；被拒的 grep 同时进 literal 与 intervene 两行，属预期）。
+  const bucket = tallyBucket(name, cfg)
+  if (bucket) sess.tally[bucket] += 1
   if (cfg.dirtyTracking && WRITE_TOOLS.includes(name) && !result?.isError) {
     const raw = exec?.arguments?.file_path
     if (typeof raw === 'string' && raw) {
@@ -1752,9 +1774,10 @@ export async function apply(ctx, config) {
     warm: false, warmOk: null, // 冷启动预热（v0.10.1；v0.13.2 真实 settle 落账）：warm=打过一次，warmOk=那发的最终结果
     adapterFresh: null, // 进程轴（v0.12.0）：{verdict,at,manifestMs,pids,newestStartMs}，30s 缓存
   }
-  // 开机播种累计计数：重启不是归零（写侧与文件 max 合并，见 pushStats）。
-  // 遥测关着就不播种——否则 code_setup 的计数行会报上一轮的旧数，像还在记。
-  if (cfg.telemetry) for (const [k, v] of Object.entries(loadCounts(cfg))) if (typeof v === 'number') state.counts[k] = v
+  // v0.19.0：计数只有进程内一份（重启归零是本意，2026-10-28 拍板「跨重启累计没
+  // 意义」）。旧的 telemetry.counts.json 播种/max 合并/lift 三件套整块删除——
+  // 会话轴的实时数走 sessionOf().tally + turn-stopping 收尾表，日粒度对账走
+  // telemetry-*.log JSONL，都不需要一个第三份落盘副本。
 
   const ac = new AbortController()
   state.abortSignal = ac.signal
@@ -1766,9 +1789,10 @@ export async function apply(ctx, config) {
   // 读的是 config 传进来的**同一个引用**（生产是 cosmokit volatile ref；验收里
   // 传裸对象 → isVolRef 为假就静默跳过，不影响别的臂）。emit 首参必须是字符串
   // （ns），否则 cordis dispatch 会把它当 thisArg 过滤掉监听器。
+  // v0.19.0：这个通道剩下的消费者是图谱层状态行（adapter）、按仓库表（repos）、
+  // 效果留痕（recent）与 budget——读数卡片撤下后它不是死的，别再当持久化层用。
   state.statsRef = config.stats
   let statsTimer = null
-  let statsWritten = ''
   const doStatsEmit = () => { try { ctx.emit('settings/document-updated', 'codebase-memory', Date.now()) } catch { /* 没有转发器就算了 */ } }
   state.pushStats = () => {
     // 页面读数与遥测日志同一个开关（v0.9.0 的契约，臂 S 钉着）：关掉遥测就冻结在
@@ -1777,29 +1801,14 @@ export async function apply(ctx, config) {
     if (!cfg.telemetry) return
     const ref = state.statsRef
     if (isVolRef(ref)) { try { ref[VOL_WRITE](renderStats(cfg, state)) } catch { /* 绝不影响会话 */ } }
-    // 累计落盘：只在计数变了时写；先与文件 max 合并再写——tauri/web 两宿主并跑时
-    // 各自只见自己的增量，max 写 + 读侧 lift（liftCounts）把文件里的别人的增量捞回报表，
-    // 「跨重启累计」两端都兑现（v0.13.1 前只有写侧，读路径不闭环）。
-    if (cfg.telemetry) {
-      const snap = JSON.stringify(state.counts)
-      if (snap !== statsWritten) {
-        statsWritten = snap
-        try {
-          const f = loadCounts(cfg)
-          for (const [k, v] of Object.entries(state.counts)) if (typeof v === 'number' && v > (typeof f[k] === 'number' ? f[k] : 0)) f[k] = v
-          if (!process.env.DSH_CBM_COUNTS_FILE) mkdirSync(cfg.adapterDir, { recursive: true })
-          writeFileSync(countsPath(cfg), JSON.stringify(f))
-        } catch { /* 绝不影响会话 */ }
-      }
-    }
     if (statsTimer) return // 合并窗口内：只等尾随那一次，页面拿到窗口末的最新值
     doStatsEmit()
     statsTimer = setTimeout(() => { statsTimer = null; doStatsEmit() }, STATS_PUSH_MS)
     if (typeof statsTimer.unref === 'function') statsTimer.unref()
   }
   ctx.effect(() => () => { if (statsTimer) clearTimeout(statsTimer) }, 'dsh-codebase-memory.stats-push')
-  // 开机先推一帧全零快照（仅遥测开时）：mneme 式读数是"卡片常驻"，刚重启还没
-  // 事件的宿主打开设置页也该看到零值卡片，而不是"暂无读数"空态。
+  // 开机先推一帧全零快照（仅遥测开时）：页面每块（图谱层行/仓库表/效果留痕）
+  // 刚重启还没事件时也该看到各自的空态而不是什么都没有。
   if (cfg.telemetry) state.pushStats()
 
   // 后台自举：绝不 await 成 boot 失败；失败只落在 state.lastError。
@@ -2120,6 +2129,7 @@ export async function apply(ctx, config) {
           return next()
         }
         sess.blocked.add(q.symbol)
+        sess.tally.intervene += 1 // 收尾表·干预桶（v0.19.0）：真实拒绝一次
         telemetry(cfg, state, 'intercept-deny', { session: key, cwd, symbol: q.symbol, enforce: cfg.enforce })
         repoBump(state, cwd, 'intercept-deny')
         pushRecent(state, { ts: Date.now(), cwd, project, symbol: q.symbol, source: 'graph', outcome: 'denied', snippet: snippet(hits.text) })
@@ -2223,6 +2233,7 @@ export async function apply(ctx, config) {
             ? { kind: 'accept', content: [{ type: 'text', text: renderPassthroughMark(q.symbol, ev, cwd) + resultText(result) }] }
             : next() // 索引本来没答案 ⇒ grep 才是对的工具
         }
+        sess.tally.intervene += 1 // 收尾表·干预桶（v0.19.0）：真实替换一次（pass-* 不算干预）
         telemetry(cfg, state, 'intercept-replace', { session: key, cwd, project, symbol: q.symbol, source, ...(dropped ? { dropped } : {}) })
         repoBump(state, cwd, 'intercept-replace')
         pushRecent(state, { ts: Date.now(), cwd, project, symbol: q.symbol, source, outcome: 'replaced-graph', snippet: snippet(text) })
@@ -2231,6 +2242,38 @@ export async function apply(ctx, config) {
         telemetry(cfg, state, 'replace-error', { message: String(error?.message ?? error).slice(0, 200) })
       }
       return next() // fail-open：拿不准就保留原始 grep 输出
+    })
+  }
+
+  // ── 收尾报数表（v0.19.0，2026-10-28 拍板）：agent/turn-stopping 是宿主每轮回复
+  // 收尾、边界提交前**串行 await**的事件；会话没有"最后一轮"事件（agent/disposed
+  // 时模型已无响应义务、steer 不动它），所以"会话内实时表"只能在回合边界打。
+  // 门闩（频率方案 A）：本轮自上一张表以来有新活动才 steer——纯聊天回合零 steer
+  // 零开销；steer 触发的转录步本身不产生新桶活动，表不会连环打。
+  // steer 消息手搓（契约 dsh-llm UserMessage：id/role/content/source，source 的
+  // kind 是开放命名空间，插件自取 'dsh-codebase-memory'）——不 import dsh-llm。
+  if (typeof ctx.on === 'function') {
+    ctx.on('agent/turn-stopping', async (payload) => {
+      try {
+        if (!cfg.sessionReport) return
+        const agent = payload?.agent
+        if (typeof agent?.steer !== 'function') return // 宿主太旧没有 steer：静默，不报错打扰收尾
+        const key = sessionKey(agent)
+        if (!key) return
+        const sess = state.sessions.get(key) // 已存在的台账才可能打表：纯聊天会话不建行
+        if (!sess) return
+        const t = sess.tally
+        const r = sess.reportedTally
+        if (r && r.wrapper === t.wrapper && r.proxy === t.proxy && r.intervene === t.intervene && r.literal === t.literal) return
+        sess.reportedTally = { ...t }
+        bumpCount(cfg, state, 'session-report')
+        agent.steer({
+          id: randomUUID(),
+          role: 'user',
+          content: [{ type: 'text', text: renderSessionReport(t) }],
+          source: { kind: 'plugin', plugin: 'dsh-codebase-memory' },
+        })
+      } catch { /* 收尾表绝不影响回合提交——这是 turn-stopping 唯一的 fail-silent 义务 */ }
     })
   }
 

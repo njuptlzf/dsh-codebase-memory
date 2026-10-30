@@ -156,8 +156,7 @@ ok(!!dictEntry && dictEntry.ns === panel?.locale, 'locale 字典的 NS 与 regis
 for (const lang of ['zh', 'en']) ok(!!dictEntry?.dict?.[lang], `字典有 ${lang}`)
 const keys = Object.keys(dictEntry?.dict?.zh || {})
 for (const key of ['title', 'summary', 'loading', 'unavailable', 'enforce.label', 'telemetry.label', 'resetField', 'saveFailed', 'foot',
-  'stats.label', 'stats.empty', 'stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index', 'stats.updated',
-  'stats.r.qfailgraph', 'stats.r.lph', 'stats.r.lpc', 'stats.r.shdone', 'stats.r.shfail', 'stats.r.shnotgit', 'stats.budget',
+  'report.label', 'report.hint',
   'selfHeal.label', 'selfHeal.hint',
   'hint.label', 'hint.hint', 'dirty.label', 'dirty.hint', 'interceptBudgetMs.label', 'interceptBudgetMs.hint',
   'interceptTools.label', 'interceptTools.hint',
@@ -168,10 +167,13 @@ for (const key of ['title', 'summary', 'loading', 'unavailable', 'enforce.label'
 }
 for (const key of ['hint.label', 'dirty.label', 'interceptBudgetMs.label', 'interceptTools.label', 'resetField',
   'sec.soft', 'sec.hard', 'sec.layers', 'sec.aux', 'sec.params',
-  'selfHeal.label', 'stats.r.shdone', 'stats.r.shnotgit',
+  'selfHeal.label', 'report.label', 'report.hint',
   'layer.graph', 'layer.adapter.stale', 'layer.adapter.noproc']) {
   ok(Object.keys(dictEntry?.dict?.en || {}).includes(key), `en 字典有 key ${key}`)
 }
+// v0.19.0：全量读数卡整块撤下（会话内计数改为对话里的收尾报数表）。stats.* 字典键
+// 若回潮 = 有人又把卡片代码粘回来了，这条锁先炸。
+ok(!keys.some((k) => k.startsWith('stats.')), 'stats.* 读数卡字典键不得回潮（v0.19.0 卡片已删）', keys.filter((k) => k.startsWith('stats.')).join('|'))
 // v0.17.0：语义层整体移除——zg 字典键若回潮（复制粘贴旧块），下面这条锁先炸。
 ok(!keys.some((k) => k.startsWith('layer.zg') || k.startsWith('zg.')), 'zg.* / layer.zg.* 字典键不得回潮', keys.filter((k) => k.startsWith('layer.zg') || k.startsWith('zg.')).join('|'))
 ok(!keys.includes('reset'), '没有裸「恢复默认」key——每个字段的恢复按钮必须叫「恢复此项」', keys.filter((k) => k.startsWith('reset')).join('|'))
@@ -204,7 +206,7 @@ ok(JSON.stringify(segValues) === JSON.stringify(modes), '分段控件的选项 =
 ok(seg?.props?.value === 'deny-once', '分段控件当前值取自主机快照', seg?.props?.value)
 ok(seg?.props?.disabled === false, 'writable 时控件可用')
 const switches = flatten(tree).filter((n) => n.type === primitives.Switch)
-ok(switches.length === 5, '渲染出 5 个 Switch（contextHint / markPassthrough / dirtyTracking / autoSelfHeal / telemetry——按层排布）', String(switches.length))
+ok(switches.length === 6, '渲染出 6 个 Switch（contextHint / markPassthrough / dirtyTracking / autoSelfHeal / telemetry / report——按层排布）', String(switches.length))
 const texts185 = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
 ok(['sec.soft', 'sec.hard', 'sec.layers', 'sec.aux', 'sec.params'].every((k) => texts185.includes(k)),
   '五个分层标题按序在场（软引导→硬拦截→图谱层→记账遥测→参数）', texts185.filter((t) => t.startsWith('sec.')).join('|'))
@@ -214,6 +216,9 @@ ok(switches[4]?.props?.checked === true, 'telemetry=true → checked', String(sw
 ok(switches[0]?.props?.checked === true && switches[2]?.props?.checked === true,
   'contextHint / dirtyTracking 缺省即开（!== false 判定）', `${switches[0]?.props?.checked}|${switches[2]?.props?.checked}`)
 ok(switches[3]?.props?.checked === true, 'autoSelfHeal 缺省即开（fixture 未写该字段，!== false 判定为开）', String(switches[3]?.props?.checked))
+ok(switches[5]?.props?.checked === true, 'sessionReport 缺省即开（收尾报数默认打表；fixture 未写该字段）', String(switches[5]?.props?.checked))
+ok(flatten(tree).some((n) => n.type === 'span' && n.props?.children === 'report.label'),
+  '收尾报数开关行标签在场（switchRow 自铺 span）')
 ok(flatten(tree).some((n) => n.type === 'span' && n.props?.children === 'telemetry.label'),
   '开关标签与控件同行（span 自铺，不依赖 Switch 的 label prop 渲染）')
 
@@ -318,7 +323,7 @@ ok(flatten(tree).some((n) => typeof n.props?.children === 'string' && n.props.ch
 
 ok(panel.component({ ...props, view: 'summary' }) === 'summary', 'summary 态返回一行文案（RowDetail 用）')
 
-/* ---- 6. 读数卡片（stats 只读，样式参考 dsh-mneme 状态页）---- */
+/* ---- 6. v0.19.0：全量读数卡已撤下——反回归锁（stats 载荷在场也不得渲染任何卡片）---- */
 const statsJson = JSON.stringify({
   at: 1791531188925,
   replace: { hit: 8, graph: 6, passDirty: 2, passNoHit: 0, passFailed: 0, passFailedGraph: 0, error: 0 },
@@ -329,38 +334,24 @@ const statsJson = JSON.stringify({
   budget: { graph: 6000 },
   index: { retryContention: 1, selfHealStart: 4, selfHealDone: 2, selfHealFailed: 1, selfHealSkipNotGit: 1 },
 })
+console.log('\n[读数卡撤除]')
 storeSnapshot = { status: 'ready', value: { enforce: 'replace', telemetry: true, stats: statsJson }, base: {}, user: {}, writable: true, revision: 11 }
 tree = panel.component({ ...props })
-const texts = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
-console.log('\n[读数]')
-ok(texts.includes('80%'), '命中率大数字 = hit/(hit+让路+无命中+出错)', texts.find((t) => t.endsWith('%')))
-ok(texts.includes('8/10'), '被替换行 = hit/den', texts.filter((t) => /^\d+\/\d+$/.test(t)).join('|'))
-ok(['stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index'].every((k) => texts.includes(k)), '五张卡片都在')
-// v0.16 死码清理：语义腿自 v0.15.0 M4' 退出替换通道，占比条随 zg/passFailedZg 两计数一并撤下（历史数在 telemetry JSONL 可翻）
-// v0.17.0：语义层整体移除，leg/zg 读数不复存在——图谱腿、预算单腿、缓存命中都要在页上。
-ok(texts.includes('stats.r.qfailgraph'), '失败计数按腿分开（图谱腿行在场）', texts.filter((t) => t.startsWith('stats.r.qfail')).join('|'))
-ok(texts.includes('stats.r.lpc') && texts.includes('stats.r.lph'), '清单缓存命中/现查进索引卡（M1 的验收读数）')
-// v0.18.0 O2：自愈首建的三个结果读数进索引卡（成功/失败/非 git 跳过）。
-ok(texts.includes('stats.r.shdone') && texts.includes('stats.r.shfail') && texts.includes('stats.r.shnotgit'), '自动首建读数三行进索引卡', texts.filter((t) => t.startsWith('stats.r.sh')).join('|'))
-// 夹具的 t() 原样返回 key（不查字典），所以这里断言"渲染了这一行"，
-// 模板占位符由下面的字典断言单独锁（只剩 {graph}；{zg} 若回潮此锁先炸）。
-ok(texts.includes('stats.budget') && /\{graph\}/.test(dictEntry?.dict?.zh?.['stats.budget'] ?? '') && !/\{zg\}/.test(dictEntry?.dict?.zh?.['stats.budget'] ?? ''),
-  '图谱预算在页上（占位符只有 {graph}）', texts.filter((t) => /budget/.test(t)).join('|').slice(0, 80))
-ok(flatten(tree).filter((n) => n.type === primitives.SegmentedControl).length === 1
-  && flatten(tree).filter((n) => n.props && typeof n.props.onClick === 'function').length === 0, '读数块不新增交互件（卡片全只读）')
-storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, stats: '{坏' }, base: {}, user: {}, writable: true, revision: 12 }
-tree = panel.component({ ...props })
-const textsBad = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
-ok(textsBad.includes('stats.replaced') && textsBad.includes('—') && !textsBad.includes('stats.empty'),
-  '坏 JSON + 遥测开 ⇒ 零值卡片常驻（大数字破折号），不进空态')
-storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, stats: '' }, base: {}, user: {}, writable: true, revision: 13 }
-tree = panel.component({ ...props })
-const textsZero = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
-ok(['stats.replaced', 'stats.denied', 'stats.dirty', 'stats.lever', 'stats.index'].every((k) => textsZero.includes(k))
-  && textsZero.includes('0/0'), '遥测开但 host 没推过数 ⇒ 五张零值卡（0/0），mneme 式常驻')
-storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: false, stats: '' }, base: {}, user: {}, writable: true, revision: 14 }
-tree = panel.component({ ...props })
-ok(flatten(tree).some((n) => n.props?.children === 'stats.empty'), '空态只属于"关了遥测"')
+{
+  const texts = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
+  // 会话累计数现在只活在对话里的收尾报数表；页面即使收到全量 stats 载荷，
+  // 也只该消费 adapter（图谱行）/repos（仓库表）/recent（效果区）三块。
+  ok(!texts.some((t) => String(t).startsWith('stats.')), 'stats 载荷在场也不渲染任何读数卡（stats.* 文案 0 命中）', texts.filter((t) => t.startsWith('stats.')).join('|').slice(0, 120))
+  ok(!texts.includes('80%') && !texts.includes('8/10'), '旧命中率/替换比大数字不得回潮', texts.filter((t) => /^\d+%$|^\d+\/\d+$/.test(t)).join('|'))
+  ok(flatten(tree).filter((n) => n.type === primitives.SegmentedControl).length === 1
+    && flatten(tree).filter((n) => n.props && typeof n.props.onClick === 'function').length === 0, 'stats 载荷不新增交互件')
+}
+for (const [label, statsVal] of [['坏 JSON', '{坏'], ['空串', ''], ['undefined', undefined]]) {
+  storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true, ...(statsVal === undefined ? {} : { stats: statsVal }) }, base: {}, user: {}, writable: true, revision: 12 }
+  tree = panel.component({ ...props })
+  const t = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
+  ok(!t.some((x) => String(x).startsWith('stats.')), `${label} ⇒ 页面不炸且零卡片文案`, t.filter((x) => x.startsWith('stats.')).join('|').slice(0, 80))
+}
 
 /* ---- 7. 仓库索引状态 + 最近替换效果 + 日志与环形上限（v0.14.0 新段落）---- */
 console.log('\n[仓库 / 效果 / 日志]')

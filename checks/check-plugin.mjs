@@ -19,7 +19,7 @@
  *     deny-once 只拦一次、前提不满足/超预算一律 fail-open、
  *     写后记账与坐标过期改放行、按 query 条件注入。走假代理工具，不依赖真引擎。
  *   R2/R3/S2 泡数据完整性（v0.8.2，两个遥测里抓到的真 bug 的回归锁）：越界 grep
- *     不替换、底层错误文本不算命中（失败与无命中分开计数）、累计计数跨重启播种+落盘。
+ *     不替换、底层错误文本不算命中（失败与无命中分开计数）、v0.19.0 起计数只在进程内（臂 S2 反证累计文件不再生成、S3 验收尾报数表）。
  *   W 冷启动契约（v0.10.1）：bootstrap 会话外预热恰好一发；projectFor 查不到时
  *     错误消息区分"不在表里/查询失败"并带出代理原文。
  *   V 适配层版本对账（v0.13.0）：实装 ≠ 钉 ⇒ 自动重装并带 note + adapter-upgrade
@@ -298,14 +298,12 @@ async function verify(profile) {
   if (name !== 'dsh-codebase-memory') throw new Error(`unexpected plugin name: ${name}`)
   record('装载', true, `name=${name}  inject=${inject.join(',')}`)
 
-  // 累计计数文件是**跨挂载存活**的用户数据；harness 若共享一份，前面的臂会把计数
-  // 泡进后面臂的播种里，精确数字断言全废。所以每次 mount 默认换一个新文件
-  // （DSH_CBM_COUNTS_FILE 是插件侧的测试缝），只有持久化臂显式共用同一份。
+  // v0.19.0：跨重启累计文件已删（telemetry.counts.json 不复存在），countsFile 参数
+  // 只是历史包袱占位——臂 S2 拿它当「幽灵文件」反证插件不再读写累计文件。
   const countsDir = join(tmpdir(), `cbm-counts-${process.pid}-${profile}`)
   mkdirSync(countsDir, { recursive: true })
-  let countsSeq = 0
   const mount = async (config, proxy = null, ctxOpts = null, countsFile = null, tdir = null) => {
-    process.env.DSH_CBM_COUNTS_FILE = countsFile ?? join(countsDir, `c${(countsSeq += 1)}.json`)
+    void countsFile // 死参数：DSH_CBM_COUNTS_FILE 测试缝随 v0.19.0 一起删了
     // 遥测也隔离：显式传 adapterDir 的臂（W2/U5/O1 要读自己目录下的 telemetry-*.log）
     // 指回自己的目录，其余一律写临时目录——否则几十次 mount 的桩会把真实日志淹掉
     // （2026-10-24 实测：真实日志里 283 条 intercept-replace 全是 project:"stub-*"）。
@@ -718,8 +716,9 @@ async function verify(profile) {
   // v0.15.0 增补 graphBudgetMs；v0.14.0 增补 logRetentionDays /
   // recentLimit / markPassthrough——它们在 Config 里都标了 volatile（页面可写、
   // 决策点现读），名单漏了就会让"标错等于对 UI 撒谎"这条断言失去意义。
+  // v0.19.0 增补 sessionReport（收尾报数开关：页面可写、turn-stopping 监听器现读）。
   const VOLATILE_KEYS = ['enforce', 'interceptTools', 'interceptBudgetMs', 'contextHint', 'telemetry', 'dirtyTracking', 'stats',
-    'logRetentionDays', 'recentLimit', 'markPassthrough', 'graphBudgetMs', 'staleWarnFiles', 'staleWarnMinIntervalSec', 'autoSelfHeal']
+    'logRetentionDays', 'recentLimit', 'markPassthrough', 'graphBudgetMs', 'staleWarnFiles', 'staleWarnMinIntervalSec', 'autoSelfHeal', 'sessionReport']
   // schemastery 的字段表在 `Config.dict`（宿主 dsh-settings 的 volatileForm 也是递归它）。
   const marked = VOLATILE_KEYS.filter((k) => Config?.dict?.[k]?.meta?.volatile === true)
   record('G 即时热改字段 + 观测字段 + 读数通道在 Config 里标了 volatile（宿主才肯 serve/写）', marked.length === VOLATILE_KEYS.length, `标了的是 ${marked.join(',') || '(无)'}`)
@@ -968,20 +967,81 @@ async function verify(profile) {
     (r3Stats?.replace?.passFailedGraph ?? 0) === 1 && r3Stats?.replace?.passFailedZg === undefined,
     JSON.stringify(r3Stats?.replace ?? null).slice(0, 150))
 
-  // ── 臂 S2：累计计数跨重启（「跑几天看占比」不能每次重启归零）─────────────────
-  const seedFile = join(countsDir, 's2-shared.json')
-  writeFileSync(seedFile, JSON.stringify({ 'intercept-replace': 7, 'intercept-replace:graph': 5 }))
+  // ── 臂 S2：v0.19.0 反回归锁——跨重启累计文件必须**不存在**了。播种语义（开机读
+  //    counts.json 抬数）与落盘 max 合并（写回 counts.json）都随「跨重启累计没意义」
+  //    的拍板（2026-10-28 用户推翻 2026-10-26 判定②）删除。这里放一个幽灵 seed 文件
+  //    当探针：插件若复活任何一条读/写路径，断言立刻炸。
+  const seedFile = join(countsDir, 's2-ghost.json')
+  const seedText = JSON.stringify({ 'intercept-replace': 7, 'intercept-replace:graph': 5 })
+  writeFileSync(seedFile, seedText)
   const s2Ref = mkVolRef('')
   const s2 = await mount({ enforce: 'replace', dirtyTracking: false, stats: s2Ref }, makeStubProxy([], { project: `stub-${process.pid}-s2` }), null, seedFile)
   let s2Boot = null
   try { s2Boot = JSON.parse(String(s2Ref.get())) } catch { /* 下一条断言报出来 */ }
-  record('S2 重启不归零：开机从累计文件播种，第一帧读数就带历史数',
-    (s2Boot?.replace?.hit ?? 0) === 7 && (s2Boot?.replace?.graph ?? 0) === 5, String(s2Ref.get()).slice(0, 120))
-  await s2.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('S2 播种已死：开机第一帧不带任何历史数（幽灵文件里的 7 没被捞回来）',
+    (s2Boot?.replace?.hit ?? 0) === 0, String(s2Ref.get()).slice(0, 120))
+  const s2Setup = await s2.tools.get('code_setup').execute({}, withSignal(REPO))
   await (s2.events['tools/post-execute'] ?? [])[1](grepExec(fakeAgent(`sess-${process.pid}-s2`, REPO), 'usageSection'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
-  const s2File = JSON.parse(String(readFileSync(seedFile, 'utf8')))
-  record('S2 新事件落盘：与文件 max 合并（7→8），不是覆盖也不是只留内存',
-    (s2File['intercept-replace'] ?? 0) === 8 && (s2File['intercept-replace:graph'] ?? 0) === 6, JSON.stringify(s2File).slice(0, 170))
+  record('S2 落盘已死：幽灵文件一个字节没动（不再 max 合并写回）',
+    String(readFileSync(seedFile, 'utf8')) === seedText, String(readFileSync(seedFile, 'utf8')).slice(0, 120))
+  record('S2 报表口径改口：进程内累计·重启归零，且不再出现「跨重启」字样',
+    /遥测计数\(进程内累计·重启归零\)/.test(s2Setup) && !/跨重启/.test(s2Setup),
+    /遥测计数.*$/m.exec(s2Setup)?.[0]?.slice(0, 160) ?? '(没有计数行)')
+
+  // ── 臂 S3：v0.19.0 收尾报数表（turn-stopping → steer）：会话四桶实测、门闩 A、
+  //    sessionReport 热关、纯聊天会话零打扰。数字来自插件钩子，模型只转录。
+  const s3Ref = mkVolRef('')
+  const s3 = await mount({ enforce: 'replace', dirtyTracking: false, stats: s3Ref }, makeStubProxy([], { project: `stub-${process.pid}-s3` }))
+  await s3.tools.get('code_setup').execute({}, withSignal(REPO)) // 链路点亮：interceptPremises 要 state.ok，替换钩子才有决策可做
+  const s3Agent = { ...fakeAgent(`sess-${process.pid}-s3`, REPO), steers: [], steer(msg) { this.steers.push(msg) } }
+  const s3Post = s3.events['tools/post-execute'] ?? []
+  const s3Ts = s3.events['agent/turn-stopping'] ?? []
+  record('S3 监听已注册：agent/turn-stopping 恰好一个监听器',
+    s3Ts.length === 1 && typeof s3Ts[0] === 'function', `count=${s3Ts.length}`)
+  const s3Text = () => String(s3Agent.steers[s3Agent.steers.length - 1]?.content?.[0]?.text ?? '')
+  // ① 包装动词调用（观察者钩子=注册序 [0]）→ 收尾必打表，wrapper=1
+  await s3Post[0]({ name: 'code_find', arguments: { query: 'usageSection' }, agent: s3Agent, signal: sig() }, { content: [{ type: 'text', text: 'ok' }], isError: false }, nextPost)
+  await s3Ts[0]({ agent: s3Agent, turn: 1, signal: sig() })
+  record('S3 包装动词进桶：第一张表 steer 出去，wrapper 行=1，且消息是合法 UserMessage',
+    s3Agent.steers.length === 1 && /\| 结构层·包装动词（code_find \/ code_callers \/ code_index） \| 1 \|/.test(s3Text()) &&
+      s3Agent.steers[0]?.role === 'user' && s3Agent.steers[0]?.source?.kind === 'plugin' && Boolean(s3Agent.steers[0]?.id),
+    s3Text().split('\n').filter((l) => l.startsWith('|')).slice(0, 4).join(' ⏎ ').slice(0, 220))
+  // ② 门闩 A：没有新活动 → 不重复打表
+  await s3Ts[0]({ agent: s3Agent, turn: 2, signal: sig() })
+  record('S3 门闩 A：回合零新活动 ⇒ 零 steer（纯聊天回合不打扰）',
+    s3Agent.steers.length === 1, `steers=${s3Agent.steers.length}`)
+  // ③ 一次符号 grep 走完宿主瀑布（[0] 记账 → [1] 替换）：literal 与 intervene 同时 +1
+  await s3Post[0](grepExec(s3Agent, 'usageSection'), { content: [{ type: 'text', text: 'raw' }], isError: false }, nextPost)
+  await s3Post[1](grepExec(s3Agent, 'usageSection'), { content: [{ type: 'text', text: 'raw' }], isError: false }, nextPost)
+  await s3Ts[0]({ agent: s3Agent, turn: 3, signal: sig() })
+  record('S3 替换既进干预也进字面量：第二张表 intervene=1 且 literal=1（会话累计口径）',
+    s3Agent.steers.length === 2 && /\| 插件干预（grep 替换 · 符号拒绝） \| 1 \|/.test(s3Text()) && /\| 字面量层（grep \/ glob \/ read） \| 1 \|/.test(s3Text()),
+    s3Text().split('\n').filter((l) => l.startsWith('|')).slice(2, 4).join(' ⏎ ').slice(0, 200) || '(没有表行)')
+  // ④ 代理长尾进桶
+  await s3Post[0]({ name: 'mcp__cbm__mcp', arguments: { tool: 'cbm_get_code_snippet' }, agent: s3Agent, signal: sig() }, { content: [{ type: 'text', text: '{}' }], isError: false }, nextPost)
+  await s3Ts[0]({ agent: s3Agent, turn: 4, signal: sig() })
+  record('S3 mcp__cbm__* 进代理桶：第三张表 proxy=1，且 wrapper 累计仍是 1（不清零）',
+    s3Agent.steers.length === 3 && /\| 结构层·mcp 代理（mcp__cbm__\* 长尾） \| 1 \|/.test(s3Text()) && /\| 结构层·包装动词（code_find \/ code_callers \/ code_index） \| 1 \|/.test(s3Text()),
+    s3Text().split('\n').filter((l) => l.startsWith('|')).slice(1, 3).join(' ⏎ ').slice(0, 200) || '(没有表行)')
+  // ⑤ 没建过台账的会话（纯聊天）：不 steer、也不许因缺行报错
+  const s3Chat = { ...fakeAgent(`sess-${process.pid}-s3-chat`, REPO), steers: [], steer(msg) { this.steers.push(msg) } }
+  await s3Ts[0]({ agent: s3Chat, turn: 1, signal: sig() })
+  record('S3 纯聊天会话零打扰：没有台账行就没有表',
+    s3Chat.steers.length === 0, `steers=${s3Chat.steers.length}`)
+  // ⑥ sessionReport 关掉：计数照走，表不打
+  const s3off = await mount({ enforce: 'replace', dirtyTracking: false, sessionReport: false, stats: mkVolRef('') }, makeStubProxy([], { project: `stub-${process.pid}-s3off` }))
+  const s3offAgent = { ...fakeAgent(`sess-${process.pid}-s3off`, REPO), steers: [], steer(msg) { this.steers.push(msg) } }
+  await (s3off.events['tools/post-execute'] ?? [])[0]({ name: 'code_find', arguments: { query: 'usageSection' }, agent: s3offAgent, signal: sig() }, { content: [{ type: 'text', text: 'ok' }], isError: false }, nextPost)
+  await (s3off.events['agent/turn-stopping'] ?? [])[0]({ agent: s3offAgent, turn: 1, signal: sig() })
+  record('S3 开关兑现：sessionReport=false ⇒ 有活动也不 steer（计数进程内照记）',
+    s3offAgent.steers.length === 0, `steers=${s3offAgent.steers.length}`)
+  // ⑦ 宿主太旧没有 steer：静默通过，不影响收尾
+  const s3NoSteer = await mount({ enforce: 'replace', dirtyTracking: false, stats: mkVolRef('') }, makeStubProxy([], { project: `stub-${process.pid}-s3ns` }))
+  const s3nsAgent = fakeAgent(`sess-${process.pid}-s3ns`, REPO) // 没有 steer 函数
+  await (s3NoSteer.events['tools/post-execute'] ?? [])[0]({ name: 'code_find', arguments: { query: 'usageSection' }, agent: s3nsAgent, signal: sig() }, { content: [{ type: 'text', text: 'ok' }], isError: false }, nextPost)
+  let s3nsErr = ''
+  try { await (s3NoSteer.events['agent/turn-stopping'] ?? [])[0]({ agent: s3nsAgent, turn: 1, signal: sig() }) } catch (e) { s3nsErr = String(e?.message ?? e) }
+  record('S3 旧宿主防御：agent 没有 steer() 时不抛错、静默跳过', !s3nsErr, s3nsErr || 'ok')
 
   // ── 臂 T：v0.9.0 新上设置页三字段的**热翻契约**——监听器常驻、字段在决策点现读。
   // 这是"页面不说谎"的机器证明：翻引用不重挂载，行为当场跟着变。
@@ -1312,18 +1372,8 @@ async function verify(profile) {
     rmSync(killFileU, { force: true })
   }
 
-  // U4：计数读侧 lift——别的实例写了更大值，本实例报表读之前先捞回来
-  const countsU = join(tmpdir(), `cbm-counts-${process.pid}-u.json`)
-  rmSync(countsU, { force: true })
-  writeFileSync(countsU, JSON.stringify({ 'lift-probe-key': 1 }), 'utf8')
-  try {
-    const u4 = await mount({ telemetry: true }, null, null, countsU) // 播种 1
-    await u4.tools.get('code_setup').execute({}, withSignal(REPO))
-    writeFileSync(countsU, JSON.stringify({ 'lift-probe-key': 4242 }), 'utf8') // 外部实例抬到 4242
-    const u4b = await u4.tools.get('code_setup').execute({}, withSignal(REPO))
-    record('U 计数读侧 lift：外部写的大值在 code_setup 报表可见（「跨重启累计」读侧兑现）',
-      /lift-probe-key=4242/.test(u4b), /遥测计数.*$/m.exec(u4b)?.[0]?.slice(0, 160) ?? '(没有计数行)')
-  } finally { rmSync(countsU, { force: true }) }
+  // U4（计数读侧 lift）已随 v0.19.0 删除：跨重启累计不复存在，反回归锁在臂 S2。
+
 
   // U5：telemetry 日志行带发出进程 pid（多宿主并跑才能对账归因）
   const u5Dir = join(tmpdir(), `cbm-u5-${process.pid}-${profile}`)
