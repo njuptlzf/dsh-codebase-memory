@@ -355,12 +355,14 @@ for (const [label, statsVal] of [['坏 JSON', '{坏'], ['空串', ''], ['undefin
 
 /* ---- 7. 仓库索引状态 + 最近替换效果 + 日志与环形上限（v0.14.0 新段落）---- */
 console.log('\n[仓库 / 效果 / 日志]')
-// 无 stats：两个新段落都要有各自的空态
+// 无 stats：v0.19.2 起两段空态整块隐藏（hint+灰字空段像坏掉的版面），只在有数据时出现
 storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true }, base: {}, user: {}, writable: true, revision: 20 }
 tree = panel.component({ ...props })
 const textsNoStats = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
-ok(textsNoStats.includes('sec.repos.empty') && textsNoStats.includes('sec.effect.empty'),
-  '无 stats ⇒ 仓库表与最近效果都出各自的空态', textsNoStats.filter((t) => t.startsWith('sec.')).join('|'))
+ok(!textsNoStats.includes('sec.repos') && !textsNoStats.includes('sec.effect') &&
+  !textsNoStats.includes('sec.repos.empty') && !textsNoStats.includes('sec.effect.empty'),
+  '无 stats ⇒ 仓库表与最近效果两段整块缺席（空态不占版面）', textsNoStats.filter((t) => t.startsWith('sec.')).join('|'))
+ok(!textsNoStats.includes('sec.filter'), '无仓库 ⇒ 筛选器也不在场')
 ok(textsNoStats.includes('sec.log'), '「日志与环形上限」段常驻')
 ok(textsNoStats.includes('logRetentionDays.label') && textsNoStats.includes('recentLimit.label'),
   '两个新输入框的标签在场')
