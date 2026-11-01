@@ -125,8 +125,8 @@ export const Config = z.object({
   staleWarnMinIntervalSec: z.number().default(60).volatile(),
   // v0.18.0 O2 查询时自愈（2026-10-27 拍板：git 仓 O2+默认开+非 git 不纳入）：
   // 结构查询命中「未索引」时替用户建一次。当时的授权规则（缺索引须点头）立的
-  // 原是 430MB 制品下载 + .zvec-grep 落仓两个顾虑；cbm 首建=本地引擎、产物在机器
-  // 级目录不落仓——顾虑不成立，用户据此点头默认开。每个 cwd 只试一次（成败都不
+  // 原是外部制品下载 + 索引产物落仓两个顾虑；cbm 首建=本地引擎、产物在机器级
+  // 目录不落仓——顾虑不成立，用户据此点头默认开。每个 cwd 只试一次（成败都不
   // 再打扰）；非 git 工作区不碰（digest 闸门，与补偿刷新同一判据）。页面可关。
   autoSelfHeal: z.boolean().default(true).volatile(),
   telemetry: z.boolean().default(true).volatile(),
@@ -2170,8 +2170,6 @@ export async function apply(ctx, config) {
           }
           if (texts.length) { source = 'graph'; text = texts.join('\n') }
         }
-        // v0.15.0 M4'：语义层从来、现在都不进替换钩子。v0.17.0 删 zg 后本钩子的
-        // 唯一来源就是图谱；对向量检索最差输入的讨论见 commit 96f2c44 前的历史。
         if (!text) {
           // 失败按**腿**归因（M3）。全被脏过滤掉是第三种情况：有答案、但坐标都不可信
           // ⇒ 记 pass-dirty（语义是"有命中但不该换"），不是 no-hit。
