@@ -130,11 +130,6 @@ export const Config = z.object({
   // 再打扰）；非 git 工作区不碰（digest 闸门，与补偿刷新同一判据）。页面可关。
   autoSelfHeal: z.boolean().default(true).volatile(),
   telemetry: z.boolean().default(true).volatile(),
-  // v0.19.0 会话收尾报数表（2026-10-28 拍板：跨重启累计没意义，只要会话内实时）。
-  // 开：每轮 turn-stopping 检查本会话计数，**自上一张表以来有新活动**才 steer 一条
-  // 转录指令（数字由插件算好写死在指令里，模型只转录、不自计——自计就有美化空间）。
-  // 纯聊天回合零 steer、零开销。关：不打表；会话计数照记（本来就在内存里）。
-  sessionReport: z.boolean().default(true).volatile(),
   // stats 是**插件→设置页**的读数通道，不是用户配置：pushStats 把计数推进这个引用，
   // 宿主 describe() 用 plainConfig 读同一引用（dsh-settings/lib/index.js:98,436），
   // 浏览器收到转发的 settings/document-updated 后重读。写成 JSON 字符串是为了让
@@ -248,14 +243,12 @@ function normalize(config = {}) {
   positiveInt('interceptBudgetMs', live(config.interceptBudgetMs), 0, cfg.notes)
   positiveInt('graphBudgetMs', live(config.graphBudgetMs), 0, cfg.notes)
   boolOf(live(config.telemetry), true, cfg.notes, 'telemetry')
-  boolOf(live(config.sessionReport), true, cfg.notes, 'sessionReport')
   boolOf(live(config.contextHint), true, cfg.notes, 'contextHint')
   boolOf(live(config.dirtyTracking), true, cfg.notes, 'dirtyTracking')
   defineLive(cfg, 'enforce', () => (ENFORCE_MODES.includes(live(config.enforce)) ? live(config.enforce) : 'off'))
   defineLive(cfg, 'interceptBudgetMs', () => positiveInt('interceptBudgetMs', live(config.interceptBudgetMs), 0, []))
   defineLive(cfg, 'graphBudgetMs', () => positiveInt('graphBudgetMs', live(config.graphBudgetMs), 0, []))
   defineLive(cfg, 'telemetry', () => boolOf(live(config.telemetry), true, [], 'telemetry'))
-  defineLive(cfg, 'sessionReport', () => boolOf(live(config.sessionReport), true, [], 'sessionReport'))
   // v0.9.0：这三个也上了设置页 ⇒ 同一纪律。interceptTools 是决策点现读的名单
   // （csv 对任何字符串都成立，非法只可能是"写错工具名"，那本来就是空名单语义）。
   defineLive(cfg, 'interceptTools', () => csv(live(config.interceptTools) || 'grep,glob'))
@@ -1135,54 +1128,16 @@ export function coversWorkspace(args, cwd) {
 /** 会话键：优先 session id（resume/多标签下 cwd 可能相同），退回 cwd。 */
 const sessionKey = (agent) => agent?.session?.header?.id ?? agent?.session?.header?.cwd ?? ''
 
-/** 每会话状态：project 缓存、脏路径、已拦过的符号（同符号只拦一次）、会话内报数四桶。 */
+/** 每会话状态：project 缓存、脏路径、已拦过的符号（同符号只拦一次）。 */
 function sessionOf(state, key) {
   let s = state.sessions.get(key)
   if (!s) {
-    // tally：会话内实时报数（v0.19.0，跨重启归零是本意——累计文件已删，只留内存）。
-    //   wrapper=包装动词命中 / proxy=cbm_* 代理长尾 / intervene=替换·拒绝 / literal=grep·read。
-    // reportedTally：上一张收尾表打出来的四桶快照，turn-stopping 门闩比它判"有没有新活动"。
     s = {
       project: '', dirty: new Set(), blocked: new Set(), lastRefreshAt: 0, lastWarnAt: 0,
-      tally: { wrapper: 0, proxy: 0, intervene: 0, literal: 0 },
-      reportedTally: null,
     }
     state.sessions.set(key, s)
   }
   return s
-}
-
-/**
- * 收尾报数的桶归属（v0.19.0）：工具名 → 会话计数四桶之一，不相关返回 null。
- * wrapper=注册的三个包装动词；proxy=mcp__cbm__* 代理面（含 mcpScript）；
- * literal=字面量检索（grep/glob/read，外加用户自定义 interceptTools 里的名字）。
- * 插件干预（intervene）不在这判——它发生在 deny/replace 钩子的决策点上，那边直接 bump。
- */
-function tallyBucket(name, cfg) {
-  if (name === 'code_find' || name === 'code_callers' || name === 'code_index') return 'wrapper'
-  if (String(name).startsWith('mcp__cbm__')) return 'proxy'
-  if (name === 'grep' || name === 'glob' || name === 'read' || isGrepLike(name, cfg.interceptTools)) return 'literal'
-  return null
-}
-
-/**
- * 收尾报数表的 steer 指令文本（v0.19.0）：数字**烧死在文本里**，模型只转录——
- * 「模型自计」给了美化空间，这正是 SKILL §收尾 原来钉不住的东西。交叉校验口径
- * 随表下发：日粒度对账翻 telemetry-*.log JSONL，回合粒度以这张表为准。
- */
-function renderSessionReport(t) {
-  return [
-    '[cbm 收尾报数·插件实测] 请把下面这张本会话计数表原样放进本轮最终回复：宿主有 GenUI 时优先转成 ```dsh-ui 的 table 围栏（发前过 validate_dsh_ui），否则用 markdown 表。数字是插件钩子对本会话的实测值：不得改动、不得自计、不得并入其他会话；0 就写 0。',
-    '',
-    '| 通道 | 本会话累计 |',
-    '|---|---|',
-    `| 结构层·包装动词（code_find / code_callers / code_index） | ${t.wrapper} |`,
-    `| 结构层·mcp 代理（mcp__cbm__* 长尾） | ${t.proxy} |`,
-    `| 插件干预（grep 替换 · 符号拒绝） | ${t.intervene} |`,
-    `| 字面量层（grep / glob / read） | ${t.literal} |`,
-    '',
-    '表下补一行口径说明：「以上为 dsh-codebase-memory 插件钩子实测（仅本会话，重启归零），非模型自报」。若字面量层明显高于结构层且本轮含符号问题，表后必须给一句原因（新会话未 code_index / 图无该符号 / 纯字面量任务）。',
-  ].join('\n')
 }
 
 /** 时间预算：超时返回 null，钩子里绝不因为查询把工具调用卡死。 */
@@ -1722,10 +1677,6 @@ function observeCall(ctx, cfg, state, exec, result) {
   if (!key || !cwd) return
   const sess = sessionOf(state, key)
   const name = String(exec?.name ?? '').toLowerCase()
-  // v0.19.0 收尾报数：每次工具调用按通道进会话桶（失败也算——模型确实用过这条通道，
-  // 表要反映尝试而不只是成功；被拒的 grep 同时进 literal 与 intervene 两行，属预期）。
-  const bucket = tallyBucket(name, cfg)
-  if (bucket) sess.tally[bucket] += 1
   if (cfg.dirtyTracking && WRITE_TOOLS.includes(name) && !result?.isError) {
     const raw = exec?.arguments?.file_path
     if (typeof raw === 'string' && raw) {
@@ -1775,9 +1726,9 @@ export async function apply(ctx, config) {
     adapterFresh: null, // 进程轴（v0.12.0）：{verdict,at,manifestMs,pids,newestStartMs}，30s 缓存
   }
   // v0.19.0：计数只有进程内一份（重启归零是本意，2026-10-28 拍板「跨重启累计没
-  // 意义」）。旧的 telemetry.counts.json 播种/max 合并/lift 三件套整块删除——
-  // 会话轴的实时数走 sessionOf().tally + turn-stopping 收尾表，日粒度对账走
-  // telemetry-*.log JSONL，都不需要一个第三份落盘副本。
+  // 意义」）。旧的 telemetry.counts.json 播种/max 合并/lift 三件套整块删除；
+  // v0.20.0 起对话里的收尾报数表与配套会话 tally 也退役（回合边界打表的噪声
+  // 大过价值）。日粒度对账走 telemetry-*.log JSONL，不需要第三份落盘副本。
 
   const ac = new AbortController()
   state.abortSignal = ac.signal
@@ -2129,7 +2080,6 @@ export async function apply(ctx, config) {
           return next()
         }
         sess.blocked.add(q.symbol)
-        sess.tally.intervene += 1 // 收尾表·干预桶（v0.19.0）：真实拒绝一次
         telemetry(cfg, state, 'intercept-deny', { session: key, cwd, symbol: q.symbol, enforce: cfg.enforce })
         repoBump(state, cwd, 'intercept-deny')
         pushRecent(state, { ts: Date.now(), cwd, project, symbol: q.symbol, source: 'graph', outcome: 'denied', snippet: snippet(hits.text) })
@@ -2233,7 +2183,6 @@ export async function apply(ctx, config) {
             ? { kind: 'accept', content: [{ type: 'text', text: renderPassthroughMark(q.symbol, ev, cwd) + resultText(result) }] }
             : next() // 索引本来没答案 ⇒ grep 才是对的工具
         }
-        sess.tally.intervene += 1 // 收尾表·干预桶（v0.19.0）：真实替换一次（pass-* 不算干预）
         telemetry(cfg, state, 'intercept-replace', { session: key, cwd, project, symbol: q.symbol, source, ...(dropped ? { dropped } : {}) })
         repoBump(state, cwd, 'intercept-replace')
         pushRecent(state, { ts: Date.now(), cwd, project, symbol: q.symbol, source, outcome: 'replaced-graph', snippet: snippet(text) })
@@ -2242,38 +2191,6 @@ export async function apply(ctx, config) {
         telemetry(cfg, state, 'replace-error', { message: String(error?.message ?? error).slice(0, 200) })
       }
       return next() // fail-open：拿不准就保留原始 grep 输出
-    })
-  }
-
-  // ── 收尾报数表（v0.19.0，2026-10-28 拍板）：agent/turn-stopping 是宿主每轮回复
-  // 收尾、边界提交前**串行 await**的事件；会话没有"最后一轮"事件（agent/disposed
-  // 时模型已无响应义务、steer 不动它），所以"会话内实时表"只能在回合边界打。
-  // 门闩（频率方案 A）：本轮自上一张表以来有新活动才 steer——纯聊天回合零 steer
-  // 零开销；steer 触发的转录步本身不产生新桶活动，表不会连环打。
-  // steer 消息手搓（契约 dsh-llm UserMessage：id/role/content/source，source 的
-  // kind 是开放命名空间，插件自取 'dsh-codebase-memory'）——不 import dsh-llm。
-  if (typeof ctx.on === 'function') {
-    ctx.on('agent/turn-stopping', async (payload) => {
-      try {
-        if (!cfg.sessionReport) return
-        const agent = payload?.agent
-        if (typeof agent?.steer !== 'function') return // 宿主太旧没有 steer：静默，不报错打扰收尾
-        const key = sessionKey(agent)
-        if (!key) return
-        const sess = state.sessions.get(key) // 已存在的台账才可能打表：纯聊天会话不建行
-        if (!sess) return
-        const t = sess.tally
-        const r = sess.reportedTally
-        if (r && r.wrapper === t.wrapper && r.proxy === t.proxy && r.intervene === t.intervene && r.literal === t.literal) return
-        sess.reportedTally = { ...t }
-        bumpCount(cfg, state, 'session-report')
-        agent.steer({
-          id: randomUUID(),
-          role: 'user',
-          content: [{ type: 'text', text: renderSessionReport(t) }],
-          source: { kind: 'plugin', plugin: 'dsh-codebase-memory' },
-        })
-      } catch { /* 收尾表绝不影响回合提交——这是 turn-stopping 唯一的 fail-silent 义务 */ }
     })
   }
 

@@ -123,20 +123,6 @@ Use when the user wants code-graph understanding before deciding whether to chan
    - If the user only wanted understanding, stop.
    - If they want a different trace, loop back to step 1 with the new target.
 
-## 收尾：分层报数表（v0.19.0——插件实测，模型只转录）
-
-v0.19.0 起数字的来源换了：本轮用过 cbm 通道（包装动词 / 代理长尾 / 被替换或被拒绝的 grep / 字面量检索）后，插件的 `agent/turn-stopping` 监听器会向对话 steer 一条 `[cbm 收尾报数·插件实测]` 消息，内含四行会话累计计数表（结构层·包装动词 / 结构层·mcp 代理 / 插件干预 / 字面量层）。
-
-收到这条 steer 时，本轮最终回复必须把表放进回复里：
-
-- 宿主有 GenUI 时优先转成 ```dsh-ui 的 table 围栏（发前过 validate_dsh_ui）；无 GenUI 或校验不过就原样用 markdown 表。
-- 数字不得改动、不得自计、不得并入其他会话；0 就写 0（写 0 恰恰是复盘信号）。
-- 若表中字面量层显著高于结构层且本任务含符号问题，表后必须补一句原因（新会话未 code_index / 图无该符号 / 纯字面量任务），否则视为漏走索引。
-
-若本轮没有收到 steer（`sessionReport` 关、插件没装、纯聊天回合），而本 skill 激活且确实用过 cbm 通道：按老口径自计一张回退表（包装动词 / mcp 代理 / grep·read 三行），并在表下注明「模型自报」。
-
-交叉校验口径：表内数字 = 插件钩子实测（仅本会话，重启归零），非模型自报。要核对全天或分仓库明细，看插件 `telemetry-*.log`（JSONL）或用 `code_setup` 打进程内累计报表——设置页自 v0.19.0 起没有读数卡。
-
 ## Optional global investigate
 
 If the host has a richer global `investigate` skill and the user wants that workflow:

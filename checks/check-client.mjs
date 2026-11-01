@@ -156,7 +156,6 @@ ok(!!dictEntry && dictEntry.ns === panel?.locale, 'locale 字典的 NS 与 regis
 for (const lang of ['zh', 'en']) ok(!!dictEntry?.dict?.[lang], `字典有 ${lang}`)
 const keys = Object.keys(dictEntry?.dict?.zh || {})
 for (const key of ['title', 'summary', 'loading', 'unavailable', 'enforce.label', 'telemetry.label', 'resetField', 'saveFailed', 'foot',
-  'report.label', 'report.hint',
   'selfHeal.label', 'selfHeal.hint',
   'hint.label', 'hint.hint', 'dirty.label', 'dirty.hint', 'interceptBudgetMs.label', 'interceptBudgetMs.hint',
   'interceptTools.label', 'interceptTools.hint',
@@ -167,13 +166,15 @@ for (const key of ['title', 'summary', 'loading', 'unavailable', 'enforce.label'
 }
 for (const key of ['hint.label', 'dirty.label', 'interceptBudgetMs.label', 'interceptTools.label', 'resetField',
   'sec.soft', 'sec.hard', 'sec.layers', 'sec.aux', 'sec.params',
-  'selfHeal.label', 'report.label', 'report.hint',
+  'selfHeal.label',
   'layer.graph', 'layer.adapter.stale', 'layer.adapter.noproc']) {
   ok(Object.keys(dictEntry?.dict?.en || {}).includes(key), `en 字典有 key ${key}`)
 }
-// v0.19.0：全量读数卡整块撤下（会话内计数改为对话里的收尾报数表）。stats.* 字典键
-// 若回潮 = 有人又把卡片代码粘回来了，这条锁先炸。
+// v0.19.0：全量读数卡整块撤下；v0.20.0 起对话里的收尾报数表也退役（计数只剩
+// telemetry-*.log 与 code_setup 报表）。stats.* / report.* 字典键若回潮 = 有人
+// 又把旧块粘回来了，这两条锁先炸。
 ok(!keys.some((k) => k.startsWith('stats.')), 'stats.* 读数卡字典键不得回潮（v0.19.0 卡片已删）', keys.filter((k) => k.startsWith('stats.')).join('|'))
+ok(!keys.some((k) => k.startsWith('report.')), 'report.* 收尾报数字典键不得回潮（v0.20.0 收尾表已删）', keys.filter((k) => k.startsWith('report.')).join('|'))
 // v0.17.0：语义层整体移除——zg 字典键若回潮（复制粘贴旧块），下面这条锁先炸。
 ok(!keys.some((k) => k.startsWith('layer.zg') || k.startsWith('zg.')), 'zg.* / layer.zg.* 字典键不得回潮', keys.filter((k) => k.startsWith('layer.zg') || k.startsWith('zg.')).join('|'))
 ok(!keys.includes('reset'), '没有裸「恢复默认」key——每个字段的恢复按钮必须叫「恢复此项」', keys.filter((k) => k.startsWith('reset')).join('|'))
@@ -206,7 +207,7 @@ ok(JSON.stringify(segValues) === JSON.stringify(modes), '分段控件的选项 =
 ok(seg?.props?.value === 'deny-once', '分段控件当前值取自主机快照', seg?.props?.value)
 ok(seg?.props?.disabled === false, 'writable 时控件可用')
 const switches = flatten(tree).filter((n) => n.type === primitives.Switch)
-ok(switches.length === 6, '渲染出 6 个 Switch（contextHint / markPassthrough / dirtyTracking / autoSelfHeal / telemetry / report——按层排布）', String(switches.length))
+ok(switches.length === 5, '渲染出 5 个 Switch（contextHint / markPassthrough / dirtyTracking / autoSelfHeal / telemetry——按层排布；v0.20.0 收尾表开关已删）', String(switches.length))
 const texts185 = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
 ok(['sec.soft', 'sec.hard', 'sec.layers', 'sec.aux', 'sec.params'].every((k) => texts185.includes(k)),
   '五个分层标题按序在场（软引导→硬拦截→图谱层→记账遥测→参数）', texts185.filter((t) => t.startsWith('sec.')).join('|'))
@@ -216,9 +217,6 @@ ok(switches[4]?.props?.checked === true, 'telemetry=true → checked', String(sw
 ok(switches[0]?.props?.checked === true && switches[2]?.props?.checked === true,
   'contextHint / dirtyTracking 缺省即开（!== false 判定）', `${switches[0]?.props?.checked}|${switches[2]?.props?.checked}`)
 ok(switches[3]?.props?.checked === true, 'autoSelfHeal 缺省即开（fixture 未写该字段，!== false 判定为开）', String(switches[3]?.props?.checked))
-ok(switches[5]?.props?.checked === true, 'sessionReport 缺省即开（收尾报数默认打表；fixture 未写该字段）', String(switches[5]?.props?.checked))
-ok(flatten(tree).some((n) => n.type === 'span' && n.props?.children === 'report.label'),
-  '收尾报数开关行标签在场（switchRow 自铺 span）')
 ok(flatten(tree).some((n) => n.type === 'span' && n.props?.children === 'telemetry.label'),
   '开关标签与控件同行（span 自铺，不依赖 Switch 的 label prop 渲染）')
 
@@ -339,7 +337,7 @@ storeSnapshot = { status: 'ready', value: { enforce: 'replace', telemetry: true,
 tree = panel.component({ ...props })
 {
   const texts = flatten(tree).map((n) => (typeof n.props?.children === 'string' ? n.props.children : '')).filter(Boolean)
-  // 会话累计数现在只活在对话里的收尾报数表；页面即使收到全量 stats 载荷，
+  // 会话累计数 v0.20.0 也退役了（收尾表删除）；页面即使收到全量 stats 载荷，
   // 也只该消费 adapter（图谱行）/repos（仓库表）/recent（效果区）三块。
   ok(!texts.some((t) => String(t).startsWith('stats.')), 'stats 载荷在场也不渲染任何读数卡（stats.* 文案 0 命中）', texts.filter((t) => t.startsWith('stats.')).join('|').slice(0, 120))
   ok(!texts.includes('80%') && !texts.includes('8/10'), '旧命中率/替换比大数字不得回潮', texts.filter((t) => /^\d+%$|^\d+\/\d+$/.test(t)).join('|'))

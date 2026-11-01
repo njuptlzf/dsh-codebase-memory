@@ -19,7 +19,7 @@
  *     deny-once 只拦一次、前提不满足/超预算一律 fail-open、
  *     写后记账与坐标过期改放行、按 query 条件注入。走假代理工具，不依赖真引擎。
  *   R2/R3/S2 泡数据完整性（v0.8.2，两个遥测里抓到的真 bug 的回归锁）：越界 grep
- *     不替换、底层错误文本不算命中（失败与无命中分开计数）、v0.19.0 起计数只在进程内（臂 S2 反证累计文件不再生成、S3 验收尾报数表）。
+ *     不替换、底层错误文本不算命中（失败与无命中分开计数）、v0.19.0 起计数只在进程内（臂 S2 反证累计文件不再生成；对话内收尾报数表 v0.20.0 已删）。
  *   W 冷启动契约（v0.10.1）：bootstrap 会话外预热恰好一发；projectFor 查不到时
  *     错误消息区分"不在表里/查询失败"并带出代理原文。
  *   V 适配层版本对账（v0.13.0）：实装 ≠ 钉 ⇒ 自动重装并带 note + adapter-upgrade
@@ -716,9 +716,8 @@ async function verify(profile) {
   // v0.15.0 增补 graphBudgetMs；v0.14.0 增补 logRetentionDays /
   // recentLimit / markPassthrough——它们在 Config 里都标了 volatile（页面可写、
   // 决策点现读），名单漏了就会让"标错等于对 UI 撒谎"这条断言失去意义。
-  // v0.19.0 增补 sessionReport（收尾报数开关：页面可写、turn-stopping 监听器现读）。
   const VOLATILE_KEYS = ['enforce', 'interceptTools', 'interceptBudgetMs', 'contextHint', 'telemetry', 'dirtyTracking', 'stats',
-    'logRetentionDays', 'recentLimit', 'markPassthrough', 'graphBudgetMs', 'staleWarnFiles', 'staleWarnMinIntervalSec', 'autoSelfHeal', 'sessionReport']
+    'logRetentionDays', 'recentLimit', 'markPassthrough', 'graphBudgetMs', 'staleWarnFiles', 'staleWarnMinIntervalSec', 'autoSelfHeal']
   // schemastery 的字段表在 `Config.dict`（宿主 dsh-settings 的 volatileForm 也是递归它）。
   const marked = VOLATILE_KEYS.filter((k) => Config?.dict?.[k]?.meta?.volatile === true)
   record('G 即时热改字段 + 观测字段 + 读数通道在 Config 里标了 volatile（宿主才肯 serve/写）', marked.length === VOLATILE_KEYS.length, `标了的是 ${marked.join(',') || '(无)'}`)
@@ -987,61 +986,6 @@ async function verify(profile) {
   record('S2 报表口径改口：进程内累计·重启归零，且不再出现「跨重启」字样',
     /遥测计数\(进程内累计·重启归零\)/.test(s2Setup) && !/跨重启/.test(s2Setup),
     /遥测计数.*$/m.exec(s2Setup)?.[0]?.slice(0, 160) ?? '(没有计数行)')
-
-  // ── 臂 S3：v0.19.0 收尾报数表（turn-stopping → steer）：会话四桶实测、门闩 A、
-  //    sessionReport 热关、纯聊天会话零打扰。数字来自插件钩子，模型只转录。
-  const s3Ref = mkVolRef('')
-  const s3 = await mount({ enforce: 'replace', dirtyTracking: false, stats: s3Ref }, makeStubProxy([], { project: `stub-${process.pid}-s3` }))
-  await s3.tools.get('code_setup').execute({}, withSignal(REPO)) // 链路点亮：interceptPremises 要 state.ok，替换钩子才有决策可做
-  const s3Agent = { ...fakeAgent(`sess-${process.pid}-s3`, REPO), steers: [], steer(msg) { this.steers.push(msg) } }
-  const s3Post = s3.events['tools/post-execute'] ?? []
-  const s3Ts = s3.events['agent/turn-stopping'] ?? []
-  record('S3 监听已注册：agent/turn-stopping 恰好一个监听器',
-    s3Ts.length === 1 && typeof s3Ts[0] === 'function', `count=${s3Ts.length}`)
-  const s3Text = () => String(s3Agent.steers[s3Agent.steers.length - 1]?.content?.[0]?.text ?? '')
-  // ① 包装动词调用（观察者钩子=注册序 [0]）→ 收尾必打表，wrapper=1
-  await s3Post[0]({ name: 'code_find', arguments: { query: 'usageSection' }, agent: s3Agent, signal: sig() }, { content: [{ type: 'text', text: 'ok' }], isError: false }, nextPost)
-  await s3Ts[0]({ agent: s3Agent, turn: 1, signal: sig() })
-  record('S3 包装动词进桶：第一张表 steer 出去，wrapper 行=1，且消息是合法 UserMessage',
-    s3Agent.steers.length === 1 && /\| 结构层·包装动词（code_find \/ code_callers \/ code_index） \| 1 \|/.test(s3Text()) &&
-      s3Agent.steers[0]?.role === 'user' && s3Agent.steers[0]?.source?.kind === 'plugin' && Boolean(s3Agent.steers[0]?.id),
-    s3Text().split('\n').filter((l) => l.startsWith('|')).slice(0, 4).join(' ⏎ ').slice(0, 220))
-  // ② 门闩 A：没有新活动 → 不重复打表
-  await s3Ts[0]({ agent: s3Agent, turn: 2, signal: sig() })
-  record('S3 门闩 A：回合零新活动 ⇒ 零 steer（纯聊天回合不打扰）',
-    s3Agent.steers.length === 1, `steers=${s3Agent.steers.length}`)
-  // ③ 一次符号 grep 走完宿主瀑布（[0] 记账 → [1] 替换）：literal 与 intervene 同时 +1
-  await s3Post[0](grepExec(s3Agent, 'usageSection'), { content: [{ type: 'text', text: 'raw' }], isError: false }, nextPost)
-  await s3Post[1](grepExec(s3Agent, 'usageSection'), { content: [{ type: 'text', text: 'raw' }], isError: false }, nextPost)
-  await s3Ts[0]({ agent: s3Agent, turn: 3, signal: sig() })
-  record('S3 替换既进干预也进字面量：第二张表 intervene=1 且 literal=1（会话累计口径）',
-    s3Agent.steers.length === 2 && /\| 插件干预（grep 替换 · 符号拒绝） \| 1 \|/.test(s3Text()) && /\| 字面量层（grep \/ glob \/ read） \| 1 \|/.test(s3Text()),
-    s3Text().split('\n').filter((l) => l.startsWith('|')).slice(2, 4).join(' ⏎ ').slice(0, 200) || '(没有表行)')
-  // ④ 代理长尾进桶
-  await s3Post[0]({ name: 'mcp__cbm__mcp', arguments: { tool: 'cbm_get_code_snippet' }, agent: s3Agent, signal: sig() }, { content: [{ type: 'text', text: '{}' }], isError: false }, nextPost)
-  await s3Ts[0]({ agent: s3Agent, turn: 4, signal: sig() })
-  record('S3 mcp__cbm__* 进代理桶：第三张表 proxy=1，且 wrapper 累计仍是 1（不清零）',
-    s3Agent.steers.length === 3 && /\| 结构层·mcp 代理（mcp__cbm__\* 长尾） \| 1 \|/.test(s3Text()) && /\| 结构层·包装动词（code_find \/ code_callers \/ code_index） \| 1 \|/.test(s3Text()),
-    s3Text().split('\n').filter((l) => l.startsWith('|')).slice(1, 3).join(' ⏎ ').slice(0, 200) || '(没有表行)')
-  // ⑤ 没建过台账的会话（纯聊天）：不 steer、也不许因缺行报错
-  const s3Chat = { ...fakeAgent(`sess-${process.pid}-s3-chat`, REPO), steers: [], steer(msg) { this.steers.push(msg) } }
-  await s3Ts[0]({ agent: s3Chat, turn: 1, signal: sig() })
-  record('S3 纯聊天会话零打扰：没有台账行就没有表',
-    s3Chat.steers.length === 0, `steers=${s3Chat.steers.length}`)
-  // ⑥ sessionReport 关掉：计数照走，表不打
-  const s3off = await mount({ enforce: 'replace', dirtyTracking: false, sessionReport: false, stats: mkVolRef('') }, makeStubProxy([], { project: `stub-${process.pid}-s3off` }))
-  const s3offAgent = { ...fakeAgent(`sess-${process.pid}-s3off`, REPO), steers: [], steer(msg) { this.steers.push(msg) } }
-  await (s3off.events['tools/post-execute'] ?? [])[0]({ name: 'code_find', arguments: { query: 'usageSection' }, agent: s3offAgent, signal: sig() }, { content: [{ type: 'text', text: 'ok' }], isError: false }, nextPost)
-  await (s3off.events['agent/turn-stopping'] ?? [])[0]({ agent: s3offAgent, turn: 1, signal: sig() })
-  record('S3 开关兑现：sessionReport=false ⇒ 有活动也不 steer（计数进程内照记）',
-    s3offAgent.steers.length === 0, `steers=${s3offAgent.steers.length}`)
-  // ⑦ 宿主太旧没有 steer：静默通过，不影响收尾
-  const s3NoSteer = await mount({ enforce: 'replace', dirtyTracking: false, stats: mkVolRef('') }, makeStubProxy([], { project: `stub-${process.pid}-s3ns` }))
-  const s3nsAgent = fakeAgent(`sess-${process.pid}-s3ns`, REPO) // 没有 steer 函数
-  await (s3NoSteer.events['tools/post-execute'] ?? [])[0]({ name: 'code_find', arguments: { query: 'usageSection' }, agent: s3nsAgent, signal: sig() }, { content: [{ type: 'text', text: 'ok' }], isError: false }, nextPost)
-  let s3nsErr = ''
-  try { await (s3NoSteer.events['agent/turn-stopping'] ?? [])[0]({ agent: s3nsAgent, turn: 1, signal: sig() }) } catch (e) { s3nsErr = String(e?.message ?? e) }
-  record('S3 旧宿主防御：agent 没有 steer() 时不抛错、静默跳过', !s3nsErr, s3nsErr || 'ok')
 
   // ── 臂 T：v0.9.0 新上设置页三字段的**热翻契约**——监听器常驻、字段在决策点现读。
   // 这是"页面不说谎"的机器证明：翻引用不重挂载，行为当场跟着变。
