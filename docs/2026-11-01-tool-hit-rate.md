@@ -2,7 +2,7 @@
 
 - 日期：2026-11-01
 - 版本：dsh-codebase-memory v0.20.1
-- 状态：复盘完成；最小根治集 C+D+F 已实施、全量 174/174 验收，发布为 v0.20.1（bump 并入 fix 提交，未 push/tag）；其余 P0（P0-1/2/4）未实施
+- 状态：复盘完成；最小根治集 C+D+F 已实施并发布 v0.20.1；P0-1（描述）+ P0-2（重写常驻 usageSection）+ P0-4 小调已实施、通过全量套件（181/181）并按 feat 发布 **v0.21.0**（2026-11-02）；P0-3 的 A/E 仍为可选
 
 ## 0. 结论（TL;DR）
 
@@ -12,7 +12,7 @@
    - **注入**（每轮）：只在 `CODE_QUESTION` 命中时注入；"查代码 / 有没有用到 / 看看这个功能"都不命中 → 绝大多数轮次 0 个 cbm 字样。
    - **钩子**（执行时）：只覆盖"符号形" pattern；字面量 grep 不拦——这是对的，但也没有任何"你本来可以用图"的反馈。
 3. 重启后还有一个**文案事故**：hint 的 project 只读会话缓存（`sess.project` / `projectsByCwd`），重启后为空，于是显示 `project=(未索引：先 code_index), 索引新鲜` 和 `第一步：code_index`；而同一时刻钩子里的 `projectFor()` 能解析出 project（本次 `runCbmFlow` 的替换就是证据）。**这是误报，不是真的没索引。**
-4. 改进顺序：先改**描述**（零新增注入成本，直接作用于每次工具选择），再加**常驻短段**（常量、缓存友好），再修 **project 与新鲜度的三态模型**（P0-5，最小根治集 C+D+F），最后才扩门闩 / 加长尾工具。
+4. 改进顺序：先改**描述**（零新增注入成本，直接作用于每次工具选择），再重写**已有常驻段**（usageSection，删劝退句、前置话术场景），再修 **project 与新鲜度的三态模型**（P0-5，最小根治集 C+D+F），最后才扩门闩 / 加长尾工具。
 5. **"未索引"和"索引新鲜"是同一类错误的两处症状**：渲染层在替数据层下结论。根治的判据不是多打补丁，而是结构上不可能把 unknown 渲染成断言——删字段（C）+ 三态不变量与测试（D）+ 有范围的事实措辞（F）。A 是过渡，B/E 是可选项。
 
 ## 1. 来龙去脉
@@ -77,7 +77,9 @@
 
 ### R3 注入是条件式，不是常驻
 
-对照 dsh-mneme：它有两条常驻承载位——`systemPrompt.section` order 150（常量总则）+ `systemPrompt.context` order 90（每轮记忆块），还有 `TOOL_GUIDE` 追加到工具描述。cbm 只有一条**条件式** `context`，且文本每轮变化（project / dirty），既不稳定也不常驻。
+对照 dsh-mneme：它有两条常驻承载位——`systemPrompt.section` order 150（常量总则）+ `systemPrompt.context` order 90（每轮记忆块），还有 `TOOL_GUIDE` 追加到工具描述。cbm 只有一条**条件式** `context`，且文本每轮变化（project / dirty），既不稳定也不常驻。（2026-11-02 更正：cbm 其实一直有常驻 `usageSection`，问题在内容不在有无——见 R3 更正块。）
+
+> **2026-11-02 更正**：本条"cbm 没有常驻承载位"**不成立**。`index.js` 的 `usageSection`（`ctx.systemPrompt.section`，name=codebase-memory，order=850，注册于 index.js:1818）一直每会话在场，且无条件注册。真正的问题不是"没有常驻段"，而是常驻段内容里有两句把模型往 grep 推的话（「字符串、日志、配置值、正则文本仍然用 grep——图索引对它们没用」「md/配置/文档仍用 grep」），并且教的是"怎么用"而不是"何时选"。因此 P0-2 定稿形态改为**重写 usageSection**，不新增一段（新增=同内容双份税）。
 
 ### R4 project 解析误报（重启后）
 
@@ -161,7 +163,9 @@
 
 注意：最后一句"literal strings ... are not in it"是**能力边界**，不是"去用 grep"；把"该用 grep"留到空结果里说（index.js:1952 已经有这句话），让模型在失败时学到，而不是在选择前被劝退。
 
-#### P0-2 加一条常驻短段（常量）
+> **2026-11-02 已实施**：三处描述按上述方向重写。`code_find` / `code_callers` 按 G 臂同尺实测 **1895 字节**（预算 2200；≈474 tokens/请求，对旧 1798 +24）。`code_index` 改为声明"通常不必先调：code_find / code_callers 首用自动建图（git 仓约 2s）"。红线句 `keep using grep for those.` 已从描述中删除，并由 A 臂新断言锁死。
+
+#### P0-2 常驻短段（原案"加一段"，实施时更正为**重写 usageSection**，见 R3 更正与本节定稿注）
 
 - 位置：`systemPrompt.section`，order 125（在变量 hint 130 之前；宿主占 110/115/120）。
 - 文本常量，同会话不变；开关沿用 `contextHint`。
@@ -170,6 +174,8 @@
 > [dsh-codebase-memory] Code questions: prefer the graph. For a named symbol or an implementation question, call code_find first — one call returns qualified name, file, line range and source, and auto-builds the graph on first use. For callers/callees, impact or call chains, call code_callers. Long-tail graph queries (multi-hop, snippet by qualified_name, freshness, architecture, diff, BM25) go through mcp__cbm__mcp with a cbm_* tool and an explicit project.
 
 - 不要在这段里写"字面量用 grep"（用户明确不要；也让描述承担边界）。
+
+> **2026-11-02 定稿修正 + 已实施**：**不新增段**（R3 更正：常驻段 `usageSection` 本来就在场，新增等于同一份内容收两遍税）。改为重写它：删掉「字符串、日志、配置值、正则文本仍然用 grep——图索引对它们没用」与「md/配置/文档仍用 grep」两句；封装动词行从"代替 grep"改成**话术场景**（「X 在哪定义 / X 长什么样 / 谁实现了 Y」「谁调用 X / 改 X 影响哪里」）；补一句「首次用这两个会自动建图（git 仓约 2s），通常不必先调 code_index」。order 保持 850：该段文本随 `state.ok` 在会话中翻转一次（未就绪→就绪），挪到 125 反而扩大一次性的前缀缓存作废面积；草案假设（无常驻段）不成立，"靠前"并无证据改变依从率。实测 1011 字符（A 臂预算 1150）。
 
 #### P0-3 修 project 解析与文案
 
@@ -182,6 +188,8 @@
 #### P0-4 空结果教学
 
 `code_find` 的 empty 文案（index.js:1952）保留"字符串 / 日志 / 配置值本来就该用 grep"——这是**失败时**的教学，比选择前的否定有效。可再加一句"若这是符号，换关键词或直接 code_index"。
+
+> **2026-11-02 核实**：本节**已存在**（现在 index.js:2008，两句教学都在），不立独立任务。本批顺手的小调：空结果在 project 为空时不再渲染「（project=）」的空括号。红线扫描范围=选择面（三描述 + usageSection + hint），失败面（empty 文案）不在红线内、刻意保留。
 
 #### P0-5 根治：project 与新鲜度拆两轴、三态、事件时判定（C+D+F）
 
@@ -301,7 +309,7 @@ flowchart TD
 | 代码类问题 hint 注入率 | 仅结构话术 | ≥90%（弱档） |
 | 重启后首次 code_find 成功率 | 未测（应自愈） | 100%（git 仓） |
 | 每 100 次代码提问 code_find 次数 | ~2 | ≥30 |
-| 常驻成本 | 413 tokens（封装工具） | +~70 tokens（常驻段），可接受 |
+| 常驻成本 | 413 tokens（封装工具 schema）+ usageSection 已在场 | schema 1798→1895B（+24 tokens/请求）；常驻段**零新增**（重写非加段） |
 | 重启后 hint 误报数 | 2（"未索引" + "索引新鲜"） | 0（3 条测试锁死） |
 | 新鲜度断言的证据 | 无（dirty=0 当 fresh） | 仅 verified-fresh 才允许断言 |
 
@@ -311,8 +319,9 @@ flowchart TD
   - 本提交 `fix(v0.20.1): hint can no longer render unknown as known (P0-5 C+D+F)`：`index.js` hint 删 project 字段、`freshnessOf` 三态纯函数 + `digestVerdict` 事件缓存（session start / code_index / selfHeal 落账，code_index 首次补写 stamp）、hint 只拼接三态话术；`checks/check-plugin.mjs` 加 3 条断言（C 不渲染 project、D 三态、F dirty 措辞）并新增 `self-heal-skip` 遥测；README.zh.md 同步；本档入仓。全量 174/174 绿（run2，N4 瞬态红定性为引擎争用）。
   - v0.20.1 仅版本号 + 本文档状态 + .gitignore（`.workbuddy-ai/`），无行为改动。
 - 生效方式：`node scripts/sync.mjs` 同步进 profile → 重启宿主（index.js 在 apply 时加载一次）。
-- 待实施：P0-1/2/4（描述、常驻段、空结果教学）；P0-3 的 A/E 降为可选。
-- 已知风险：常驻段 +70 tokens/请求；门闩扩面可能误注入；描述改动需回归 `checks/check-plugin.mjs` 的 schema 预算（2200 字节）。
+- **2026-11-02 已实施并通过全量套件（181/181，exit 0）**：P0-1 三处工具描述重写（红线句删除；code_find+code_callers 按 G 臂同尺实测 1895B ≤ 2200）；P0-2 定稿为**重写 usageSection** 而非新增段（R3 更正）：删两句 grep 劝退、前置话术场景、补首用自动建图说明，order 保持 850，实测 1011 字符 ≤ A 臂预算 1150；P0-4 核实已存在 + 空 project 观感小调。`checks/check-plugin.mjs` 新增 7 条断言（红线、when-to-use×3、code_index 不先调声明、首用建图、常驻段字节稳定、空结果教学保留）。本批按惯例发布 **v0.21.0**（能力面文案变更）：commit `feat(v0.21.0): the code graph stops steering the model to grep (P0-1/2/4)`，轻量 tag + GitHub release（https://github.com/njuptlzf/dsh-codebase-memory/releases/tag/v0.21.0），两 profile（tauri/web）经 `pnpm install` 升级到 `#v0.21.0` 覆盖此前的 sync 暂存；生效前提仍是重启宿主。
+- P0-3 的 A/E 仍为可选。
+- 已知风险：门闩扩面（P1）未做，仍会漏非结构话术的轮次；描述改动的效果只能靠 telemetry 的拦截计数与真实会话观察验收，无离线评测集（P2）。
 
 ## 9. 参考
 

@@ -375,6 +375,22 @@ async function verify(profile) {
   // 基线（接入说明最初版）约 843 字符；放宽到 1150 给两处静默/响亮坑的说明留空间。
   record('A prompt 段不过预算', prompt.length <= 1150, `${prompt.length} 字符（上限 1150）`)
 
+  // ── P0-1/P0-2 契约（docs/2026-11-01-tool-hit-rate.md）─────────────────────────
+  // 红线：选择面（常驻段 + 三个封装描述）**不得**出现把模型往 grep 推的祈使句；
+  // "字面量该用 grep"只允许出现在空结果教学里（失败面，index.js 的 empty 文案）。
+  const descAll = ['code_find', 'code_callers', 'code_index']
+    .map((t) => a.tools.get(t)?.description ?? '').join('\n')
+  record('P0 红线：常驻段与封装描述无 grep 劝退句',
+    !/仍然用 grep|仍用 grep|keep using grep/.test(`${prompt}\n${descAll}`))
+  record('P0-4 保留：空结果教学仍在', /本来就该用 grep/.test(readFileSync(installed, 'utf8')))
+  // when-to-use 话术必须出现在描述里（工具选择只看 name/description/inputSchema）。
+  record('P0-1 code_find when-to-use 就位', /Use it whenever the question is about code structure/.test(a.tools.get('code_find').description))
+  record('P0-1 code_callers when-to-use 就位', /Use it for impact and call-chain questions/.test(a.tools.get('code_callers').description))
+  record('P0-1 code_index 声明通常不必先调', /usually do NOT need to call this first/.test(a.tools.get('code_index').description))
+  record('P0-2 常驻段声明首用自动建图', /会自动建图/.test(prompt))
+  // 前缀缓存硬约束：常驻段同会话字节不变（两次渲染全等）。
+  record('P0-2 常驻段字节稳定', a.sections.at(-1).text() === a.sections.at(-1).text())
+
   // ── 臂 E：A 的 lifecycle + H2 的会话启动补偿刷新 ──────────────────────────────
   const manifest = JSON.parse(readFileSync(join(ADAPTER_DIR, 'cbm.json'), 'utf8'))
   record('E 清单用 keep-alive（启动即连接，消除会话启动竞态）',

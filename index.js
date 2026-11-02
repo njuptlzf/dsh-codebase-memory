@@ -826,16 +826,16 @@ function usageSection(state) {
     '本工作区已接入 codebase-memory 代码索引（经 mcp-adapter 压成单个代理工具）。',
     '',
     '**首选封装动词**（project 与参数形状由插件填，你只管说要找什么）：',
-    '- `code_find("符号")` → qualified_name + 文件 + 行范围 + 源码，代替"用 grep 猜定义在哪"。',
-    '- `code_callers("qualified_name", direction?)` → 调用者/被调方，代替手工数调用点。',
-    '字符串、日志、配置值、正则文本仍然用 grep——图索引对它们没用。',
+    '- `code_find("符号")` → qualified_name + 文件 + 行范围 + 源码，一步回答「X 在哪定义 / X 长什么样 / 谁实现了 Y」。',
+    '- `code_callers("qualified_name", direction?)` → 调用者/被调方逐跳，回答「谁调用 X / 改 X 影响哪里」。',
+    '首次用这两个会自动建图（git 仓约 2s），通常不必先调 `code_index`；大改后或提示可能过期时再刷新。',
     '',
     '索引：`code_index`——repo_path 已绑本会话工作区，不要自传；返回的 `project` 供长尾调用。',
     `长尾都走代理工具 \`${PROXY_TOOL}\`，args 直接传对象；多步用 mcpScript 一趟跑完：`,
     '- 验鲜 {"tool":"cbm_check_index_coverage","args":{"project":"<p>","paths":["<相对路径>"]}}',
     '- 取原文 {"tool":"cbm_get_code_snippet","args":{"project":"<p>","qualified_name":"<qn>","format":"json"}}',
     '- 多跳 {"tool":"cbm_query_graph",...}；{"server":"cbm"} 列工具，{"describe":"..."} 看参数',
-    '- 按意思找（自然语言问代码）{"tool":"cbm_search_graph","args":{"project":"<p>","query":"..."}}——引擎的 BM25 符号检索（还有 semantic_query 参数）；图谱只含代码，md/配置/文档仍用 grep。',
+    '- 按意思找（自然语言问代码）{"tool":"cbm_search_graph","args":{"project":"<p>","query":"..."}}——引擎的 BM25 检索（还有 semantic_query 参数）。',
     '',
     '两个坑性质相反，处置不同：',
     '- **取原文务必带 format:"json"**：默认 tree 是排版信封，照抄当锚点必不匹配，但会当场报错。',
@@ -1882,7 +1882,7 @@ export async function apply(ctx, config) {
 
   ctx.tools.register(defineTool({
     name: 'code_index',
-    description: 'Index or refresh THIS session workspace into the codebase-memory knowledge graph, then return the graph `project` name required by the search tools. The repository path is bound to the session workspace by the plugin and is deliberately not a parameter. Incremental when the project is already indexed. Run it before searching a repository for the first time, and again after substantial edits.',
+    description: 'Index or refresh THIS session workspace into the codebase-memory knowledge graph, then return the graph `project` name required by the long-tail tools. The repository path is bound to the session workspace by the plugin and is deliberately not a parameter. Incremental when the project is already indexed. You usually do NOT need to call this first: code_find / code_callers auto-build the graph on first use (git workspaces, ~2s). Call it explicitly after large edits, or when a result says the coordinates may be stale.',
     parameters: {
       mode: {
         type: 'string',
@@ -1980,7 +1980,7 @@ export async function apply(ctx, config) {
   if (cfg.wrapperTools) {
     ctx.tools.register(defineTool({
       name: 'code_find',
-      description: 'Locate a SYMBOL (function / class / method / route) in this workspace by name: returns the qualified name, file, line range and the source itself from the code graph. Use it INSTEAD of grep when the question is "where is X defined / what does X look like". NOT for string literals, log messages, config values, URLs or regex over text — keep using grep for those. If the workspace has no graph yet, the plugin self-heals: it builds one on the spot (git workspaces only, one attempt per directory) and answers in the same call — only if it still reports "not indexed", run code_index first.',
+      description: 'Find a symbol (function / class / method / route) in THIS workspace and return its qualified name, file, exact line range, and source from the code graph. Use it whenever the question is about code structure: where is X defined, what does X look like, which file implements Y. One call does the job of grep+read for a named symbol. If the workspace has no graph yet, the plugin self-heals: it builds one on the spot (git workspaces only, one attempt per directory) and answers in the same call — only if it still reports "not indexed", run code_index first. The graph indexes symbols only — literal strings, log lines and config values are not in it.',
       parameters: {
         query: { type: 'string', required: true, description: 'Symbol name or a short keyword phrase (BM25 over the graph). Prefer the exact identifier.' },
         limit: { type: 'integer', description: 'Max candidate symbols (default 3, cap 10).' },
@@ -2005,7 +2005,7 @@ export async function apply(ctx, config) {
           if (!search.ok) throw new Error(`search_graph 调用失败（链路或引擎异常）：${(search.text || '超时').slice(0, 300)}`)
           const rows = parseRows(search.text)
           if (rows === null) return { status: 'ok', text: truncateCodepoints(search.text, SNIPPET_MAX_CODEPOINTS), project } // 形状变了也不吞结果
-          if (rows.length === 0) return { status: 'empty', text: `代码图（project=${project}）里没有匹配 "${args.query}" 的符号。\n字符串 / 日志 / 配置值本来就该用 grep；确实是符号的话，换个关键词或先 code_index。` }
+          if (rows.length === 0) return { status: 'empty', text: `代码图${project ? `（project=${project}）` : ''}里没有匹配 "${args.query}" 的符号。\n字符串 / 日志 / 配置值本来就该用 grep；确实是符号的话，换个关键词或先 code_index。` }
           const lines = [`code_find project=${project}  命中 ${rows.length} 个候选：`]
           lines.push(formatRows(rows, project))
           let staleNote = ''
@@ -2041,7 +2041,7 @@ export async function apply(ctx, config) {
 
     ctx.tools.register(defineTool({
       name: 'code_callers',
-      description: 'Who calls a symbol (direction=inbound, the default) or what it calls (outbound), hop by hop, from the code graph. Use it INSTEAD of grepping the identifier to eyeball call sites: it follows the CALLS/USAGE edges and gives qualified names. Argument is the qualified_name from code_find (or a bare symbol name that exists in the graph).',
+      description: 'Trace who calls a symbol (direction=inbound, the default) or what it calls (outbound), hop by hop, from the code graph. Use it for impact and call-chain questions: who calls X, what breaks if I change X, trace the call chain. Prefer it over grepping the identifier to eyeball call sites: it follows the CALLS/USAGE edges and gives qualified names. Argument is the qualified_name from code_find (or a bare symbol name that exists in the graph).',
       parameters: {
         name: { type: 'string', required: true, description: 'Qualified name (preferred) or symbol name to trace.' },
         direction: { type: 'string', description: 'inbound (callers, default) | outbound (callees) | both.' },
