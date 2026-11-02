@@ -195,3 +195,24 @@ grep -rn "events\['agent/" checks/check-plugin.mjs
   - S3 轮扫端到端：真事件踢发 → 候选走 5 分钟冷却短路（不真跑 `index_repository`）→ 报表 `上轮 checked=1 … refreshed=0`；
   - E 新增**事件白名单静态臂**：读 `index.js` 原文，任何 `ctx.on('…')` 不在宿主真实事件清单即红——这是"假事件"的回归锁。
   - 未做 §5.6 的"两个假仓真触发 `index_repository`"：验收不该让套件付一次真索引；它验证的"digest 变了才重建"由纯函数 + 冷却/未变闸门的两条既有断言覆盖。§5.6 的"节流窗口内不重复踢"也未单独立臂——踢发被 5 分钟冷却与 `sweepRunning` 双重挡住，`S3` 的 `checked=1` 已经证明一次事件只产生一轮。
+
+## 9. 活体验收与 v0.23.1 补丁（同日 18:12 重启后）
+
+用户重启宿主做活体验收（"重启完了，重新验收"），两条通道结果相反：
+
+- **通道① `agent/created` 补偿刷新：通过。** `refresh.log` 出现 `10:12:28Z refresh …\dsh-codebase-memory（git 状态变了）` → `10:12:46Z done exit=0`——18 秒自动重建，不需要任何手动 `code_index`。这正是 m00794 抱怨"分析没有自动更新"要的效果，真事件接线在活宿主里成立。behind 第四态同场验证：18:12 重建后我继续改文件，会话注入段立刻打出"索引落后于工作区：图建于 18:12，之后 git 状态变过；先 code_index"——无手动触发。
+- **通道② 轮扫：崩溃。** 遥测 `workspace-sweep-fail: spawn git ENOENT`（pid 20504@10:05:33、pid 37868@10:11:47）。
+
+**根因**：真实 `ADAPTER_DIR`（`C:\Users\kingdee\.dsh\vendor\mcp-adapter`）的 `refresh-stamps.json` 里躺着 **9 月验收跑残留的两条死条目**（`%TEMP%\cbm-check-refresh-60628-tauri/-web`，目录早已蒸发）。轮扫的 eligible 取自 stamp keys ∪ projects ∪ workspaces，死路径进候选后，`repoRootOf` 对不存在的 cwd `spawn git`——Windows 直接 ENOENT——**一条毒条目让整轮 reject**：`lastSweep` 不落账，同文件里 5 条活仓（ruankao-ai / obsidian-daily-report / agent-chat / selfheal-fixture / 本仓）一条都没查。
+
+这一课只有活体能教：跨进程污染（别的进程、别的版本的 checks 往共享目录写过的路径后来被删）是轮扫的**运行现实**，不是理论边界；测试替身里的候选永远"活着"，193/193 看不见它。
+
+**修复（三处，全部往"单条失败不得传染整轮"收敛）**：
+
+1. `runWorkspaceSweep`：eligible 先 `existsSync` 滤掉已消失的路径（stamp 条目保留不删——目录可能回来，记账是另一回事）；
+2. 循环体 per-target `try/catch`，新增 `failed` 计数进 `lastSweep` 与遥测（报表行格式不变）；
+3. `repoRootOf`：`run()` 抛错（目录消失 / git 起不来）时 catch 回退 cwd——同一防护自动覆盖 `projectFor`、`selfHealIndex`、`runCbmFlow` 三个调用方。
+
+**回归臂 S4**：往 stamp 混一条 ghost 目录 + 活仓（`at=now` 走冷却短路）→ 断言报表出现 `上轮 checked=1`（ghost 被滤、本轮完成落账）且本进程 pid 名下无 `workspace-sweep-fail`。遥测行是逐行 JSON，**按 `pid` 字段精确过滤**——活宿主的旧 bundle 每 5 分钟仍在同一份共享遥测里写 fail 行，子串匹配会误伤假红。修复前该臂必红（报表停在"还没跑过"），修复后绿，判别力成立。
+
+> 2026-11-02 已发布 **v0.23.1**：版本 bump 后串行复跑 tauri 194/194、web 194/194，quick 四件套全过。生效前提同上：`node scripts/sync.mjs` + 重启宿主（profile pin 升 tag 仍受 `minimumReleaseAge` 阻塞，走 sync 通路）。

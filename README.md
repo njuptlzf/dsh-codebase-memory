@@ -68,7 +68,7 @@ Afterwards the plugin probes, in order: the official install location → `$DSH_
 There is no npm package and no `dsh install` command — plugin installation *is* `dsh plugin <args>`, which runs pnpm in the profile directory. So install from the GitHub release directly:
 
 ```powershell
-dsh plugin --profile <your-profile> add github:njuptlzf/dsh-codebase-memory#v0.23.0
+dsh plugin --profile <your-profile> add github:njuptlzf/dsh-codebase-memory#v0.23.1
 ```
 
 Keep the `#<tag>` pin: a tag resolves to one commit, so a later `pnpm install` does not silently move under you. Bump the tag (or drop it to follow `main`) when you want a newer release; uninstall with `dsh plugin --profile <p> remove dsh-codebase-memory`.

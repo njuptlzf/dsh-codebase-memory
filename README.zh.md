@@ -65,7 +65,7 @@ Unblock-File .\install.ps1; .\install.ps1 --skip-config
 本插件没有 npm 包，也没有 `dsh install` 命令——装插件就是 `dsh plugin <args>`，本质是在 profile 目录里跑 pnpm。所以直接从 GitHub 装：
 
 ```powershell
-dsh plugin --profile <你的profile> add github:njuptlzf/dsh-codebase-memory#v0.23.0
+dsh plugin --profile <你的profile> add github:njuptlzf/dsh-codebase-memory#v0.23.1
 ```
 
 `#<tag>` 要留着：tag 钉死一个 commit，之后 `pnpm install` 不会悄悄漂移。要更新时改 tag（或去掉 tag 跟随 `main`）；卸载 `dsh plugin --profile <p> remove dsh-codebase-memory`。

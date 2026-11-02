@@ -877,7 +877,14 @@ const SWEEP_MAX_WORKSPACES = 64
 async function repoRootOf(ctx, state, cwd, signal) {
   const hit = state.repoRoots.get(cwd)
   if (hit && Date.now() - hit.at < 60 * 1000) return hit.root
-  const r = await run(ctx, ['git', 'rev-parse', '--show-toplevel'], { cwd, maxBytes: 16 * 1024, signal })
+  let r
+  try {
+    r = await run(ctx, ['git', 'rev-parse', '--show-toplevel'], { cwd, maxBytes: 16 * 1024, signal })
+  } catch {
+    // 目录已消失 / git 起不来：Windows 对不存在的 cwd 直接 spawn ENOENT。回退 cwd，
+    // 让 digest 闸门随后处理；一条死路径绝不能毒掉整个调用方（轮扫整轮曾被它掀翻）。
+    return cwd
+  }
   const raw = r.exitCode === 0 ? String(r.stdout || '').trim() : ''
   // git 在 Windows 上吐正斜杠，而会话 cwd / cbm 记录都是反斜杠：统一成平台风格，
   // 键才不会因为分隔符不同被当成两个仓库。
@@ -1027,6 +1034,9 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal, opts = {}
  * 轮扫的一轮：把「候选仓库」按 sweepPlan 排好，逐个走同一条带闸门的补偿刷新。
  * 串行是刻意的——引擎一次只该跑一个 index，并发只会被它 aborted_previous_preserved。
  * 每仓的冷却/未变闸门照旧，所以热仓每轮的实际成本只有两次 git 调用。
+ * 耐受性（v0.23.1，活体炸出来的）：stamp 里会有蒸发的临时工作区（历次验收残留），
+ * 对不存在的目录 spawn git 在 Windows 上是 ENOENT——先 existsSync 滤掉死路径，
+ * 循环内再 per-target catch：一条毒仓库只能烧掉自己那一格，不能掀翻整轮。
  */
 async function runWorkspaceSweep(ctx, cfg, state, signal) {
   const stampPath = join(cfg.adapterDir, 'refresh-stamps.json')
@@ -1034,22 +1044,28 @@ async function runWorkspaceSweep(ctx, cfg, state, signal) {
     ...Object.keys(readStamps(stampPath)),
     ...state.projectsByCwd.keys(),
     ...state.workspaces.keys(),
-  ])]
+  ])].filter((p) => { try { return existsSync(p) } catch { return false } })
   if (!eligible.length) return
   const plan = sweepPlan({ eligible, seen: state.workspaces, now: Date.now(), cursor: state.sweepCursor })
   state.sweepCursor = plan.cursor
   let refreshed = 0
   let behind = 0
   let checked = 0
+  let failed = 0
   for (const cwd of plan.order) {
     if (signal?.aborted) break
     checked++
-    const outcome = await refreshSessionWorkspace(ctx, cfg, state, null, signal, { cwd, quiet: true, by: 'sweep' })
-    if (outcome === 'refreshed') refreshed++
-    if (state.digestVerdict.get(cwd) === 'differ') behind++
+    try {
+      const outcome = await refreshSessionWorkspace(ctx, cfg, state, null, signal, { cwd, quiet: true, by: 'sweep' })
+      if (outcome === 'refreshed') refreshed++
+      if (state.digestVerdict.get(cwd) === 'differ') behind++
+    } catch (error) {
+      failed++
+      refreshLog(cfg, `sweep ${cwd}: 异常 ${String(error?.message ?? error).slice(0, 160)}`)
+    }
   }
-  state.lastSweep = { at: Date.now(), checked, hot: plan.hot.length, cold: plan.cold.length, refreshed, behind }
-  telemetry(cfg, state, 'workspace-sweep', { checked, hot: plan.hot.length, cold: plan.cold.length, refreshed, behind })
+  state.lastSweep = { at: Date.now(), checked, hot: plan.hot.length, cold: plan.cold.length, refreshed, behind, failed }
+  telemetry(cfg, state, 'workspace-sweep', { checked, hot: plan.hot.length, cold: plan.cold.length, refreshed, behind, failed })
 }
 
 /**

@@ -498,23 +498,59 @@ async function verify(profile) {
     else writeFileSync(sStampFile, sStampBackup, 'utf8')
   }
 
-  // S3 轮扫端到端：打开轮扫 → 首发踢发 → 候选走冷却短路 → 报表/状态留下这一轮的账。
-  const sw = await mount({ workspaceSweepSec: 60 })
+  // S3 轮扫端到端（v0.23.1 起整体搬进临时 adapterDir）：候选、stamp、日志、遥测全在
+  // 自己目录里，先写 stamp 再 mount——第一脚踢发（code_setup→runCbmFlow）跑的就是我们
+  // 预置的候选集。旧写法碰共享 ADAPTER_DIR：活宿主每几分钟整写 refresh-stamps.json，
+  // 且首发轮扫拿到的真实候选（数条活仓）要经真引擎 list_projects，2.5s 断言窗口必炸
+  // （2026-11-02 实测：同一代码 tauri 挂 web 过，纯看谁先跑过谁冷却）。
+  const s3T = join(tmpdir(), `cbm-s3-${process.pid}`)
+  rmSync(s3T, { recursive: true, force: true })
+  mkdirSync(join(s3T, 'node_modules', '@njuptlzf', 'mcp-adapter'), { recursive: true })
+  writeFileSync(join(s3T, 'node_modules', '@njuptlzf', 'mcp-adapter', 'mcp-server.mjs'), '', 'utf8')
+  writeFileSync(join(s3T, 'node_modules', '@njuptlzf', 'mcp-adapter', 'package.json'),
+    `{"name":"@njuptlzf/mcp-adapter","version":"${DEFAULT_ADAPTER_VERSION}"}`, 'utf8')
+  writeFileSync(join(s3T, 'refresh-stamps.json'),
+    JSON.stringify({ [REPO]: { at: Date.now(), digest: 'built|0|0' } }), 'utf8')
+  const sw = await mount({ workspaceSweepSec: 60, adapterDir: s3T })
   await sw.tools.get('code_setup').execute({}, withSignal(REPO))
-  const swStampFile = join(ADAPTER_DIR, 'refresh-stamps.json')
-  const swBackup = existsSync(swStampFile) ? readFileSync(swStampFile, 'utf8') : null
+  sw.events['agent/created'][0]({ agent: fakeAgent(`sess-${process.pid}-sweep`, REPO), source: 'fresh', signal: sig() })
+  await new Promise((resolve) => setTimeout(resolve, 2500))
+  const swReport = await sw.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('S 轮扫被踢发并留下一轮的账（checked=1，冷却短路未重建）',
+    /轮扫: on\(60s\) 候选=\d+ 上轮 checked=1 hot=\d+ cold=\d+ refreshed=0/.test(swReport),
+    /轮扫:.*$/m.exec(swReport)?.[0] ?? '(报表里没有轮扫行)')
+
+  // S4 毒条目耐受（v0.23.1，活体炸出）：stamp 里混一条已蒸发的临时目录——修复前对它
+  // spawn git 直接 ENOENT 掀翻整轮（报表停在「还没跑过」）；修复后它被 existsSync 滤掉，
+  // 活仓照常走冷却短路，本轮的账照落。同样搬进临时 adapterDir：ghost 只有我们造得出，
+  // fail 行只问责本进程目录里的遥测，与活宿主零串扰。
+  const s4T = join(tmpdir(), `cbm-s4-${process.pid}`)
+  rmSync(s4T, { recursive: true, force: true })
+  mkdirSync(join(s4T, 'node_modules', '@njuptlzf', 'mcp-adapter'), { recursive: true })
+  writeFileSync(join(s4T, 'node_modules', '@njuptlzf', 'mcp-adapter', 'mcp-server.mjs'), '', 'utf8')
+  writeFileSync(join(s4T, 'node_modules', '@njuptlzf', 'mcp-adapter', 'package.json'),
+    `{"name":"@njuptlzf/mcp-adapter","version":"${DEFAULT_ADAPTER_VERSION}"}`, 'utf8')
+  const s4Ghost = join(tmpdir(), `cbm-s4-ghost-${process.pid}-never-exists`)
+  writeFileSync(join(s4T, 'refresh-stamps.json'), JSON.stringify({
+    [s4Ghost]: { at: Date.now(), digest: 'ghost|0|0' },
+    [REPO]: { at: Date.now(), digest: 'built|0|0' },
+  }), 'utf8')
+  const sw4 = await mount({ workspaceSweepSec: 60, adapterDir: s4T })
+  await sw4.tools.get('code_setup').execute({}, withSignal(REPO))
+  sw4.events['agent/created'][0]({ agent: fakeAgent(`sess-${process.pid}-sweep4`, REPO), source: 'fresh', signal: sig() })
+  await new Promise((resolve) => setTimeout(resolve, 2500))
+  const sw4Report = await sw4.tools.get('code_setup').execute({}, withSignal(REPO))
+  const sw4Ok = /上轮 checked=1 hot=\d+ cold=\d+ refreshed=0/.test(sw4Report)
+  let sw4FailLine = ''
   try {
-    writeFileSync(swStampFile, JSON.stringify({ [REPO]: { at: Date.now(), digest: 'built|0|0' } }), 'utf8')
-    sw.events['agent/created'][0]({ agent: fakeAgent(`sess-${process.pid}-sweep`, REPO), source: 'fresh', signal: sig() })
-    await new Promise((resolve) => setTimeout(resolve, 2500))
-    const swReport = await sw.tools.get('code_setup').execute({}, withSignal(REPO))
-    record('S 轮扫被事件踢发并留下一轮的账（checked=1，冷却短路未重建）',
-      /轮扫: on\(60s\) 候选=\d+ 上轮 checked=1 hot=\d+ cold=\d+ refreshed=0/.test(swReport),
-      /轮扫:.*$/m.exec(swReport)?.[0] ?? '(报表里没有轮扫行)')
-  } finally {
-    if (swBackup === null) rmSync(swStampFile, { force: true })
-    else writeFileSync(swStampFile, swBackup, 'utf8')
-  }
+    const sw4Tl = readFileSync(join(s4T, `telemetry-${new Date().toISOString().slice(0, 10)}.log`), 'utf8')
+    sw4Tl.split('\n').forEach((l) => {
+      try { const j = JSON.parse(l); if (j.pid === process.pid && j.event === 'workspace-sweep-fail') sw4FailLine = l } catch { /* 空行 */ }
+    })
+  } catch { /* 本轮没写遥测行——由 sw4Ok 兜底判失败 */ }
+  record('S 毒条目（蒸发的临时目录）不再掀翻整轮：checked=1 且无 workspace-sweep-fail',
+    sw4Ok && !sw4FailLine,
+    `${/轮扫:.*$/m.exec(sw4Report)?.[0] ?? '(无轮扫行)'}${sw4FailLine ? ` | fail: ${sw4FailLine.slice(0, 160)}` : ''}`)
 
   // ── 臂 Z（v0.17.0 起语义层整体移除）：原「zgEnabled 三态接线」臂改成防回潮锁。
   // 删的依据：telemetry 三个月 code-search=1 次生产调用、zg 索引维护失败率 72:20、
