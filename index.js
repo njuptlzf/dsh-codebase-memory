@@ -22,9 +22,9 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const name = 'dsh-codebase-memory'
@@ -99,6 +99,10 @@ export const Config = z.object({
   cbmPath: z.string().default(''),
   autoIndex: z.boolean().default(true),
   sessionRefresh: z.boolean().default(true),
+  // v0.23.0：多工作区轮扫的间隔（秒，0=关）。DSH 是多会话/多工作区宿主，而引擎的
+  // git watcher 只跟 MCP 进程那个静态 cwd——不主动轮扫，别的工作区的图就一直停在
+  // 上一次建图。轮扫只做"便宜的一步"：git digest 比对 + 按需重建（见 runWorkspaceSweep）。
+  workspaceSweepSec: z.number().default(300).volatile(),
   // ── 触发层（docs/design-v2.md 4.8）：每个杠杆独立开关，全部可回滚 ──────────
   wrapperTools: z.boolean().default(true),
   // enforce / interceptTools / interceptBudgetMs / contextHint / telemetry /
@@ -262,6 +266,7 @@ function normalize(config = {}) {
   defineLive(cfg, 'recentLimit', () => positiveInt('recentLimit', live(config.recentLimit), 100, []))
   defineLive(cfg, 'markPassthrough', () => boolOf(live(config.markPassthrough), false, [], 'markPassthrough'))
   defineLive(cfg, 'autoSelfHeal', () => boolOf(live(config.autoSelfHeal), true, [], 'autoSelfHeal'))
+  defineLive(cfg, 'workspaceSweepSec', () => positiveInt('workspaceSweepSec', live(config.workspaceSweepSec), 300, []))
   // v0.16 T-D 的两个旁路参数：0 都是合法值（0=关闭），走 positiveInt 的含零语义。
   defineLive(cfg, 'staleWarnFiles', () => positiveInt('staleWarnFiles', live(config.staleWarnFiles), 8, []))
   defineLive(cfg, 'staleWarnMinIntervalSec', () => positiveInt('staleWarnMinIntervalSec', live(config.staleWarnMinIntervalSec), 60, []))
@@ -781,6 +786,7 @@ function report(cfg, state) {
     `代理工具: ${PROXY_TOOL}  bootstrap=${cfg.bootstrap}  adapterVersion=${cfg.adapterVersion}  warm=${state.warm ? (state.warmOk === true ? 'ok' : state.warmOk === false ? 'failed' : `pending(${state.warmStartedAt ? Math.round((Date.now() - state.warmStartedAt) / 1000) : 0}s)`) : 'off'}`,
     `适配层进程: ${adapterLine(state)}`,
     `触发层: wrapper=${cfg.wrapperTools ? 'on' : 'off'}  enforce=${cfg.enforce}  intercept=${cfg.interceptTools.join('+') || '(无)'}  budget=graph:${budgetGraph(cfg)}ms(intercept=${cfg.interceptBudgetMs > 0 ? `${cfg.interceptBudgetMs}ms` : '未设'})  dirty=${cfg.dirtyTracking ? 'on' : 'off'}(冷却 ${cfg.dirtyRefreshCooldownSec}s)  context=${cfg.contextHint ? 'on' : 'off'}`,
+    `轮扫: ${live(cfg.workspaceSweepSec) > 0 ? `on(${live(cfg.workspaceSweepSec)}s) 候选=${state.workspaces.size}${state.lastSweep ? ` 上轮 checked=${state.lastSweep.checked} hot=${state.lastSweep.hot} cold=${state.lastSweep.cold} refreshed=${state.lastSweep.refreshed} behind=${state.lastSweep.behind}` : ' 还没跑过'}` : 'off'}`,
     // 六个即时热字段；清单重建不用重启宿主——
     // code_setup {action:"restart-adapter"} 重拉适配层即可（宿主监督器自动重生进程）。
     '热改: enforce / telemetry / contextHint / dirtyTracking / interceptBudgetMs / interceptTools / graphBudgetMs → 设置 → 插件 → dsh-codebase-memory → codebase-memory 行「配置」（不用重启）；其余字段改 profile 的 cordis.patch.yml 并重启',
@@ -855,6 +861,47 @@ function usageSection(state) {
 
 const REFRESH_MIN_INTERVAL_MS = 5 * 60 * 1000
 
+// 轮扫（v0.23.0）：候选 = 本进程见过的所有仓库根。热仓（30 分钟内碰过）每轮都查，
+// 冷仓按游标 round-robin 每轮至多 6 个——成本上界是"每 workspaceSweepSec 最多
+// 6 次 git digest 比对 + 热仓几次"，重建仍然只发生在 digest 真变了的时候。
+const SWEEP_HOT_WINDOW_MS = 30 * 60 * 1000
+const SWEEP_COLD_PER_ROUND = 6
+const SWEEP_MAX_WORKSPACES = 64
+
+/**
+ * 工作区身份按 **git toplevel** 归一：DSH 的会话 cwd 可能只是仓库子目录，而
+ * cbm 的项目 root_path 是仓库根；不归一就会"同一仓两个身份、alreadyIndexed
+ * 永不命中、图被建两份"。非 git 工作区回退到 cwd（digest 闸门随后判 not-git）。
+ * 缓存 60s：hint / 拦截热路径每轮都可能问，spawn git 不能没有上界。
+ */
+async function repoRootOf(ctx, state, cwd, signal) {
+  const hit = state.repoRoots.get(cwd)
+  if (hit && Date.now() - hit.at < 60 * 1000) return hit.root
+  const r = await run(ctx, ['git', 'rev-parse', '--show-toplevel'], { cwd, maxBytes: 16 * 1024, signal })
+  const raw = r.exitCode === 0 ? String(r.stdout || '').trim() : ''
+  // git 在 Windows 上吐正斜杠，而会话 cwd / cbm 记录都是反斜杠：统一成平台风格，
+  // 键才不会因为分隔符不同被当成两个仓库。
+  const root = raw ? (sep === '\\' ? raw.replace(/\//g, '\\') : raw).replace(/[\\/]+$/, '') : cwd
+  state.repoRoots.set(cwd, { root, at: Date.now() })
+  return root
+}
+
+/**
+ * 纯函数：这一轮该查哪些仓库。热仓（seen 在窗口内）按最近碰过的顺序全查；
+ * 冷仓按路径排序后从游标处 round-robin 取 coldPerRound 个——游标跨轮推进，
+ * 冷仓再多也不会饿死。导出是为了让验收直接证伪调度公平性，不必起宿主。
+ */
+export function sweepPlan({ eligible = [], seen = new Map(), now = Date.now(), hotWindowMs = SWEEP_HOT_WINDOW_MS, coldPerRound = SWEEP_COLD_PER_ROUND, cursor = 0 } = {}) {
+  const touched = (p) => Number(seen?.get?.(p) ?? seen?.[p] ?? 0)
+  const repos = [...new Set(eligible)].sort()
+  const hot = repos.filter((p) => touched(p) > 0 && now - touched(p) <= hotWindowMs)
+  hot.sort((a, b) => (touched(b) - touched(a)) || a.localeCompare(b))
+  const cold = repos.filter((p) => !hot.includes(p))
+  const start = cold.length ? ((Math.trunc(cursor) % cold.length) + cold.length) % cold.length : 0
+  const picked = cold.slice(start).concat(cold.slice(0, start)).slice(0, Math.max(0, coldPerRound))
+  return { order: [...hot, ...picked], hot, cold: picked, cursor: cold.length ? (start + picked.length) % cold.length : 0 }
+}
+
 /** 同一工作区的 git 状态摘要；非 git 工作区返回 null（与引擎 auto_watch 的 git-only 行为一致）。 */
 async function workspaceDigest(ctx, cwd, signal) {
   const head = await run(ctx, ['git', 'rev-parse', 'HEAD'], { cwd, maxBytes: 16 * 1024, signal })
@@ -878,28 +925,46 @@ async function alreadyIndexed(ctx, state, cwd, signal) {
   })
 }
 
+const REFRESH_LOG_MAX_BYTES = 512 * 1024
+
 /** detached 刷新的 stdout 没人看，不留日志就无从排障。写不了日志也绝不打扰会话。 */
 function refreshLog(cfg, line) {
   try {
     mkdirSync(cfg.adapterDir, { recursive: true })
-    writeFileSync(join(cfg.adapterDir, 'refresh.log'), `${new Date().toISOString()} ${line}\n`, { flag: 'a' })
+    const path = join(cfg.adapterDir, 'refresh.log')
+    // 轮扫会把它从"每次会话一行"放大成"每次轮扫 N 行"；超过上限就整份归档一次，
+    // 只保留 log.1 一份（排障要的是最近的时间线，历史归档没有第二个消费者）。
+    try { if (statSync(path).size > REFRESH_LOG_MAX_BYTES) renameSync(path, `${path}.1`) } catch { /* 还没有文件 */ }
+    writeFileSync(path, `${new Date().toISOString()} ${line}\n`, { flag: 'a' })
   } catch { /* 忽略 */ }
 }
 
 const readStamps = (path) => { try { return JSON.parse(readFileSync(path, 'utf8')) } catch { return {} } }
 
 /**
- * 会话启动补偿刷新：闸门 → 后台跑。全程不抛、不 await（调用方是同步监听器）。
+ * 会话启动/轮扫的补偿刷新：闸门 → 后台跑。全程不抛、不 await（调用方是事件监听器）。
  * 只有"git 状态变了 且 该项目已索引过"才会真的付出那次 ~15–30s 的后台开销。
  *
- * 返回值是给杠杆 ⑤ 用的：`'refreshed'` 才允许清脏集合，`'skipped:*'` 必须留着——
+ * `opts.cwd` 让轮扫可以不伪造 agent；`opts.quiet` 让轮扫不写"冷却/未变"这类
+ * 每仓每次都会出现的噪声行（refresh.log 要留着排障，不是用来记录没发生的事）。
+ *
+ * 返回值是给杠杆 ⑤/轮扫用的：`'refreshed'` 才允许清脏集合，`'skipped:*'` 必须留着——
  * 被闸门挡下意味着**什么都没重建**，这时清账等于宣称"改动已进索引"，那正是我们要
  * 防的静默错位。
  */
-async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
-  const cwd = agent?.session?.header?.cwd
-  if (!cwd) { refreshLog(cfg, 'skip (无会话 cwd)'); return 'skipped:no-cwd' }
-  if (state.cbm !== 'ready') { refreshLog(cfg, `skip ${cwd}: 引擎未就绪`); return 'skipped:engine' }
+async function refreshSessionWorkspace(ctx, cfg, state, agent, signal, opts = {}) {
+  const sessionCwd = opts.cwd || agent?.session?.header?.cwd
+  if (!sessionCwd) { refreshLog(cfg, 'skip (无会话 cwd)'); return 'skipped:no-cwd' }
+  if (state.cbm !== 'ready') { refreshLog(cfg, `skip ${sessionCwd}: 引擎未就绪`); return 'skipped:engine' }
+  const quiet = opts.quiet === true
+  // 仓库身份按 git toplevel 归一：stamp / verdict / project 三张表用同一个 key，
+  // 否则同一个仓的父目录会话与子目录会话会互相把对方判成"没索引过"，图被建两份。
+  const cwd = await repoRootOf(ctx, state, sessionCwd, signal)
+  state.workspaces.set(cwd, Date.now())
+  if (state.workspaces.size > SWEEP_MAX_WORKSPACES) {
+    const [oldest] = [...state.workspaces.entries()].sort((a, b) => a[1] - b[1])[0] ?? []
+    if (oldest) state.workspaces.delete(oldest)
+  }
   const stampPath = join(cfg.adapterDir, 'refresh-stamps.json')
   const stamps = readStamps(stampPath)
   const last = stamps[cwd]
@@ -908,18 +973,32 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
   const digest = await workspaceDigest(ctx, cwd, signal)
   if (digest === null) {
     state.digestVerdict.delete(cwd) // 非 git：没有可比对的 digest ⇒ 判 unknown
-    refreshLog(cfg, `skip ${cwd}: 非 git 工作区（与引擎 auto_watch 一致）`)
+    if (!quiet) refreshLog(cfg, `skip ${cwd}: 非 git 工作区（与引擎 auto_watch 一致）`)
     return 'skipped:not-git'
   }
   // 只有两边都有 digest 才谈得上"落后"：旧 stamp 没记 digest 时算不出来，宁可判 unknown。
   if (last?.digest) state.digestVerdict.set(cwd, last.digest === digest ? 'equal' : 'differ')
   else state.digestVerdict.delete(cwd)
-  if (last && Date.now() - (last.at ?? 0) < REFRESH_MIN_INTERVAL_MS) { refreshLog(cfg, `skip ${cwd}: 冷却中`); return 'skipped:cooldown' }
-  if (state.refreshing.has(cwd)) { refreshLog(cfg, `skip ${cwd}: 已有一次刷新在跑`); return 'skipped:in-flight' }
-  if (last && last.digest === digest) { refreshLog(cfg, `skip ${cwd}: git 状态未变`); return 'skipped:unchanged' }
-  if (!(await alreadyIndexed(ctx, state, cwd, signal))) { refreshLog(cfg, `skip ${cwd}: 尚未索引过（不替用户制造索引）`); return 'skipped:not-indexed' }
+  if (last && Date.now() - (last.at ?? 0) < REFRESH_MIN_INTERVAL_MS) {
+    if (!quiet) refreshLog(cfg, `skip ${cwd}: 冷却中`)
+    return 'skipped:cooldown'
+  }
+  if (state.refreshing.has(cwd)) {
+    if (!quiet) refreshLog(cfg, `skip ${cwd}: 已有一次刷新在跑`)
+    return 'skipped:in-flight'
+  }
+  if (last && last.digest === digest) {
+    if (!quiet) refreshLog(cfg, `skip ${cwd}: git 状态未变`)
+    return 'skipped:unchanged'
+  }
+  // projectsByCwd 有记录 = 引擎清单里已经见过它，省掉一发 list_projects（轮扫的冷仓
+  // 每个都会问一次，那是 8–10s 的固定成本，不能出现在轮扫的默认路径上）。
+  if (!state.projectsByCwd.has(cwd) && !(await alreadyIndexed(ctx, state, cwd, signal))) {
+    if (!quiet) refreshLog(cfg, `skip ${cwd}: 尚未索引过（不替用户制造索引）`)
+    return 'skipped:not-indexed'
+  }
   state.refreshing.add(cwd)
-  refreshLog(cfg, `refresh ${cwd}（git 状态变了）`)
+  refreshLog(cfg, `refresh ${cwd}（git 状态变了${opts.by === 'sweep' ? '，轮扫' : ''}）`)
   try {
     const runIndex = () => run(ctx, [state.cbmPath, 'cli', '--quiet', 'index_repository', '--repo-path', cwd], {
       cwd, maxBytes: 1024 * 1024, graceMs: 60000, signal,
@@ -945,6 +1024,56 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
 }
 
 /**
+ * 轮扫的一轮：把「候选仓库」按 sweepPlan 排好，逐个走同一条带闸门的补偿刷新。
+ * 串行是刻意的——引擎一次只该跑一个 index，并发只会被它 aborted_previous_preserved。
+ * 每仓的冷却/未变闸门照旧，所以热仓每轮的实际成本只有两次 git 调用。
+ */
+async function runWorkspaceSweep(ctx, cfg, state, signal) {
+  const stampPath = join(cfg.adapterDir, 'refresh-stamps.json')
+  const eligible = [...new Set([
+    ...Object.keys(readStamps(stampPath)),
+    ...state.projectsByCwd.keys(),
+    ...state.workspaces.keys(),
+  ])]
+  if (!eligible.length) return
+  const plan = sweepPlan({ eligible, seen: state.workspaces, now: Date.now(), cursor: state.sweepCursor })
+  state.sweepCursor = plan.cursor
+  let refreshed = 0
+  let behind = 0
+  let checked = 0
+  for (const cwd of plan.order) {
+    if (signal?.aborted) break
+    checked++
+    const outcome = await refreshSessionWorkspace(ctx, cfg, state, null, signal, { cwd, quiet: true, by: 'sweep' })
+    if (outcome === 'refreshed') refreshed++
+    if (state.digestVerdict.get(cwd) === 'differ') behind++
+  }
+  state.lastSweep = { at: Date.now(), checked, hot: plan.hot.length, cold: plan.cold.length, refreshed, behind }
+  telemetry(cfg, state, 'workspace-sweep', { checked, hot: plan.hot.length, cold: plan.cold.length, refreshed, behind })
+}
+
+/**
+ * 活动驱动节流踢发：不养 setInterval（宿主生命周期里没有"插件自己的时钟"，
+ * 定时器还要自己管 unref/清理）。事件与渲染路径每次路过都踢一脚，真正的节流
+ * 在这里：workspaceSweepSec 窗口内、或上一轮还没跑完，直接返回。
+ */
+function kickWorkspaceSweep(ctx, cfg, state, signal) {
+  try {
+    if (!cfg.sessionRefresh) return
+    const every = Number(live(cfg.workspaceSweepSec) ?? 0) * 1000
+    if (!every) return
+    if (state.sweepRunning) return
+    const now = Date.now()
+    if (now - (state.sweepKickAt ?? 0) < every) return
+    state.sweepKickAt = now
+    state.sweepRunning = true
+    void runWorkspaceSweep(ctx, cfg, state, signal)
+      .catch((error) => telemetry(cfg, state, 'workspace-sweep-fail', { message: String(error?.message ?? error).slice(0, 200) }))
+      .finally(() => { state.sweepRunning = false })
+  } catch { /* 监听器里绝不抛 */ }
+}
+
+/**
  * v0.18.0 O2 查询时自愈：结构查询命中「本工作区没进图」时，替用户把首建跑一次。
  * 与补偿刷新的分工：refreshSessionWorkspace 管**已索引过**的仓防漂移（git 状态变
  * 了才重建）；这里管**从没索引过**的仓——正是审计坐实的那道缺口
@@ -962,6 +1091,8 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
  */
 async function selfHealIndex(ctx, cfg, state, cwd, sess, signal) {
   if (!cfg.autoSelfHeal) return { ok: false, skipped: 'off' }
+  // 仓库根归一：与补偿刷新/项目解析同一个 key，否则会把子目录当成第二个仓再建一份。
+  cwd = await repoRootOf(ctx, state, cwd, signal)
   // 静默出口也记一行：N4 这类「钩子踢了但没见 spawn」的排障，没有 reason 就只能猜门。
   if (state.cbm !== 'ready') { telemetry(cfg, state, 'self-heal-skip', { cwd, reason: 'engine' }); return { ok: false, skipped: 'engine' } }
   if (state.selfHealAttempted.has(cwd)) { telemetry(cfg, state, 'self-heal-skip', { cwd, reason: 'attempted' }); return { ok: false, skipped: 'attempted' } }
@@ -1307,6 +1438,9 @@ function refreshProjectsListing(ctx, cfg, state, attempt = 0) {
  * 跑 code_index，而真正的原因（代理层报错/超时）一个字都没露。
  */
 async function projectFor(ctx, exec, cfg, state, session, cwd, budgetMs = budgetGraph(cfg)) {
+  // v0.23.0：按 git toplevel 归一。子目录会话与仓库根会话必须共享同一个 project，
+  // 否则 cbm 项目表里记的是仓库根，这里拿子目录去比，永远 notIndexed（会反复自愈/重建）。
+  cwd = await repoRootOf(ctx, state, cwd, state.abortSignal)
   if (session.project) return { project: session.project, reason: '' }
   const cached = state.projectsByCwd.get(cwd)
   if (cached) { session.project = cached; return { project: cached, reason: '' } }
@@ -1429,6 +1563,8 @@ function renderStats(cfg, state) {
     // v0.15.0 M1：project 清单的取用方式——hot=热路径现查 list_projects（应趋零），
     // cacheHit=命中预热留下的清单（零成本）。hot 不降就是预热没生效。
     listProjects: { hot: n('list-projects:hot'), cacheHit: n('list-projects:cache-hit') },
+    // v0.23.0：多工作区轮扫的读数（关着时 everySec=0；last 是上一轮结论）。
+    sweep: { everySec: live(cfg.workspaceSweepSec), last: state.lastSweep },
     // 图谱腿当前生效的预算（ms）：面板要让"为什么慢"能一眼看到。
     budget: { graph: budgetGraph(cfg) },
     // v0.18.0 O2：代跑首建的读数。start=被查询踢起过、done=建图成功、failed=失败
@@ -1647,14 +1783,18 @@ async function runCbmFlow(ctx, cfg, state, exec, work) {
   // 杠杆 ① 的采纳率读数：模型真的在用封装动词吗？两个封装工具共用这条动线，
   // 所以计一次点在这里，而不是各自的 execute 里。
   telemetry(cfg, state, 'wrapper-call', {})
-  const cwd = exec?.agent?.session?.header?.cwd
-  if (!cwd) throw new Error('封装工具需要会话工作区：exec.agent.session.header.cwd 为空')
+  const sessionCwd = exec?.agent?.session?.header?.cwd
+  if (!sessionCwd) throw new Error('封装工具需要会话工作区：exec.agent.session.header.cwd 为空')
+  // 仓库根归一后再查项目/测新鲜度：封装工具在子目录会话里也必须命中父仓的图。
+  const cwd = await repoRootOf(ctx, state, sessionCwd, exec.signal)
   await bootstrap(ctx, cfg, state, exec.signal).catch((error) => {
     state.lastError = String(error?.message ?? error)
     state.ok = false
   })
   if (state.adapter !== 'ready') throw new Error('压缩层(②)未就绪，检索无法工作：\n' + report(cfg, state))
   if (state.cbm !== 'ready') throw new Error(cbmInstallHint(state))
+  // 模型已经在用封装动词 = 这个工作区是热的；顺手踢一脚轮扫（内部节流）。
+  kickWorkspaceSweep(ctx, cfg, state, exec.signal)
   const sess = sessionOf(state, sessionKey(exec.agent))
   const { project, reason, notIndexed } = await projectFor(ctx, exec, cfg, state, sess, cwd, WRAPPER_BUDGET_MS)
   if (!project) {
@@ -1762,6 +1902,11 @@ export async function apply(ctx, config) {
     // P0-5 D：事件时算出的 digest 对照结论（cwd → 'equal'|'differ'）。hint 的渲染
     // 是同步的，读不到 git；只在事件里算一次，渲染层只读这个缓存，绝不现推。
     digestVerdict: new Map(),
+    // v0.23.0：git toplevel 归一缓存（cwd → {root, at}）。hint / 拦截是同步热路径，
+    // 读它拿仓库根，避免每轮 spawn git。
+    repoRoots: new Map(),
+    // v0.23.0 轮扫：仓库根 → 最近一次求值时间（热/冷判据），以及游标/在跑/上一轮结论。
+    workspaces: new Map(), sweepCursor: 0, sweepKickAt: 0, sweepRunning: false, lastSweep: null,
     // v0.18.0 O2：每个 cwd 只自愈一次（成败都不再重试——失败再来一遍只会把
     // 同一个坑磕出满屏日志，处方仍然是显式 code_index）。
     selfHealAttempted: new Set(),
@@ -1826,18 +1971,36 @@ export async function apply(ctx, config) {
     text: () => usageSection(state),
   }), 'dsh-codebase-memory.usage-section')
 
-  // H2：会话启动补偿刷新。监听器必须**同步且绝不抛**——它跑在 agent 启动的发布路径上，
-  // 所以这里只做特性探测 + 启动后台任务（`on` 不存在就静默降级，不违"boot 绝不 throw"）。
-  if (cfg.sessionRefresh && typeof ctx.on === 'function') {
-    ctx.on('agent/session-start', (payload) => {
-      try {
-        const cwd = payload?.agent?.session?.header?.cwd
-        // 绝不静默吞掉失败：detached 的后台任务没人看 stdout，只有日志能事后定位。
-        void refreshSessionWorkspace(ctx, cfg, state, payload?.agent, ac.signal)
-          .catch((error) => refreshLog(cfg, `fail ${cwd ?? '(无 cwd)'}: 未捕获 ${String(error?.message ?? error).slice(0, 160)}`))
-      } catch (error) {
-        push(state, `会话启动刷新未能启动（已忽略）：${String(error?.message ?? error).slice(0, 120)}`)
-      }
+  // H2：会话启动补偿刷新 + 多工作区轮扫。**只挂宿主真实发射的事件**（v0.23.0 修）：
+  //   agent/created   载荷 {agent, source, signal}，source ∈ fresh|resume|clear|compaction
+  //                   （dsh-agent/lib/index.js:581）——会话真正的起点。
+  //   agent/pre-step  waterfall `(payload, next)`，每步模型请求前一次
+  //                   （dsh-agent-loop/lib/index.js:909）——长会话里持续给轮扫"心跳"，
+  //                   整条链路不依赖任何墙钟定时器。
+  //   agent/disposed  载荷 {agent}（dsh-agent/lib/index.js:552）——收掉会话缓存。
+  // 监听器同步返回、后台任务自己兜错：它们跑在 agent 的发布/步进路径上，
+  // 插件出问题绝不能把会话弄坏。
+  if (typeof ctx.on === 'function') {
+    if (cfg.sessionRefresh) {
+      ctx.on('agent/created', (payload) => {
+        try {
+          const cwd = payload?.agent?.session?.header?.cwd
+          // 绝不静默吞掉失败：detached 的后台任务没人看 stdout，只有日志能事后定位。
+          void refreshSessionWorkspace(ctx, cfg, state, payload?.agent, ac.signal)
+            .catch((error) => refreshLog(cfg, `fail ${cwd ?? '(无 cwd)'}: 未捕获 ${String(error?.message ?? error).slice(0, 160)}`))
+          kickWorkspaceSweep(ctx, cfg, state, ac.signal)
+        } catch (error) {
+          push(state, `会话启动刷新未能启动（已忽略）：${String(error?.message ?? error).slice(0, 120)}`)
+        }
+      })
+      ctx.on('agent/pre-step', (payload, next) => {
+        kickWorkspaceSweep(ctx, cfg, state, ac.signal)
+        return next()
+      })
+    }
+    ctx.on('agent/disposed', (payload) => {
+      const key = sessionKey(payload?.agent)
+      if (key) state.sessions.delete(key)
     })
   }
 
@@ -2279,10 +2442,14 @@ export async function apply(ctx, config) {
         try {
           if (!cfg.contextHint) return '' // 关着：一行都不注入，也不计数
           if (!state.ok) return '' // 链路没就绪就别推荐
+          // 每次装配都路过这里：轮扫的节流在 kick 里，这里只负责"踢一脚"。
+          kickWorkspaceSweep(ctx, cfg, state, ac.signal)
           const agent = assembly?.agent
-          const cwd = agent?.session?.header?.cwd
+          const sessionCwd = agent?.session?.header?.cwd
           const key = sessionKey(agent)
-          if (!key || !cwd) return ''
+          if (!key || !sessionCwd) return ''
+          // 同步渲染拿不到 git：用异步路径缓存下来的 toplevel 归一结果（没算过就退回 cwd）。
+          const cwd = state.repoRoots.get(sessionCwd)?.root || sessionCwd
           const query = lastUserQuery(agent)
           const sess = sessionOf(state, key)
           const dirty = sess.dirty.size

@@ -159,7 +159,7 @@ function makeCtx(tools, sections, events = {}, contexts = [], proxy = null, opts
   let abortedOnce = false
   return {
     effect: (fn) => fn(),
-    // 记录监听器而不是吞掉：H2 的会话启动刷新挂在 'agent/session-start' 上，验收要能调到它。
+    // 记录监听器而不是吞掉：H2 的会话启动刷新挂在 'agent/created' 上，验收要能调到它。
     on: (name, fn) => { (events[name] ??= []).push(fn) },
     // emit 同样记账而不抛 "not a function"：读数通道的节流 emit 要靠它断言。
     emit: (...args) => { (opts.emits ??= []).push(args) },
@@ -294,7 +294,7 @@ async function verify(profile) {
   // 必须在 import 之前设：这个值在模块加载时读一次。
   process.env.DSH_CBM_WARM_DELAY_MS = '0'
   const mod = await import(pathToFileURL(installed).href)
-  const { apply, name, inject, engineVerdict, fileDrift, classifyPattern, truncateCodepoints, isGrepLike, normPath, projectFromListing, freshnessOf, dropDirtyRows, Config, parseAdapterProcsWin, parseAdapterProcsPosix, DEFAULT_ADAPTER_VERSION } = mod
+  const { apply, name, inject, engineVerdict, fileDrift, classifyPattern, truncateCodepoints, isGrepLike, normPath, projectFromListing, freshnessOf, dropDirtyRows, sweepPlan, Config, parseAdapterProcsWin, parseAdapterProcsPosix, DEFAULT_ADAPTER_VERSION } = mod
   if (name !== 'dsh-codebase-memory') throw new Error(`unexpected plugin name: ${name}`)
   record('装载', true, `name=${name}  inject=${inject.join(',')}`)
 
@@ -314,7 +314,10 @@ async function verify(profile) {
     const contexts = []
     const events = {}
     const emits = []
-    await apply(makeCtx(tools, sections, events, contexts, proxy, { ...(ctxOpts ?? {}), emits }), config)
+    // v0.23.0：轮扫在验收里默认关档。它会按真实 refresh-stamps.json 去碰真引擎
+    // （后台起 index_repository 重建几个仓），那是几十分钟的副作用，不该由单元验收付。
+    // 测轮扫的臂自己显式打开（臂 S3）。
+    await apply(makeCtx(tools, sections, events, contexts, proxy, { ...(ctxOpts ?? {}), emits }), { workspaceSweepSec: 0, ...config })
     if (!tools.has('code_index') || !tools.has('code_setup')) {
       throw new Error(`期望注册 code_index + code_setup，实际 ${[...tools.keys()].join(',')}`)
     }
@@ -395,6 +398,18 @@ async function verify(profile) {
   // 前缀缓存硬约束：常驻段同会话字节不变（两次渲染全等）。
   record('P0-2 常驻段字节稳定', a.sections.at(-1).text() === a.sections.at(-1).text())
 
+  // 臂 G 用的替身从这里起就可用：臂 E/S 先要调 handler，源码里 const 不提升，
+  // 所以这批 helper 必须声明在第一个用到它的臂之前（v0.23.0 踩过一次 TDZ）。
+  const next = async () => ({ kind: 'allow' })
+  const nextPost = async () => ({ kind: 'accept' }) // 宿主 post-execute 的默认决策
+  const fakeAgent = (id, cwd, events) => ({
+    session: {
+      header: { id, cwd },
+      ...(events ? { snapshotEvents: () => events } : {}),
+    },
+  })
+  const sig = () => AbortSignal.timeout(60000)
+
   // ── 臂 E：A 的 lifecycle + H2 的会话启动补偿刷新 ──────────────────────────────
   const manifest = JSON.parse(readFileSync(join(ADAPTER_DIR, 'cbm.json'), 'utf8'))
   record('E 清单用 keep-alive（启动即连接，消除会话启动竞态）',
@@ -404,17 +419,32 @@ async function verify(profile) {
   record('E 真清单带 settings.scriptMode（缺席 ⇒ 臂 A bootstrap 没按新代码重写清单）',
     manifest.settings?.scriptMode === true, `实际=${JSON.stringify(manifest.settings ?? null)}`)
 
-  const startHandlers = a.events['agent/session-start'] ?? []
-  record('E 注册了 agent/session-start 监听', startHandlers.length === 1, `handlers=${startHandlers.length}`)
+  const startHandlers = a.events['agent/created'] ?? []
+  record('E 注册了真事件 agent/created 的监听（会话起点）', startHandlers.length === 1, `handlers=${startHandlers.length}`)
   const off = await mount({ sessionRefresh: false })
-  record('E sessionRefresh=false 时确实不注册监听', (off.events['agent/session-start'] ?? []).length === 0)
+  record('E sessionRefresh=false 时确实不注册刷新监听',
+    (off.events['agent/created'] ?? []).length === 0 && (off.events['agent/pre-step'] ?? []).length === 0)
+  // 事件名白名单（v0.23.0 补的牙）：宿主只发这些事件，插件也只能挂这些。
+  // 旧版这里写的是 agent/session-start——宿主从没发过它，而 makeCtx 会把任意名字
+  // 收进 events[]，测试自己再手工调用，于是事件名写错也全绿。这条臂直接读源码，
+  // 不经过替身，所以"替身比宿主宽容"这个洞在这里补不上。
+  const DSH_EVENTS = new Set([
+    'agent/created', 'agent/disposed', 'agent/pre-step', 'agent/request',
+    'system-prompt/assemble', 'system-prompt/change', 'tools/pre-execute', 'tools/post-execute',
+    'session/created', 'session/event', 'workspace/session-activity', 'llm/stream', 'internal/update',
+  ])
+  const hookSrc = readFileSync(join(REPO, 'index.js'), 'utf8')
+  const subscribed = [...hookSrc.matchAll(/ctx\.on\('([^']+)'/g)].map((m) => m[1])
+  const unknownEvents = [...new Set(subscribed)].filter((name) => !DSH_EVENTS.has(name))
+  record('E 插件订阅的每个事件都是 DSH 真实发射的（防「假事件」回潮）',
+    unknownEvents.length === 0, unknownEvents.length ? `不在白名单: ${unknownEvents.join(', ')}` : `订阅 ${[...new Set(subscribed)].join(' / ')}`)
 
   // 非 git 工作区必须被闸门挡下：既证明监听器跑通了，也证明它没为无意义的仓库付索引开销。
   const nonGit = join(tmpdir(), `cbm-check-nongit-${process.pid}`)
   mkdirSync(nonGit, { recursive: true })
   let syncThrow = null
   try {
-    startHandlers[0]?.({ agent: { session: { header: { cwd: nonGit } } }, source: 'startup' })
+    startHandlers[0]?.({ agent: { session: { header: { cwd: nonGit } } }, source: 'fresh', signal: sig() })
   } catch (error) {
     syncThrow = String(error?.message ?? error)
   }
@@ -425,6 +455,66 @@ async function verify(profile) {
   const mine = logText.split('\n').filter((line) => line.includes(String(process.pid)))
   record('E 非 git 工作区被闸门跳过', mine.some((line) => /非 git 工作区/.test(line)), (mine.at(-1) ?? '(日志里没有本次记录)').slice(0, 130))
   rmSync(nonGit, { recursive: true, force: true })
+  // agent/pre-step：每一步都得把 next() 放行，否则会话卡在第一步。
+  const preStepHandlers = a.events['agent/pre-step'] ?? []
+  let stepped = 0
+  const stepResult = await (preStepHandlers[0]?.({ agent: fakeAgent(`sess-${process.pid}-step`, REPO), messages: [], signal: sig(), step: 1 }, () => { stepped++; return 'continued' }) ?? Promise.resolve('missing'))
+  record('E agent/pre-step 放行并调用 next()（不阻断会话步进）', stepResult === 'continued' && stepped === 1, `result=${stepResult} next=${stepped}`)
+  record('E 注册了 agent/disposed 监听（会话结束收缓存）', (a.events['agent/disposed'] ?? []).length === 1)
+
+  // ── 臂 S（v0.23.0）：多工作区轮扫 ────────────────────────────────────────────
+  // S1 纯函数证伪调度公平性：热仓每轮都查，冷仓 round-robin 不饿死，空集不炸。
+  const sNow = Date.now()
+  const sp1 = sweepPlan({ eligible: ['c1', 'h1', 'c2', 'c3'], seen: new Map([['h1', sNow - 60_000]]), now: sNow, coldPerRound: 1, cursor: 0 })
+  record('S sweepPlan 热仓（30 分钟内碰过）每轮必查且排在冷仓前',
+    sp1.hot.join(',') === 'h1' && sp1.order[0] === 'h1' && sp1.cold.length === 1, JSON.stringify(sp1))
+  const sp2 = sweepPlan({ eligible: ['c1', 'h1', 'c2', 'c3'], seen: new Map([['h1', sNow - 60_000]]), now: sNow, coldPerRound: 1, cursor: sp1.cursor })
+  const sp3 = sweepPlan({ eligible: ['c1', 'h1', 'c2', 'c3'], seen: new Map([['h1', sNow - 60_000]]), now: sNow, coldPerRound: 1, cursor: sp2.cursor })
+  record('S sweepPlan 冷仓按游标 round-robin（三轮把 3 个冷仓都轮到，不饿死）',
+    new Set([sp1.cold[0], sp2.cold[0], sp3.cold[0]]).size === 3,
+    `轮1=${sp1.cold[0]} 轮2=${sp2.cold[0]} 轮3=${sp3.cold[0]}`)
+  const spEmpty = sweepPlan({ eligible: [], seen: new Map(), now: sNow })
+  record('S sweepPlan 空候选返回空计划（无仓库的机器不写噪声）',
+    spEmpty.order.length === 0 && spEmpty.hot.length === 0 && spEmpty.cold.length === 0 && spEmpty.cursor === 0, JSON.stringify(spEmpty))
+  record('S 轮扫默认开（300 秒）：关的是配置值，不是代码里硬编码 0',
+    /workspaceSweepSec: z\.number\(\)\.default\(300\)/.test(hookSrc) && /轮扫: off/.test(await a.tools.get('code_setup').execute({}, withSignal(REPO))),
+    '源码含 default(300)；验收里 workspaceSweepSec:0 ⇒ 报表显示 off')
+
+  // S2 仓库身份归一：会话 cwd 是仓库子目录，stamp/日志必须记仓库根。
+  // 用本仓的 checks/ 子目录真跑一次 handler（真 git 两次调用，走冷却短路，不重建）。
+  const sSub = join(REPO, 'checks')
+  const sStampFile = join(ADAPTER_DIR, 'refresh-stamps.json')
+  const sStampBackup = existsSync(sStampFile) ? readFileSync(sStampFile, 'utf8') : null
+  try {
+    writeFileSync(sStampFile, JSON.stringify({ [REPO]: { at: Date.now(), digest: 'built|0|0' } }), 'utf8')
+    startHandlers[0]?.({ agent: fakeAgent(`sess-${process.pid}-sub`, sSub), source: 'fresh', signal: sig() })
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    const sLog = existsSync(refreshLogPath) ? readFileSync(refreshLogPath, 'utf8') : ''
+    record('S 子目录会话被归一到 git toplevel（stamp/日志只认仓库根，不建第二份）',
+      sLog.includes(`skip ${REPO}: 冷却中`) && !sLog.includes(`skip ${sSub}: 冷却中`),
+      sLog.includes(`skip ${REPO}: 冷却中`) ? `记到 ${REPO}` : '(没记到仓库根)')
+  } finally {
+    if (sStampBackup === null) rmSync(sStampFile, { force: true })
+    else writeFileSync(sStampFile, sStampBackup, 'utf8')
+  }
+
+  // S3 轮扫端到端：打开轮扫 → 首发踢发 → 候选走冷却短路 → 报表/状态留下这一轮的账。
+  const sw = await mount({ workspaceSweepSec: 60 })
+  await sw.tools.get('code_setup').execute({}, withSignal(REPO))
+  const swStampFile = join(ADAPTER_DIR, 'refresh-stamps.json')
+  const swBackup = existsSync(swStampFile) ? readFileSync(swStampFile, 'utf8') : null
+  try {
+    writeFileSync(swStampFile, JSON.stringify({ [REPO]: { at: Date.now(), digest: 'built|0|0' } }), 'utf8')
+    sw.events['agent/created'][0]({ agent: fakeAgent(`sess-${process.pid}-sweep`, REPO), source: 'fresh', signal: sig() })
+    await new Promise((resolve) => setTimeout(resolve, 2500))
+    const swReport = await sw.tools.get('code_setup').execute({}, withSignal(REPO))
+    record('S 轮扫被事件踢发并留下一轮的账（checked=1，冷却短路未重建）',
+      /轮扫: on\(60s\) 候选=\d+ 上轮 checked=1 hot=\d+ cold=\d+ refreshed=0/.test(swReport),
+      /轮扫:.*$/m.exec(swReport)?.[0] ?? '(报表里没有轮扫行)')
+  } finally {
+    if (swBackup === null) rmSync(swStampFile, { force: true })
+    else writeFileSync(swStampFile, swBackup, 'utf8')
+  }
 
   // ── 臂 Z（v0.17.0 起语义层整体移除）：原「zgEnabled 三态接线」臂改成防回潮锁。
   // 删的依据：telemetry 三个月 code-search=1 次生产调用、zg 索引维护失败率 72:20、
@@ -553,15 +643,6 @@ async function verify(profile) {
   }
 
   // ── 臂 G：触发层（杠杆 ①②③⑤ 的决策逻辑，走假代理工具，不依赖真引擎）────────
-  const next = async () => ({ kind: 'allow' })
-  const nextPost = async () => ({ kind: 'accept' }) // 宿主 post-execute 的默认决策
-  const fakeAgent = (id, cwd, events) => ({
-    session: {
-      header: { id, cwd },
-      ...(events ? { snapshotEvents: () => events } : {}),
-    },
-  })
-  const sig = () => AbortSignal.timeout(60000)
   const grepExec = (agent, pattern, extra = {}) => ({ name: 'grep', arguments: { pattern, ...extra }, agent, signal: sig() })
 
   // G1 分类器：符号类与字面量类的正反例。判据是**误拦为 0**，不是召回率。
@@ -642,7 +723,7 @@ async function verify(profile) {
   const stampBackup = existsSync(stampFile) ? readFileSync(stampFile, 'utf8') : null
   try {
     writeFileSync(stampFile, JSON.stringify({ [REPO]: { at: Date.now(), digest: 'built|0|0' } }), 'utf8')
-    g.events['agent/session-start'][0]({ agent: probeAgent, source: 'startup' })
+    g.events['agent/created'][0]({ agent: probeAgent, source: 'fresh', signal: sig() })
     await new Promise((resolve) => setTimeout(resolve, 1500))
     const bhint = (g.contexts ?? []).find((c) => c.name === 'codebase-memory:hint')
     const bhintText = typeof bhint?.text === 'function' ? bhint.text({ agent: probeAgent }) : ''
@@ -761,7 +842,7 @@ async function verify(profile) {
   // recentLimit / markPassthrough——它们在 Config 里都标了 volatile（页面可写、
   // 决策点现读），名单漏了就会让"标错等于对 UI 撒谎"这条断言失去意义。
   const VOLATILE_KEYS = ['enforce', 'interceptTools', 'interceptBudgetMs', 'contextHint', 'telemetry', 'dirtyTracking', 'stats',
-    'logRetentionDays', 'recentLimit', 'markPassthrough', 'graphBudgetMs', 'staleWarnFiles', 'staleWarnMinIntervalSec', 'autoSelfHeal']
+    'logRetentionDays', 'recentLimit', 'markPassthrough', 'graphBudgetMs', 'workspaceSweepSec', 'staleWarnFiles', 'staleWarnMinIntervalSec', 'autoSelfHeal']
   // schemastery 的字段表在 `Config.dict`（宿主 dsh-settings 的 volatileForm 也是递归它）。
   const marked = VOLATILE_KEYS.filter((k) => Config?.dict?.[k]?.meta?.volatile === true)
   record('G 即时热改字段 + 观测字段 + 读数通道在 Config 里标了 volatile（宿主才肯 serve/写）', marked.length === VOLATILE_KEYS.length, `标了的是 ${marked.join(',') || '(无)'}`)

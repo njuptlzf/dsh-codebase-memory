@@ -11,6 +11,7 @@
 - [安装](#安装)
 - [怎么用](#怎么用)（含[话术清单](#3-话术清单实测有效)、[AGENTS.md 模板](#4-怎么写-agentsmd一劳永逸)与 [SKILL 随插件维护](#5-skill-随插件仓库维护)）
 - [DSH 怎么找到它，模型又怎么开始用它](#dsh-怎么找到它模型又怎么开始用它)
+- [DSH 生命周期：插件挂在哪些事件上](#dsh-生命周期这个插件到底挂在哪些事件上)
 - [引擎兼容性（codebase-memory-mcp 变了会怎样）](#引擎兼容性codebase-memory-mcp-变了会怎样)
 - [配置](#配置可选)
 - [验收](#验收)
@@ -64,7 +65,7 @@ Unblock-File .\install.ps1; .\install.ps1 --skip-config
 本插件没有 npm 包，也没有 `dsh install` 命令——装插件就是 `dsh plugin <args>`，本质是在 profile 目录里跑 pnpm。所以直接从 GitHub 装：
 
 ```powershell
-dsh plugin --profile <你的profile> add github:njuptlzf/dsh-codebase-memory#v0.22.0
+dsh plugin --profile <你的profile> add github:njuptlzf/dsh-codebase-memory#v0.23.0
 ```
 
 `#<tag>` 要留着：tag 钉死一个 commit，之后 `pnpm install` 不会悄悄漂移。要更新时改 tag（或去掉 tag 跟随 `main`）；卸载 `dsh plugin --profile <p> remove dsh-codebase-memory`。
@@ -272,6 +273,36 @@ code_index（建索引 / 改完代码后刷新）
 
 为什么用原生订阅而不是官方桥接包：`dsh-hooks-claude-code` 在本机**任何 profile 都没装**（模块只在 DSH 安装树里，`.dsh-module-fallback` 不带 `@deepseek-ai/*`），挂它 = 装包 + 加 bundle 行 + 写 `hooks.json` + 重启；而外部 shell 钩子按生态自己的说法"能观察、能否决，但没法把文本交回模型"。在插件内部我们既能 deny，又能把**答案本身**写进 deny 的 reason，还能读到 project、索引新鲜度与本会话脏路径——这些正是钩子成立的前提。
 
+## DSH 生命周期：这个插件到底挂在哪些事件上
+
+插件只接宿主的**真实**生命周期总线。下表是完整清单——事件 → 宿主在哪里发射 → 我们在哪个阶段介入 → 做什么。
+没列出的事件不是漏了，是我们不订阅。
+
+| DSH 事件 | 发射点（宿主） | 介入阶段 | 插件做什么 |
+|---|---|---|---|
+| `apply()`（bundle 挂载） | `dsh` bundle 加载器 | 加载 | 注册工具（`code_find`、`code_callers`、`code_index`、`code_setup`）、常驻 prompt 段、条件提示、下面这些监听器。不做 I/O。 |
+| `agent/created` | `dsh-agent/lib/index.js:581`（`{agent, source, signal}`，source ∈ fresh/resume/clear/compaction） | agent 已存在、首个请求之前 | 补偿刷新：把 `session.cwd` 归一到 git toplevel，比 stamp 里的 digest 与当前 digest，**只**在这个仓已索引过且 digest 真变了时后台重建；随后踢一轮工作区轮扫。 |
+| `agent/pre-step` | `dsh-agent-loop/lib/index.js:909`（waterfall `(payload, next)`） | 每次模型请求之前 | 踢工作区轮扫（按 `workspaceSweepSec` 节流），然后 `next()`。这是"不养定时器也能让别的工作区保鲜"的心跳。 |
+| `agent/disposed` | `dsh-agent/lib/index.js:552` | agent 销毁之后 | 删掉该会话的缓存（脏台账、project、已拦符号）。 |
+| `tools/pre-execute` | `dsh-tools/lib/index.js:3321` | 工具执行之前 | 符号类 `grep` 拦截（`enforce: deny` / `deny-once`）：按会话 cwd 解析 project、查图、把命中写进 deny 的 reason。任何前提不满足都 fail-open。 |
+| `tools/post-execute` | `dsh-tools/lib/index.js:3321` | 工具执行之后 | 两个监听器，注册顺序有意义：① 写后记账（`write`/`edit` 路径，之后坐标一律不信）；② `enforce: replace`——把符号类 `grep` 的输出换成图谱命中（只换成功结果；脏文件按命中行过滤）。 |
+| `systemPrompt.section` / `systemPrompt.context`（注册面，不是事件） | 在 `system-prompt/assemble`（`dsh-system-prompt/lib/index.js:398`）时渲染 | prompt 组装 | 段：有预算的常驻动线（同会话字节不变，保住前缀缓存）。context：按问法懒算的条件提示——新鲜度判定、"索引落后于工作区"提醒、轮扫踢发。 |
+
+刻意**不**订阅的事件，以及原因：
+
+| DSH 事件 | 为什么不接 |
+|---|---|
+| `agent/request` | prompt/提示已经走 `system-prompt/assemble`；再看一遍同一个请求只是往模型热路径上多挂一个钩子。 |
+| `system-prompt/assemble` | 我们通过 `section`/`context` 注册面参与，宿主就在那个阶段渲染——再订阅事件本身是重复劳动。 |
+| `system-prompt/change`、`internal/update` | 配置/发现类插件的观察型事件，这里没有任何逻辑依赖它们。 |
+| `session/created`、`session/event` | 会话级总线事件；我们要的工作区身份在 `agent/created` 里随 `agent.session.header.cwd` 就到了，并且归一到 git toplevel。 |
+| `workspace/session-activity` | 工作区记账；轮扫由 agent 活动 + 提示渲染路径驱动，不需要读它。 |
+| `llm/stream` | 逐 token 流不是索引或拦截的输入。 |
+
+**这张表是承重的。** 到 v0.22.0 为止，本插件订阅的是 `agent/session-start`——宿主根本不发这个事件。
+线上它是死代码，而测试替身（任何名字都收进 `events[]`、再由测试自己手工调用）一直让它绿着。
+v0.23.0 起套件里有一条读 `index.js` 原文的锁：**任何** `ctx.on(...)` 的事件名不在宿主真实清单里就直接红。
+
 ## 引擎兼容性（codebase-memory-mcp 变了会怎样）
 
 **本插件按"契约"依赖引擎，不按包版本**——它从不 import cbm，只 shell 它的二进制（单独安装、运行期才发现版本，`code_setup` 会打印）。所以上游升级**不会**在安装期报错，只可能在**使用期**坏在我们依赖的东西上：
@@ -300,7 +331,8 @@ code_index（建索引 / 改完代码后刷新）
 | `adapterDir` | `$DSH_HOME/vendor/mcp-adapter` | 压缩层与 `cbm.json` 的落点 |
 | `cbmPath` | 自动探测 | 留空则按 官方安装位 → vendor → PATH 探测 |
 | `autoIndex` | `true` | 自举时把引擎的 `auto_index` 对齐到该值（先读后写，值相同不重复写）。**作用域警告**：它落在机器级共享的 `~/.cache/codebase-memory-mcp/_config.db`，同机所有 MCP client 共用——不想让本插件替你决定就设成 `false`。实测语义：只给**尚无索引**的项目在会话启动时补一次全量，**不刷新陈旧坐标**，所以它不是防漂移手段（防漂移仍是 `code_index` + `check_index_coverage`） |
-| `sessionRefresh` | `true` | 会话启动（`agent/session-start`）时后台刷新**会话工作区**的索引，闸门为（git 状态变了）∧（该项目已索引过）∧（5 分钟冷却）。用来补引擎 watcher 在多工作区宿主下覆盖不到的洞——见[已知限制](#已知限制与不做)。设 `false` 关闭 |
+| `sessionRefresh` | `true` | 会话开始（`agent/created`，宿主真实事件）时后台刷新**会话工作区**的索引，闸门为（git 状态变了）∧（该项目已索引过）∧（5 分钟冷却）；会话 cwd 先归一到 git toplevel。用来补引擎 watcher 在多工作区宿主下覆盖不到的洞——见[已知限制](#已知限制与不做)。设 `false` 同时关掉这条刷新与工作区轮扫 |
+| `workspaceSweepSec` | `300` | 后台工作区轮扫间隔（volatile，设置页可改，标签为「工作区轮扫间隔（秒）」）。DSH 是多会话/多工作区宿主，而引擎的 git watcher 只跟 MCP 进程那个静态 cwd——不轮扫，别的工作区的图就一直停在上一轮建图。每轮对本进程见过的仓比 git digest：热仓（30 分钟内碰过）每轮都查，冷仓按游标 round-robin 每轮至多 6 个；重建仍要求 digest 真变了 ∧ 已索引过。`0` 关闭轮扫。踢发来自 `agent/created`、`agent/pre-step`、提示渲染路径与 `runCbmFlow`——不养定时器 |
 | `wrapperTools` | `true` | 层 ①：注册 `code_find` / `code_callers`。设 `false` 只剩代理工具 |
 | `enforce` | `off` | **热改**（设置页）。层 ②/②b：`off` / `deny-once`（符号类 grep 每会话每符号拒一次）/ `deny`（每次都拒）/ `replace`（grep 照常跑，模型看到的输出换成图谱命中，不出错误）。**replace 是"硬替换"的正经档位**：不跟模型打"先查索引"的嘴仗，直接把结果摆它面前。要升 `deny` 先拿遥测证明误拦率可接受。（原 `advise`——post-execute 软提示注入——已于 2026-10-08 撤回；旧配置写 `advise` 会回落到 `off` 并在报表里提示） |
 | `interceptTools` | `grep,glob` | **热改**（设置页）。逗号分隔的内置工具名（裸名小写；`glob` 的 pattern 基本不会被判成符号） |
@@ -385,7 +417,7 @@ cbm CLI 同一台机器单次 search_graph        : 5491 / 6526 / 8280 ms  ← �
   - **`ctx.tools.execute(input)` 是公开方法**（`tools` 服务方法表里有）。①② 能用起来的前提就是它：走 keep-alive 长连接（实测 29–64ms），不 spawn CLI（5.5–8.3s）。入参 `{callId, name, arguments, agent?, signal}`。
   - `systemPrompt.context({name, order, text})`：`text` 必须是**字符串或同步函数**（异步/`undefined` 触发装配不变量），返回 `""` 才是"本轮不注入"；contexts 不进提示词，而是投影成一条 user 角色的 runtime-context 快照，`suppressRuntimeContext()`（极简预设）会**全量**丢掉它。
   - 提示词文本走严格的 `{{variable}}` 插值，任何引擎/用户来源文本都不能凑成合法的未注册变量（`noVars` 兜一层）。
-  - 本宿主**同时**有 `agent/created` 与 `agent/session-start`（后者由 `dsh-agent-loop` 在首个回合前 emit，带 `source`），且 `agent.inject(message)` 才是会话开始时喂模型可见上下文的正路——方案里"会话开始事件不可注入"只对 emit 的返回值成立。
+  - 本宿主发的是 `agent/created`（**没有** `agent/session-start`——那个名字在 v0.23.0 之前只存在于本插件里），`sessionRefresh` 挂在它上面；`agent.inject(message)` 才是从生命周期事件喂模型可见上下文的正路——"会话开始事件不可注入"只对 emit 的返回值成立。
 - **Windows 三连坑**（都已绕开）：PATH 上的 `npm.cmd` 不能无 shell spawn → 探测 `npm-cli.js` 直跑；cbm 的 `.cmd` shim 同理 → 清单里写绝对 `.exe`；PowerShell 5.1 按 ANSI 读无 BOM 的中文 `.ps1` → 仓库脚本一律 `.mjs` 用 node 跑。
 - **`ctx.subprocess.spawn` 的两条真实契约**（本版插件曾各栽一次，验收的假 ctx 现在照抄了它们）：
   1. `cwd` 必填——真实实现对 `spec.cwd.includes('\0')` 求值，`undefined` 直接 TypeError；
@@ -399,7 +431,7 @@ cbm CLI 同一台机器单次 search_graph        : 5491 / 6526 / 8280 ms  ← �
   1. *`tree` 是排版信封，不是源码*：默认渲染对**每一行**机械贴固定前导空格——`get_code_snippet` +2、`search_code --mode full` +8（偏移量随信封嵌套层数增长）。本来就顶格（col 0）的行和空行**照样**被贴，可见它是 `"  " + line` 而非 dedent/重排，照抄当锚点必不匹配；好在失败**很响**（`old_string was not found`），不可能静默改坏文件。**`format: "json"` 返回的是原文字节**：类方法（磁盘 `2/4/2` → json `2/4/2`，tree 却是 `4/6/4`）与顶层 interface（磁盘 `0` → json `0`，tree `2`）双格式对照通过，再从索引库直接枚举符号随机抽样、不经 `search_graph` 的 14/14 也全部逐字节相同。`get_code_snippet` 与 `search_code` 都支持。
   2. *坐标仍可能过期——这条才真危险*：`start_line`/`end_line` 取自索引、正文取自磁盘，所以未重新索引的改动之后，片段会**静默返回偏移过的、看着像真的但是错的区域**——`name` 和 `source_mode: full` 照旧、不报错。[上游 issue #1750](https://github.com/DeusData/codebase-memory-mcp/issues/1750) 记的就是它（仍 open）。`index_status` **看不出来**（一直报 `ready`），但 `check_index_coverage --paths <文件>` 能：`freshness = metadata_changed`、`recommended_action = read_source_and_reindex`——那是**信号**、不是修复。所以改完就 `code_index`，动手前用 `read` 取锚点。
   片段把 CRLF 归一成 LF **不算坑**：DSH 的 `edit` 是行尾感知的（LF 锚点能命中 CRLF 文件，写回时 CRLF 原样保留）。
-- **会话启动刷新——为什么插件要做一件"引擎本来就有"的事。** 引擎的自动更新建立在三个本宿主不成立的假设上：被监视的 project 是**MCP 服务进程 cwd** 那一个（单一、静态），watcher 只认 **git**（其他情况日志里是 `watcher.baseline strategy=none`），且它只活在**客户端会话**期间（实测：即便跑着 permanent daemon，会话结束后改动 **165s 仍不被感知**）。DSH 是一个 server 进程服务多个工作区各异的会话，所以引擎结构上跟不住会话工作区——而坐标一陈旧，`get_code_snippet` 就会**静默返回邻居的代码却标着正确的符号名**（实测真实仓库 59 个符号里 20 个）。于是有了 `sessionRefresh`：会话启动时，只要 git 状态变了、该项目已索引过、且过了 5 分钟冷却，就后台刷一次。真触发时的代价：约 15–30s 后台 CPU（1000 文件仓库 ≈ 21s；ruankao-ai ≈ 28–30s——墙钟主要是每次运行的固定开销，不是解析量）；git 状态没变的会话只需几十毫秒跳过。诚实的缺口：`agent/session-start` 是 **detached**，会话最初几次查询仍可能与刷新竞态；会话**中途**被别的会话改动不管；非 git 工作区刻意跳过。（**从没建过图**的工作区过去谁都不管——刷新闸门要求「已索引过」，查询侧只提示不代跑；v0.18.0 起这个洞由 `autoSelfHeal` 在查询侧补上：封装动词当场首建再答，钩子后台踢一脚，仍限 git 仓、每目录一次。）
+- **会话启动刷新——为什么插件要做一件"引擎本来就有"的事。** 引擎的自动更新建立在三个本宿主不成立的假设上：被监视的 project 是**MCP 服务进程 cwd** 那一个（单一、静态），watcher 只认 **git**（其他情况日志里是 `watcher.baseline strategy=none`），且它只活在**客户端会话**期间（实测：即便跑着 permanent daemon，会话结束后改动 **165s 仍不被感知**）。DSH 是一个 server 进程服务多个工作区各异的会话，所以引擎结构上跟不住会话工作区——而坐标一陈旧，`get_code_snippet` 就会**静默返回邻居的代码却标着正确的符号名**（实测真实仓库 59 个符号里 20 个）。于是有了 `sessionRefresh`：会话开始（`agent/created`）时，只要 git 状态变了、该项目已索引过、且过了 5 分钟冷却，就后台刷一次。真触发时的代价：约 15–30s 后台 CPU（1000 文件仓库 ≈ 21s；ruankao-ai ≈ 28–30s——墙钟主要是每次运行的固定开销，不是解析量）；git 状态没变的会话只需几十毫秒跳过。诚实的缺口：监听器同步返回（刷新是 detached 的），会话最初几次查询仍可能与刷新竞态；会话**中途**被别的会话改动，单发刷新管不到——这个残余缺口由轮扫（`workspaceSweepSec`）对本进程见过的每个仓补上；非 git 工作区刻意跳过。（**从没建过图**的工作区过去谁都不管——刷新闸门要求「已索引过」，查询侧只提示不代跑；v0.18.0 起这个洞由 `autoSelfHeal` 在查询侧补上：封装动词当场首建再答，钩子后台踢一脚，仍限 git 仓、每目录一次。）
 - **`lifecycle` 用 `keep-alive`，理由是启动竞态。** 服务在 extension load 时即连接（`init.ts:290-295`：只有 `keep-alive`/`eager` 进 `startupServers`），并打 keep-alive 标记、带健康检查重连。它规避两个毛病：普通 `lazy` 会在 adapter 默认 **10 分钟**空闲后被回收（`idleTimeout` 默认 10，只有 `eager`/`lazy-keep-alive` 会归零），一回收就把 cbm 的 session-managed daemon 与 watcher 一起带走；而 `lazy` 与 `lazy-keep-alive` 都是"**首次使用才连**"，于是 cbm 的 `auto_index` 与 watcher baseline 会与**第一次工具调用并发**——这正是 Claude Code 没有的启动竞态（它在会话启动时就连接已配置的 MCP server）。不用 `eager` 是因为它**没有自动重连**。**它不修的**：变更仍靠 git 轮询（实测 18–30s 才感知），且只覆盖"**服务进程 cwd**"那一个 project——会话中途的改动、别的工作区、非 git 根目录，仍归 `sessionRefresh` 与 `code_index` 管。代价：DSH host 启动即常驻一个 cbm 进程（实测约 17MB RSS）。
 - **平台**：当前实现按 Windows 写死（`.exe` 探测、`USERPROFILE` 回退、npm-cli.js 候选）。Linux/macOS 用户欢迎提 PR 或 issue。
 - **刷新是增量的——墙钟耗时主要花在固定开销上，而不是重解析。** 用节点 id 在临时 git 仓库上实测：**零改动**的 `code_index` **什么都不动**（每个节点 id 与 `sqlite_sequence` 完全一致）；**只改 1 个文件**时，只有**那个文件**的节点被换了 id——**19/19 未改动文件 id 分毫不动**。所以它并不是"每次重解析整个工作区"。你真正付的是每次运行的固定开销（进程启动、开库、变更检测）：1000 文件仓库约 21s、ruankao-ai 28–30s，而且几乎不随文件数增长（300 文件 ≈ 18s → 1000 文件 ≈ 21s）。**watcher** 是另一条代码路径：改 1 个文件后它还会把靠后的文件**重编号**（实测 `[18,53,54] → [18,54,55]`，而全局只多了 1 个 id），所以它的写入面比 CLI 路径宽。图新鲜度以你最后一次调用为准。

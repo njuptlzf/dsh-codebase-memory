@@ -250,31 +250,34 @@ ok(JSON.stringify(calls.set) === JSON.stringify([['contextHint', true], ['markPa
   'markPassthrough 开关即时写（不写进 enforce=off 的默认里）', JSON.stringify(calls.set))
 calls.set.length = 0
 const inputs = flatten(tree).filter((n) => n.type === primitives.Input)
-ok(inputs.length === 5, '五个输入框（interceptBudgetMs / graphBudgetMs / interceptTools / logRetentionDays / recentLimit——zgBudgetMs 随语义层删除）', String(inputs.length))
+ok(inputs.length === 6, '六个输入框（interceptBudgetMs / graphBudgetMs / workspaceSweepSec / interceptTools / logRetentionDays / recentLimit——zgBudgetMs 随语义层删除）', String(inputs.length))
 ok(inputs[0]?.props?.type === 'number' && inputs[0]?.props?.defaultValue === 2500
   && inputs[1]?.props?.defaultValue === 0
-  && inputs[2]?.props?.defaultValue === 'grep,glob'
-  && inputs[3]?.props?.defaultValue === 7 && inputs[4]?.props?.defaultValue === 100,
-  '输入框回填主机快照当前值', `${inputs[0]?.props?.defaultValue}|${inputs[1]?.props?.defaultValue}|${inputs[2]?.props?.defaultValue}|${inputs[3]?.props?.defaultValue}|${inputs[4]?.props?.defaultValue}`)
+  && inputs[2]?.props?.defaultValue === 300
+  && inputs[3]?.props?.defaultValue === 'grep,glob'
+  && inputs[4]?.props?.defaultValue === 7 && inputs[5]?.props?.defaultValue === 100,
+  '输入框回填主机快照当前值', `${inputs[0]?.props?.defaultValue}|${inputs[1]?.props?.defaultValue}|${inputs[2]?.props?.defaultValue}|${inputs[3]?.props?.defaultValue}|${inputs[4]?.props?.defaultValue}|${inputs[5]?.props?.defaultValue}`)
 inputs[0].props.onBlur({ target: { value: '1800' } })
 ok(JSON.stringify(calls.set) === JSON.stringify([['interceptBudgetMs', 1800]]),
   'blur 且值合法才写表单（数字已解析）', JSON.stringify(calls.set))
 const badNum = { value: 'abc' }
 const badCsv = { value: '   ' }
 inputs[0].props.onBlur({ target: badNum })
-inputs[2].props.onBlur({ target: badCsv })
-// 追加三输入（graphBudgetMs / logRetentionDays / recentLimit）也走 blur 才写；坏值一律不写并拨回默认
+inputs[3].props.onBlur({ target: badCsv })
+// 追加输入（graphBudgetMs / workspaceSweepSec / logRetentionDays / recentLimit）也走 blur 才写；坏值一律不写并拨回默认
 const badDays = { value: 'x' }
 const badLimit = { value: '0' }
-inputs[3].props.onBlur({ target: badDays })
-inputs[4].props.onBlur({ target: badLimit })
+const badSweep = { value: '-5' }
+inputs[2].props.onBlur({ target: badSweep })
+inputs[4].props.onBlur({ target: badDays })
+inputs[5].props.onBlur({ target: badLimit })
 ok(calls.set.length === 1 && badNum.value === '2500' && badCsv.value === 'grep,glob'
-  && badDays.value === '7' && badLimit.value === '100',
-  '非法/空值一个字节都不写，输入框拨回当前值', `${badNum.value}|${badCsv.value}|${badDays.value}|${badLimit.value}`)
+  && badDays.value === '7' && badLimit.value === '100' && badSweep.value === '300',
+  '非法/空值一个字节都不写，输入框拨回当前值', `${badNum.value}|${badCsv.value}|${badDays.value}|${badLimit.value}|${badSweep.value}`)
 let blurred = 0
 const fakeTarget = { blur: () => { blurred += 1 } }
-inputs[2].props.onKeyDown({ key: 'Enter', currentTarget: fakeTarget })
-inputs[2].props.onKeyDown({ key: 'a', currentTarget: fakeTarget })
+inputs[3].props.onKeyDown({ key: 'Enter', currentTarget: fakeTarget })
+inputs[3].props.onKeyDown({ key: 'a', currentTarget: fakeTarget })
 ok(blurred === 1, '回车即提交（走 blur），普通按键不打扰表单', String(blurred))
 calls.unset.length = 0
 const btns2 = flatten(tree).filter((n) => n.props && typeof n.props.onClick === 'function')
@@ -406,9 +409,9 @@ ok(repoSegs.length === 2,
 ok(repoSegs[1]?.props?.options?.[0]?.label === 'sec.filter.all',
   '仓库筛选器首项为「全部」（值为空字符串），后续每项对应一个 cwd',
   JSON.stringify(repoSegs[1]?.props?.options ?? []).slice(0, 120))
-// 输入框总数应为 5：interceptBudgetMs / graphBudgetMs / interceptTools / logRetentionDays / recentLimit
-ok(flatten(tree).filter((n) => n.type === primitives.Input).length === 5,
-  '总输入框数 = 5（整体预算 + 图谱预算 + 名单 + 保留天数/环形上限；zgBudgetMs 已删）',
+// 输入框总数应为 6：interceptBudgetMs / graphBudgetMs / workspaceSweepSec / interceptTools / logRetentionDays / recentLimit
+ok(flatten(tree).filter((n) => n.type === primitives.Input).length === 6,
+  '总输入框数 = 6（整体预算 + 图谱预算 + 轮扫间隔 + 名单 + 保留天数/环形上限；zgBudgetMs 已删）',
   String(flatten(tree).filter((n) => n.type === primitives.Input).length))
 
 console.log(`\n${failed === 0 ? 'check:client 全过' : `${failed} 项失败`}`)
