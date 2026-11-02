@@ -363,10 +363,14 @@ async function verify(profile) {
   // ── prompt 契约（动线齐 / args 形状对 / 不埋过期常量）──────────────────────────
   const prompt = a.sections.at(-1).text()
   // 高频动线已由封装工具接管（杠杆 ①），常驻段只需要留下"长尾怎么走"的证据：
-  // 取原文与验鲜这两个仍然要手填 project 的动作，加上两个封装动词本身。
-  const needCallables = ['code_find', 'code_callers', 'cbm_get_code_snippet', 'cbm_check_index_coverage']
+  // 取原文这一个仍然要手填 project 的动作，加上两个封装动词本身。验鲜流程归
+  // SKILL dsh-cbm-investigate 单一真源——常驻段再点一遍只是第二份会漂移的剧本。
+  const needCallables = ['code_find', 'code_callers', 'cbm_get_code_snippet']
   const missing = needCallables.filter((needle) => !prompt.includes(needle))
   record('A prompt 动线含可调用工具名', missing.length === 0, missing.length ? `缺 ${missing.join(', ')}` : '')
+  record('A prompt 不再重复 SKILL 的验鲜流程（coverage / metadata_changed 归 SKILL）',
+    !prompt.includes('cbm_check_index_coverage') && !/metadata_changed/.test(prompt),
+    prompt.includes('cbm_check_index_coverage') ? '常驻段还留着 cbm_check_index_coverage' : '')
   record('A prompt 取原文示例带 format:json', /"format":"json"/.test(prompt))
   // args 必须是对象形状：出现 \" 说明示例写成了转义 JSON 字符串，与 README 的教法语义冲突
   record('A prompt args 用对象形状', !/\\"/.test(prompt), /\\"/.test(prompt) ? '渲染文本里有 \\"，即示例把 args 写成了字符串' : '')
@@ -628,6 +632,30 @@ async function verify(profile) {
   const traced = await g.tools.get('code_callers').execute({ name: 'stub-project.stubSymbol' }, { agent: agentG, signal: sig() })
   record('G code_callers 默认 inbound 并返回调用者', /callerOfStub/.test(traced.text) && /direction: inbound/.test(traced.text), traced.text.split('\n')[1] ?? '')
 
+  // G2b 第四态 behind：stamp 建图之后工作区又变过 ⇒ 索引落后。hint 必须不管问法
+  // 都提示（正门/旁路之外的第三闸门），code_find 的坐标也要挂同一句警告。
+  // 用真实 state（g 已 code_setup），但 stamp 指到"建图时"：at=now 走冷却，
+  // 只落事实不重建，真引擎不会被拿去跑索引。
+  const proseAskProbe = [{ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '把 README 的措辞改顺一点' }] } }]
+  const probeAgent = fakeAgent(`sess-${process.pid}-behind`, REPO, proseAskProbe)
+  const stampFile = join(ADAPTER_DIR, 'refresh-stamps.json')
+  const stampBackup = existsSync(stampFile) ? readFileSync(stampFile, 'utf8') : null
+  try {
+    writeFileSync(stampFile, JSON.stringify({ [REPO]: { at: Date.now(), digest: 'built|0|0' } }), 'utf8')
+    g.events['agent/session-start'][0]({ agent: probeAgent, source: 'startup' })
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    const bhint = (g.contexts ?? []).find((c) => c.name === 'codebase-memory:hint')
+    const bhintText = typeof bhint?.text === 'function' ? bhint.text({ agent: probeAgent }) : ''
+    record('D 索引落后于工作区时 hint 不管问法都提示先 code_index',
+      /索引落后于工作区/.test(bhintText) && /code_index/.test(bhintText), bhintText.slice(0, 160))
+    const bh = await g.tools.get('code_find').execute({ query: 'stubSymbol' }, { agent: agentG, signal: sig() })
+    record('D code_find 对落后索引的坐标加警告并标 stale',
+      /索引落后于工作区/.test(bh.text) && bh.status === 'stale', `${bh.status} ${bh.text.split('\n')[1] ?? ''}`)
+  } finally {
+    if (stampBackup === null) rmSync(stampFile, { force: true })
+    else writeFileSync(stampFile, stampBackup, 'utf8')
+  }
+
   // G3 杠杆 ②：deny-once —— 同一符号只拦一次，第二次放行。
   const dCalls = []
   const d = await mount({ enforce: 'deny-once' }, makeStubProxy(dCalls, { project: `stub-${process.pid}-deny` }))
@@ -760,31 +788,51 @@ async function verify(profile) {
     flipOff === 'allow' && flipDeny === 'deny' && flipBack === 'allow', `off→${flipOff} deny→${flipDeny} off→${flipBack}`)
 
   // G8 杠杆 ③：按 query 条件注入；不像在查代码结构就一个字符都不占。
+  // v 的 stamps 落在真实 ADAPTER_DIR：本仓的索引经常落后于某次编辑，而 behind 是
+  // "不看问法也注入"的第三闸门——不摘掉这条 stamp，环境态会被误读成代码回归。
+  // 摘掉后 freshness 落回 unknown / possibly-stale，专测注入闸门本身。
   const hint = (v.contexts ?? []).find((c) => c.name === 'codebase-memory:hint')
   const codeAsk = [{ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '谁调用 normalize 这个函数？' }] } }]
   const proseAsk = [{ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '把 README 的措辞改顺一点' }] } }]
-  const hintText = typeof hint?.text === 'function' ? hint.text({ agent: fakeAgent(`sess-${process.pid}-hint`, REPO, codeAsk) }) : ''
-  const hintEmpty = typeof hint?.text === 'function' ? hint.text({ agent: fakeAgent(`sess-${process.pid}-hint`, REPO, proseAsk) }) : 'x'
-  const hintPlanted = typeof hint?.text === 'function' ? hint.text({ agent: fakeAgent(`sess-${process.pid}-hint2`, REPO, codeAsk) }) : 'x'
+  const stampsPath = join(ADAPTER_DIR, 'refresh-stamps.json')
+  const stampsBackup = existsSync(stampsPath) ? readFileSync(stampsPath, 'utf8') : null
+  if (stampsBackup) {
+    const saved = JSON.parse(stampsBackup)
+    delete saved[REPO]
+    writeFileSync(stampsPath, JSON.stringify(saved), 'utf8')
+  }
+  let hintText = ''
+  let hintEmpty = 'x'
+  let hintPlanted = 'x'
+  let dirtyHint = ''
+  try {
+    hintText = typeof hint?.text === 'function' ? hint.text({ agent: fakeAgent(`sess-${process.pid}-hint`, REPO, codeAsk) }) : ''
+    hintEmpty = typeof hint?.text === 'function' ? hint.text({ agent: fakeAgent(`sess-${process.pid}-hint`, REPO, proseAsk) }) : 'x'
+    hintPlanted = typeof hint?.text === 'function' ? hint.text({ agent: fakeAgent(`sess-${process.pid}-hint2`, REPO, codeAsk) }) : 'x'
+    dirtyHint = typeof hint?.text === 'function' ? hint.text({ agent: fakeAgent(`sess-${process.pid}-adv`, REPO, codeAsk) }) : ''
+  } finally {
+    if (stampsBackup === null) rmSync(stampsPath, { force: true })
+    else writeFileSync(stampsPath, stampsBackup, 'utf8')
+  }
   record('G 注册了 systemPrompt.context（order 130，不挤进常驻段）', !!hint && hint.order === 130, `order=${hint?.order}`)
   record('G 条件注入：像查代码结构时给 1–2 行状态', typeof hintText === 'string' && hintText.length > 0 && /code_find/.test(hintText) && !/\{\{/.test(hintText), hintText.slice(0, 140))
   record('G 条件注入：不像时返回空串（宿主按空串跳过）', hintEmpty === '', JSON.stringify(hintEmpty))
   // P0-5 C：hint 不再渲染 project，也不许在缓存为空时断言"未索引/第一步"。
   record('C hint 不渲染 project、不出现“未索引/第一步”',
     typeof hintText === 'string' && !/未索引|第一步|stub-/.test(hintText), hintText.slice(0, 120))
-  // P0-5 D：三态是纯函数，只按已缓存事实判定；unknown 不许升级成断言。
-  record('D freshnessOf 三态可证伪（verified / possibly-stale / unknown）',
+  // P0-5 D：新鲜度是纯函数，只按已缓存事实判定；unknown 不许升级成断言。
+  // 第四态 behind：stamp 建图之后工作区变过（digestVerdict='differ'）⇒ 行号不可信。
+  // 它比 possibly-stale 更硬：dirty 只说"本会话改过"，behind 覆盖建图后的任何变化。
+  record('D freshnessOf 四态可证伪（verified / possibly-stale / behind / unknown）',
     typeof freshnessOf === 'function'
       && freshnessOf({ stamp: { at: 1 }, dirty: 0, project: 'p', digestVerdict: 'equal' }) === 'verified'
       && freshnessOf({ stamp: { at: 1 }, dirty: 2, project: 'p', digestVerdict: 'equal' }) === 'possibly-stale'
-      && freshnessOf({ stamp: { at: 1 }, dirty: 0, project: 'p', digestVerdict: 'differ' }) === 'possibly-stale'
+      && freshnessOf({ stamp: { at: 1 }, dirty: 0, project: 'p', digestVerdict: 'differ' }) === 'behind'
+      && freshnessOf({ stamp: { at: 1 }, dirty: 2, project: 'p', digestVerdict: 'differ' }) === 'behind'
       && freshnessOf({ stamp: null, dirty: 0, project: '', digestVerdict: undefined }) === 'unknown'
       && freshnessOf({ stamp: null, dirty: 0, project: 'p', digestVerdict: undefined }) === 'possibly-stale',
-    typeof freshnessOf !== 'function' ? '插件未导出 freshnessOf' : 'verified/possibly-stale/unknown 全对')
+    typeof freshnessOf !== 'function' ? '插件未导出 freshnessOf' : 'verified/possibly-stale/behind/unknown 全对')
   // P0-5 F：dirty>0 时只说"改了 N 个文件/可能过期"，不再写"索引新鲜"（dirty=0 也同理）。
-  const dirtyHint = typeof hint?.text === 'function'
-    ? hint.text({ agent: fakeAgent(`sess-${process.pid}-adv`, REPO, codeAsk) })
-    : ''
   record('F dirty>0 只说“改了 N 个文件/可能过期”，不写“索引新鲜”',
     /本会话改了 1 个文件/.test(dirtyHint) && /过期/.test(dirtyHint) && !/索引新鲜/.test(dirtyHint), String(dirtyHint).slice(0, 140))
   record('G 注入文本不含宿主会插值的 {{var}}', !/[{]{2}[a-z][a-z0-9_]*[}]{2}/.test(hintPlanted + hintText), '')

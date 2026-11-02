@@ -2,7 +2,7 @@
 
 - 日期：2026-11-01
 - 版本：dsh-codebase-memory v0.20.1
-- 状态：复盘完成；最小根治集 C+D+F 已实施并发布 v0.20.1；P0-1（描述）+ P0-2（重写常驻 usageSection）+ P0-4 小调已实施、通过全量套件（181/181）并按 feat 发布 **v0.21.0**（2026-11-02）；P0-3 的 A/E 仍为可选
+- 状态：复盘完成；最小根治集 C+D+F 已实施并发布 v0.20.1；P0-1（描述）+ P0-2（重写常驻 usageSection）+ P0-4 小调已实施、通过全量套件（181/181）并按 feat 发布 **v0.21.0**；P0-5 续批（新鲜度第四态 behind + 常驻段去重）已实施、通过全量套件（184/184）并发布 **v0.22.0**（2026-11-02）；P0-3 的 A/E 仍为可选
 
 ## 0. 结论（TL;DR）
 
@@ -320,6 +320,7 @@ flowchart TD
   - v0.20.1 仅版本号 + 本文档状态 + .gitignore（`.workbuddy-ai/`），无行为改动。
 - 生效方式：`node scripts/sync.mjs` 同步进 profile → 重启宿主（index.js 在 apply 时加载一次）。
 - **2026-11-02 已实施并通过全量套件（181/181，exit 0）**：P0-1 三处工具描述重写（红线句删除；code_find+code_callers 按 G 臂同尺实测 1895B ≤ 2200）；P0-2 定稿为**重写 usageSection** 而非新增段（R3 更正）：删两句 grep 劝退、前置话术场景、补首用自动建图说明，order 保持 850，实测 1011 字符 ≤ A 臂预算 1150；P0-4 核实已存在 + 空 project 观感小调。`checks/check-plugin.mjs` 新增 7 条断言（红线、when-to-use×3、code_index 不先调声明、首用建图、常驻段字节稳定、空结果教学保留）。本批按惯例发布 **v0.21.0**（能力面文案变更）：commit `feat(v0.21.0): the code graph stops steering the model to grep (P0-1/2/4)`，轻量 tag + GitHub release（https://github.com/njuptlzf/dsh-codebase-memory/releases/tag/v0.21.0），两 profile（tauri/web）经 `pnpm install` 升级到 `#v0.21.0` 覆盖此前的 sync 暂存；生效前提仍是重启宿主。
+- **2026-11-02 已实施并通过全量套件（tauri 184/184 exit 0、web 184/184）**：P0-5 续批两件事。① 新鲜度第四态 `behind`：`stamp.digest ≠ 现场 git digest` ⇒「索引落后于工作区，先 code_index」——`refreshSessionWorkspace` 把 digest 计算提到冷却/在跑闸门前（闸门只挡重建，不挡事实），`freshnessOf` 四态，hint 第三闸门不看问法、不吃旁路冷却，`code_find` 异步现场核算并回写 `digestVerdict`（status 转 stale）。旧 stamp 没记 digest 时宁可判 unknown，不误报落后。② 常驻段去重：删掉 `cbm_check_index_coverage` 验鲜示例与「freshness=metadata_changed ⇒ 先 code_index」半句，首用自动建图压成一行事实——验鲜流程单一真源归 SKILL `dsh-cbm-investigate`。`checks` 同步：A 臂新增防回潮锁（常驻段不得再现 coverage/metadata_changed）、D 臂改四态、G2b 新增 behind 集成断言（hint + code_find 各验一发）、G8 临时摘本仓 stamp 隔离环境态。本批发布 **v0.22.0**；生效前提仍是 `node scripts/sync.mjs` + 重启宿主。
 - P0-3 的 A/E 仍为可选。
 - 已知风险：门闩扩面（P1）未做，仍会漏非结构话术的轮次；描述改动的效果只能靠 telemetry 的拦截计数与真实会话观察验收，无离线评测集（P2）。
 

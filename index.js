@@ -828,19 +828,17 @@ function usageSection(state) {
     '**首选封装动词**（project 与参数形状由插件填，你只管说要找什么）：',
     '- `code_find("符号")` → qualified_name + 文件 + 行范围 + 源码，一步回答「X 在哪定义 / X 长什么样 / 谁实现了 Y」。',
     '- `code_callers("qualified_name", direction?)` → 调用者/被调方逐跳，回答「谁调用 X / 改 X 影响哪里」。',
-    '首次用这两个会自动建图（git 仓约 2s），通常不必先调 `code_index`；大改后或提示可能过期时再刷新。',
+    '首次调用会自动建图（git 仓约 2s）。',
     '',
     '索引：`code_index`——repo_path 已绑本会话工作区，不要自传；返回的 `project` 供长尾调用。',
     `长尾都走代理工具 \`${PROXY_TOOL}\`，args 直接传对象；多步用 mcpScript 一趟跑完：`,
-    '- 验鲜 {"tool":"cbm_check_index_coverage","args":{"project":"<p>","paths":["<相对路径>"]}}',
     '- 取原文 {"tool":"cbm_get_code_snippet","args":{"project":"<p>","qualified_name":"<qn>","format":"json"}}',
     '- 多跳 {"tool":"cbm_query_graph",...}；{"server":"cbm"} 列工具，{"describe":"..."} 看参数',
     '- 按意思找（自然语言问代码）{"tool":"cbm_search_graph","args":{"project":"<p>","query":"..."}}——引擎的 BM25 检索（还有 semantic_query 参数）。',
     '',
     '两个坑性质相反，处置不同：',
     '- **取原文务必带 format:"json"**：默认 tree 是排版信封，照抄当锚点必不匹配，但会当场报错。',
-    '- **行号来自索引**：代码改过没重建，片段会**静默**返回邻居内容且不报错。所以动手前验鲜：',
-    '  freshness=metadata_changed ⇒ 先 code_index。',
+    '- **行号来自索引**：代码改过没重建，片段会**静默**返回邻居内容且不报错。',
     '',
     '偏移量、实测样本与上游 issue 见本仓库 README 的「已知限制」。',
   ]
@@ -905,15 +903,19 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
   const stampPath = join(cfg.adapterDir, 'refresh-stamps.json')
   const stamps = readStamps(stampPath)
   const last = stamps[cwd]
-  if (last && Date.now() - (last.at ?? 0) < REFRESH_MIN_INTERVAL_MS) { refreshLog(cfg, `skip ${cwd}: 冷却中`); return 'skipped:cooldown' }
-  if (state.refreshing.has(cwd)) { refreshLog(cfg, `skip ${cwd}: 已有一次刷新在跑`); return 'skipped:in-flight' }
+  // digest 先算：它不只决定"要不要重建"，还直接喂 hint 的 behind 态（索引落后于工作区）。
+  // 放在冷却/在跑闸门之前，闸门挡下的只是重建，不挡事实。
   const digest = await workspaceDigest(ctx, cwd, signal)
   if (digest === null) {
     state.digestVerdict.delete(cwd) // 非 git：没有可比对的 digest ⇒ 判 unknown
     refreshLog(cfg, `skip ${cwd}: 非 git 工作区（与引擎 auto_watch 一致）`)
     return 'skipped:not-git'
   }
-  state.digestVerdict.set(cwd, last?.digest === digest ? 'equal' : 'differ')
+  // 只有两边都有 digest 才谈得上"落后"：旧 stamp 没记 digest 时算不出来，宁可判 unknown。
+  if (last?.digest) state.digestVerdict.set(cwd, last.digest === digest ? 'equal' : 'differ')
+  else state.digestVerdict.delete(cwd)
+  if (last && Date.now() - (last.at ?? 0) < REFRESH_MIN_INTERVAL_MS) { refreshLog(cfg, `skip ${cwd}: 冷却中`); return 'skipped:cooldown' }
+  if (state.refreshing.has(cwd)) { refreshLog(cfg, `skip ${cwd}: 已有一次刷新在跑`); return 'skipped:in-flight' }
   if (last && last.digest === digest) { refreshLog(cfg, `skip ${cwd}: git 状态未变`); return 'skipped:unchanged' }
   if (!(await alreadyIndexed(ctx, state, cwd, signal))) { refreshLog(cfg, `skip ${cwd}: 尚未索引过（不替用户制造索引）`); return 'skipped:not-indexed' }
   state.refreshing.add(cwd)
@@ -1149,16 +1151,18 @@ function sessionOf(state, key) {
 }
 
 /**
- * 新鲜度三态（P0-5 D）：只按**已缓存的事实**判，绝不把 unknown 升级成断言。
+ * 新鲜度四态（P0-5 D + 索引落后）：只按**已缓存的事实**判，绝不把 unknown 升级成断言。
  *   verified         stamp 存在，事件时算出的 digest 与 stamp 一致，且本会话没写过文件；
- *   possibly-stale   本会话写过文件，或 digest 与 stamp 不一致，或图存在但没有 stamp；
+ *   behind           stamp 存在，digest 与 stamp **不一致** ⇒ 图建好之后工作区又变过；
+ *   possibly-stale   本会话写过文件，或图存在但没有 stamp；
  *   unknown          非 git / 没算过 digest / 既没 project 也没 stamp。
- * 判定只在事件里算一次（session start / write-edit / code_index / selfHeal 后），
+ * 判定只在事件里算一次（session start / code_index / selfHeal / code_find 现场核），
  * hint 只读结果——这解决的正是"同步渲染 vs 异步事实"的结构矛盾。
  */
 export function freshnessOf({ stamp, dirty, project, digestVerdict }) {
   if (!stamp) return project ? 'possibly-stale' : 'unknown'
-  if (digestVerdict === 'differ' || dirty > 0) return 'possibly-stale'
+  if (digestVerdict === 'differ') return 'behind'
+  if (dirty > 0) return 'possibly-stale'
   if (digestVerdict === 'equal') return 'verified'
   return 'unknown'
 }
@@ -1168,9 +1172,10 @@ const hhmm = (at) => {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-/** F：三态 → 有范围的事实。unknown 只说明未知，不猜；verified 的时间锚点来自 stamp。 */
+/** F：四态 → 有范围的事实。unknown 只说明未知，不猜；verified 的时间锚点来自 stamp。 */
 function describeFreshness(state, { stamp, dirty, project }) {
   if (state === 'verified') return `图建于 ${hhmm(stamp.at)}；最近一次校验时 git 状态与建图时一致。`
+  if (state === 'behind') return `索引落后于工作区：图建于 ${hhmm(stamp.at)}，之后 git 状态变过；先 code_index。`
   if (state === 'possibly-stale') {
     return dirty > 0
       ? `坐标可能过期：本会话改了 ${dirty} 个文件。`
@@ -1999,7 +2004,7 @@ export async function apply(ctx, config) {
         render: (_args, value) => [{ type: 'text', text: value.text }],
       },
       async execute(args, exec) {
-        const out = await runCbmFlow(ctx, cfg, state, exec, async ({ project, sess }) => {
+        const out = await runCbmFlow(ctx, cfg, state, exec, async ({ project, sess, cwd }) => {
           const limit = Math.min(Math.max(Number.isInteger(args.limit) ? args.limit : 3, 1), 10)
           const search = await cbmCall(ctx, exec, 'search_graph', { project, query: String(args.query ?? ''), limit, format: 'json' }, WRAPPER_BUDGET_MS)
           if (!search.ok) throw new Error(`search_graph 调用失败（链路或引擎异常）：${(search.text || '超时').slice(0, 300)}`)
@@ -2028,12 +2033,27 @@ export async function apply(ctx, config) {
               }
             }
           }
+          // 第四态：stamp 建图之后工作区又变过 ⇒ 行号不可信。hint 回调是同步的，只能读
+          // 事件缓存；这里是异步的，现场算真 digest，顺手把 verdict 落账让下一轮 hint 跟上。
+          let behind = false
+          const stamp = readStamps(join(cfg.adapterDir, 'refresh-stamps.json'))[cwd]
+          if (stamp?.digest) {
+            const live = await workspaceDigest(ctx, cwd, exec.signal)
+            if (live === null) state.digestVerdict.delete(cwd)
+            else {
+              behind = live !== stamp.digest
+              state.digestVerdict.set(cwd, behind ? 'differ' : 'equal')
+            }
+          }
+          const behindWarn = behind
+            ? `\n⚠ 索引落后于工作区（图建于 ${hhmm(stamp.at)}，之后 git 状态变过）：先 code_index 再采信上面的行号。`
+            : ''
           const fresh = ledgerStale(sess)
           const warn = fresh === 'stale'
             ? `\n⚠ 本会话用 write/edit 改过 ${sess.dirty.size} 个文件（${[...sess.dirty].slice(0, 5).join(', ')}${sess.dirty.size > 5 ? ' …' : ''}），而这些改动还没进索引：上面的行号与片段可能落到邻居代码。建议先 code_index（已在后台补刷）。逐路径证据可自己跑 cbm_check_index_coverage。`
             : ''
           if (fresh === 'stale') scheduleDirtyRefresh(ctx, cfg, state, sess, exec)
-          return { status: fresh === 'stale' ? 'stale' : 'ok', text: truncateCodepoints(lines.join('\n') + warn + staleNote, 6000), project }
+          return { status: fresh === 'stale' || behind ? 'stale' : 'ok', text: truncateCodepoints(lines.join('\n') + warn + behindWarn + staleNote, 6000), project }
         })
         return out
       },
@@ -2266,28 +2286,30 @@ export async function apply(ctx, config) {
           const query = lastUserQuery(agent)
           const sess = sessionOf(state, key)
           const dirty = sess.dirty.size
-          // v0.16 T-D 双闸门：正门=CODE_QUESTION（照旧，模型自己在问结构）；旁路=
-          // 脏台账攒够（编辑潮里模型不问结构问题、埋头 read——正是坐标最不可信、
-          // 又最需要一句话说破的时刻）。
-          const normalGate = !!query && CODE_QUESTION.test(query)
-          const bypass = cfg.staleWarnFiles > 0 && dirty >= cfg.staleWarnFiles
-          if (!normalGate && !bypass) return ''
-          let staleCmd = ''
-          if (bypass) {
-            // 冷却只约束旁路：正门那时模型自己要提示，不算打扰；旁路每轮装配都
-            // 求值，无冷却会在编辑潮里连发。
-            if (!normalGate && Date.now() - (sess.lastWarnAt ?? 0) < cfg.staleWarnMinIntervalSec * 1000) return ''
-            sess.lastWarnAt = Date.now()
-            bumpCount(cfg, state, 'stale-warn')
-            staleCmd = ' ⚠ 先 code_index 刷新索引，再用 cbm_check_index_coverage 验鲜；别拿整文件 read 找坐标。'
-          }
-          // C（P0-5）：hint 不再渲染 project——封装动词自己填，模型不需要名字；
+          // C（P0-5）：hint 不渲染 project——封装动词自己填，模型不需要名字；
           // 没有字段，就没有字段可以撒谎。project 只留给三态判定分类用。
           // D+F：新鲜度只说事件时缓存的那一态，unknown 就明说未知，不再从 dirty=0
           // 推断"索引新鲜"（dirty 只覆盖 write/edit 的代码文件，shell 编辑不可见）。
           const project = sess.project || state.projectsByCwd.get(cwd) || ''
           const stamp = readStamps(join(cfg.adapterDir, 'refresh-stamps.json'))[cwd]
           const freshness = freshnessOf({ stamp, dirty, project, digestVerdict: state.digestVerdict.get(cwd) })
+          // v0.16 T-D 双闸门：正门=CODE_QUESTION（照旧，模型自己在问结构）；旁路=
+          // 脏台账攒够（编辑潮里模型不问结构问题、埋头 read——正是坐标最不可信、
+          // 又最需要一句话说破的时刻）。behind 是第三个闸门：索引明确落后于工作区时
+          // 不管问的是不是结构问题都得说，否则正是"看着新图答旧题"的静默错位。
+          const normalGate = !!query && CODE_QUESTION.test(query)
+          const bypass = cfg.staleWarnFiles > 0 && dirty >= cfg.staleWarnFiles
+          if (!normalGate && !bypass && freshness !== 'behind') return ''
+          let staleCmd = ''
+          if (bypass) {
+            // 冷却只约束旁路：正门那时模型自己要提示，不算打扰；旁路每轮装配都
+            // 求值，无冷却会在编辑潮里连发。behind 不适用冷却——它自愈于 code_index，
+            // 在那之前每轮都说才是对的。
+            if (freshness !== 'behind' && !normalGate && Date.now() - (sess.lastWarnAt ?? 0) < cfg.staleWarnMinIntervalSec * 1000) return ''
+            sess.lastWarnAt = Date.now()
+            bumpCount(cfg, state, 'stale-warn')
+            staleCmd = freshness === 'behind' ? '' : ' ⚠ 先 code_index 刷新索引，再用 cbm_check_index_coverage 验鲜；别拿整文件 read 找坐标。'
+          }
           const head = `codebase-memory: ${describeFreshness(freshness, { stamp, dirty, project })}`
           // 预热行只讲 cbm 索引工具怎么用（用户明确不要「字面量归 grep」那句）。
           const tail = '代码检索：code_index 建图/刷新；code_find 查符号定义与源码、code_callers 查调用者/被调方（两者 project 自动填）；跨跳图查询、按 qualified_name 取源码、验鲜、BM25 检索走 mcp__cbm__mcp 的 cbm_*（args 需自带 project）。'
