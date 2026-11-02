@@ -208,7 +208,7 @@ code_index（建索引 / 改完代码后刷新）
 
 | 链路 | 类型 | 何时生效 | 说明 |
 |---|---|---|---|
-| **① skill 自动加载** | 软 | 问题匹配 skill 的 `whenToUse`/`description`（`dsh-codebase-impact-analysis` 描述就写着「谁调用X / 改X影响哪些地方 / 重命名风险 / 调用链 / 死代码 / 架构」） | 模型自动调 `skill` 工具 → SKILL.md 指示「第一步 `code_index`，然后 `cbm_*` 图谱查询」。这就是注入提示「project=(未索引：先 code_index)」的来源 |
+| **① skill 自动加载** | 软 | 问题匹配 skill 的 `whenToUse`/`description`（`dsh-codebase-impact-analysis` 描述就写着「谁调用X / 改X影响哪些地方 / 重命名风险 / 调用链 / 死代码 / 架构」） | 模型自动调 `skill` 工具 → SKILL.md 指示「第一步 `code_index`，然后 `cbm_*` 图谱查询」。这条链路不依赖注入提示里的 project 名（hint 现在只在确认时给出新鲜度事实，不再渲染 project） |
 | **② 封装动词** | 硬 | 模型对结构类问题按工具描述直接调 `code_find`/`code_callers`/`code_index` | 插件注入的原生工具，`project` 由插件从会话工作区自动填（`projectFor`），不需要 skill、不需要特殊措辞 |
 | **③ grep 改写钩子** | 硬（兜底） | 模型误用 grep 搜符号形 pattern 时 | 插件在 `post-execute` 拦截，把模型可见输出换成图谱命中（图谱是替换的唯一来源）；最坏情况也能吃到图谱结果 |
 

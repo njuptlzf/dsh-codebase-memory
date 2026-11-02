@@ -908,7 +908,12 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
   if (last && Date.now() - (last.at ?? 0) < REFRESH_MIN_INTERVAL_MS) { refreshLog(cfg, `skip ${cwd}: 冷却中`); return 'skipped:cooldown' }
   if (state.refreshing.has(cwd)) { refreshLog(cfg, `skip ${cwd}: 已有一次刷新在跑`); return 'skipped:in-flight' }
   const digest = await workspaceDigest(ctx, cwd, signal)
-  if (digest === null) { refreshLog(cfg, `skip ${cwd}: 非 git 工作区（与引擎 auto_watch 一致）`); return 'skipped:not-git' }
+  if (digest === null) {
+    state.digestVerdict.delete(cwd) // 非 git：没有可比对的 digest ⇒ 判 unknown
+    refreshLog(cfg, `skip ${cwd}: 非 git 工作区（与引擎 auto_watch 一致）`)
+    return 'skipped:not-git'
+  }
+  state.digestVerdict.set(cwd, last?.digest === digest ? 'equal' : 'differ')
   if (last && last.digest === digest) { refreshLog(cfg, `skip ${cwd}: git 状态未变`); return 'skipped:unchanged' }
   if (!(await alreadyIndexed(ctx, state, cwd, signal))) { refreshLog(cfg, `skip ${cwd}: 尚未索引过（不替用户制造索引）`); return 'skipped:not-indexed' }
   state.refreshing.add(cwd)
@@ -925,6 +930,7 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
     refreshLog(cfg, `done ${cwd} exit=${r.exitCode}`)
     if (r.exitCode === 0) {
       writeFileSync(stampPath, JSON.stringify({ ...stamps, [cwd]: { at: Date.now(), digest } }, null, 2), 'utf8')
+      state.digestVerdict.set(cwd, 'equal')
       return 'refreshed'
     }
     return 'failed'
@@ -954,9 +960,10 @@ async function refreshSessionWorkspace(ctx, cfg, state, agent, signal) {
  */
 async function selfHealIndex(ctx, cfg, state, cwd, sess, signal) {
   if (!cfg.autoSelfHeal) return { ok: false, skipped: 'off' }
-  if (state.cbm !== 'ready') return { ok: false, skipped: 'engine' }
-  if (state.selfHealAttempted.has(cwd)) return { ok: false, skipped: 'attempted' }
-  if (state.refreshing.has(cwd)) return { ok: false, skipped: 'in-flight' }
+  // 静默出口也记一行：N4 这类「钩子踢了但没见 spawn」的排障，没有 reason 就只能猜门。
+  if (state.cbm !== 'ready') { telemetry(cfg, state, 'self-heal-skip', { cwd, reason: 'engine' }); return { ok: false, skipped: 'engine' } }
+  if (state.selfHealAttempted.has(cwd)) { telemetry(cfg, state, 'self-heal-skip', { cwd, reason: 'attempted' }); return { ok: false, skipped: 'attempted' } }
+  if (state.refreshing.has(cwd)) { telemetry(cfg, state, 'self-heal-skip', { cwd, reason: 'in-flight' }); return { ok: false, skipped: 'in-flight' } }
   state.selfHealAttempted.add(cwd)
   const digest = await workspaceDigest(ctx, cwd, signal)
   if (digest === null) {
@@ -988,6 +995,7 @@ async function selfHealIndex(ctx, cfg, state, cwd, sess, signal) {
     try {
       const stamps = readStamps(stampPath)
       writeFileSync(stampPath, JSON.stringify({ ...stamps, [cwd]: { at: Date.now(), digest } }, null, 2), 'utf8')
+      state.digestVerdict.set(cwd, 'equal')
     } catch { /* 留痕写不进就算了，索引本身已经成功 */ }
     repoBump(state, cwd, 'self-heal-done')
     telemetry(cfg, state, 'self-heal-done', { cwd, project: info.project, nodes: info.nodes ?? 0 })
@@ -1138,6 +1146,37 @@ function sessionOf(state, key) {
     state.sessions.set(key, s)
   }
   return s
+}
+
+/**
+ * 新鲜度三态（P0-5 D）：只按**已缓存的事实**判，绝不把 unknown 升级成断言。
+ *   verified         stamp 存在，事件时算出的 digest 与 stamp 一致，且本会话没写过文件；
+ *   possibly-stale   本会话写过文件，或 digest 与 stamp 不一致，或图存在但没有 stamp；
+ *   unknown          非 git / 没算过 digest / 既没 project 也没 stamp。
+ * 判定只在事件里算一次（session start / write-edit / code_index / selfHeal 后），
+ * hint 只读结果——这解决的正是"同步渲染 vs 异步事实"的结构矛盾。
+ */
+export function freshnessOf({ stamp, dirty, project, digestVerdict }) {
+  if (!stamp) return project ? 'possibly-stale' : 'unknown'
+  if (digestVerdict === 'differ' || dirty > 0) return 'possibly-stale'
+  if (digestVerdict === 'equal') return 'verified'
+  return 'unknown'
+}
+
+const hhmm = (at) => {
+  const d = new Date(at ?? 0)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
+/** F：三态 → 有范围的事实。unknown 只说明未知，不猜；verified 的时间锚点来自 stamp。 */
+function describeFreshness(state, { stamp, dirty, project }) {
+  if (state === 'verified') return `图建于 ${hhmm(stamp.at)}；最近一次校验时 git 状态与建图时一致。`
+  if (state === 'possibly-stale') {
+    return dirty > 0
+      ? `坐标可能过期：本会话改了 ${dirty} 个文件。`
+      : '坐标可能过期：git 状态与建图时不一致。'
+  }
+  return project ? '新鲜度未知。' : '新鲜度未知（code_find 会自动建图）。'
 }
 
 /** 时间预算：超时返回 null，钩子里绝不因为查询把工具调用卡死。 */
@@ -1715,6 +1754,9 @@ export async function apply(ctx, config) {
     adapter: 'unknown', cbm: 'unknown', ok: false, autoIndex: '', refreshing: new Set(), notes: [], lastError: '',
     sessions: new Map(), projectsByCwd: new Map(), counts: {}, indexJobs: new Map(),
     repos: new Map(), recent: [],
+    // P0-5 D：事件时算出的 digest 对照结论（cwd → 'equal'|'differ'）。hint 的渲染
+    // 是同步的，读不到 git；只在事件里算一次，渲染层只读这个缓存，绝不现推。
+    digestVerdict: new Map(),
     // v0.18.0 O2：每个 cwd 只自愈一次（成败都不再重试——失败再来一遍只会把
     // 同一个坑磕出满屏日志，处方仍然是显式 code_index）。
     selfHealAttempted: new Set(),
@@ -1885,6 +1927,9 @@ export async function apply(ctx, config) {
 
       const argv = [state.cbmPath, 'cli', 'index_repository', '--repo-path', cwd]
       if (args.mode) argv.push('--mode', args.mode)
+      // 建图前取 digest：成功后写进 stamp，让 hint 的 verified 有可核验的锚点
+      // （否则手动 code_index 之后没有 stamp，三态永远停在 unknown）。
+      const digest = await workspaceDigest(ctx, cwd, exec.signal)
       // index_repository 不支持 --format：它的 stdout 本来就是 JSON。
       const spec = { cwd, maxBytes: 1024 * 1024, graceMs: 20000, signal: exec.signal }
       let r = await withIndexLock(state, cwd, () => run(ctx, argv, spec))
@@ -1908,6 +1953,17 @@ export async function apply(ctx, config) {
       const sess = sessionOf(state, sessionKey(exec.agent))
       sess.project = info.project
       sess.dirty.clear()
+      // 与 selfHeal / 补偿刷新同款落账：stamp 是 verified 的唯一锚点，digestVerdict
+      // 让 hint 立刻能说"已核验"，不用等下一次 session start。
+      if (digest === null) state.digestVerdict.delete(cwd)
+      else {
+        try {
+          const stampPath = join(cfg.adapterDir, 'refresh-stamps.json')
+          const stamps = readStamps(stampPath)
+          writeFileSync(stampPath, JSON.stringify({ ...stamps, [cwd]: { at: Date.now(), digest } }, null, 2), 'utf8')
+          state.digestVerdict.set(cwd, 'equal')
+        } catch { state.digestVerdict.delete(cwd) }
+      }
       return {
         project: info.project,
         status: info.status ?? 'unknown',
@@ -2209,8 +2265,6 @@ export async function apply(ctx, config) {
           if (!key || !cwd) return ''
           const query = lastUserQuery(agent)
           const sess = sessionOf(state, key)
-          // 渲染是同步的，所以只能用**已缓存**的 project（同 cwd 解析过就有）。
-          const project = sess.project || state.projectsByCwd.get(cwd) || ''
           const dirty = sess.dirty.size
           // v0.16 T-D 双闸门：正门=CODE_QUESTION（照旧，模型自己在问结构）；旁路=
           // 脏台账攒够（编辑潮里模型不问结构问题、埋头 read——正是坐标最不可信、
@@ -2225,12 +2279,18 @@ export async function apply(ctx, config) {
             if (!normalGate && Date.now() - (sess.lastWarnAt ?? 0) < cfg.staleWarnMinIntervalSec * 1000) return ''
             sess.lastWarnAt = Date.now()
             bumpCount(cfg, state, 'stale-warn')
-            staleCmd = ` ⚠ 已改 ${dirty} 个文件：先 code_index 刷新索引、经 cbm_check_index_coverage 验鲜后才能信用图谱坐标；别拿整文件 read 找坐标。`
+            staleCmd = ' ⚠ 先 code_index 刷新索引，再用 cbm_check_index_coverage 验鲜；别拿整文件 read 找坐标。'
           }
-          const head = `codebase-memory: project=${project || '(未索引：先 code_index)'}, ${dirty ? `本会话改了 ${dirty} 个文件（坐标可能过期）` : '索引新鲜'}.`
-          const tail = project
-            ? '找定义/调用关系用 code_find / code_callers；字符串、日志、配置值仍用 grep。'
-            : '第一步：code_index。'
+          // C（P0-5）：hint 不再渲染 project——封装动词自己填，模型不需要名字；
+          // 没有字段，就没有字段可以撒谎。project 只留给三态判定分类用。
+          // D+F：新鲜度只说事件时缓存的那一态，unknown 就明说未知，不再从 dirty=0
+          // 推断"索引新鲜"（dirty 只覆盖 write/edit 的代码文件，shell 编辑不可见）。
+          const project = sess.project || state.projectsByCwd.get(cwd) || ''
+          const stamp = readStamps(join(cfg.adapterDir, 'refresh-stamps.json'))[cwd]
+          const freshness = freshnessOf({ stamp, dirty, project, digestVerdict: state.digestVerdict.get(cwd) })
+          const head = `codebase-memory: ${describeFreshness(freshness, { stamp, dirty, project })}`
+          // 预热行只讲 cbm 索引工具怎么用（用户明确不要「字面量归 grep」那句）。
+          const tail = '代码检索：code_index 建图/刷新；code_find 查符号定义与源码、code_callers 查调用者/被调方（两者 project 自动填）；跨跳图查询、按 qualified_name 取源码、验鲜、BM25 检索走 mcp__cbm__mcp 的 cbm_*（args 需自带 project）。'
           // 只数真正注入的那一次（每轮装配都调这个回调，注入与否是 ③ 的有效性读数）。
           bumpCount(cfg, state, 'hint-injected')
           return noVars(`${head} ${staleCmd}${tail}`)

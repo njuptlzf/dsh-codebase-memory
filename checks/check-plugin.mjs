@@ -294,7 +294,7 @@ async function verify(profile) {
   // 必须在 import 之前设：这个值在模块加载时读一次。
   process.env.DSH_CBM_WARM_DELAY_MS = '0'
   const mod = await import(pathToFileURL(installed).href)
-  const { apply, name, inject, engineVerdict, fileDrift, classifyPattern, truncateCodepoints, isGrepLike, normPath, projectFromListing, dropDirtyRows, Config, parseAdapterProcsWin, parseAdapterProcsPosix, DEFAULT_ADAPTER_VERSION } = mod
+  const { apply, name, inject, engineVerdict, fileDrift, classifyPattern, truncateCodepoints, isGrepLike, normPath, projectFromListing, freshnessOf, dropDirtyRows, Config, parseAdapterProcsWin, parseAdapterProcsPosix, DEFAULT_ADAPTER_VERSION } = mod
   if (name !== 'dsh-codebase-memory') throw new Error(`unexpected plugin name: ${name}`)
   record('装载', true, `name=${name}  inject=${inject.join(',')}`)
 
@@ -752,9 +752,25 @@ async function verify(profile) {
   const hintPlanted = typeof hint?.text === 'function' ? hint.text({ agent: fakeAgent(`sess-${process.pid}-hint2`, REPO, codeAsk) }) : 'x'
   record('G 注册了 systemPrompt.context（order 130，不挤进常驻段）', !!hint && hint.order === 130, `order=${hint?.order}`)
   record('G 条件注入：像查代码结构时给 1–2 行状态', typeof hintText === 'string' && hintText.length > 0 && /code_find/.test(hintText) && !/\{\{/.test(hintText), hintText.slice(0, 140))
-  record('G 条件注入：project 来自同 cwd 的缓存（跨会话复用，渲染保持同步）',
-    typeof hintText === 'string' && hintText.includes(`stub-${process.pid}-adv`), hintText.slice(0, 80))
   record('G 条件注入：不像时返回空串（宿主按空串跳过）', hintEmpty === '', JSON.stringify(hintEmpty))
+  // P0-5 C：hint 不再渲染 project，也不许在缓存为空时断言"未索引/第一步"。
+  record('C hint 不渲染 project、不出现“未索引/第一步”',
+    typeof hintText === 'string' && !/未索引|第一步|stub-/.test(hintText), hintText.slice(0, 120))
+  // P0-5 D：三态是纯函数，只按已缓存事实判定；unknown 不许升级成断言。
+  record('D freshnessOf 三态可证伪（verified / possibly-stale / unknown）',
+    typeof freshnessOf === 'function'
+      && freshnessOf({ stamp: { at: 1 }, dirty: 0, project: 'p', digestVerdict: 'equal' }) === 'verified'
+      && freshnessOf({ stamp: { at: 1 }, dirty: 2, project: 'p', digestVerdict: 'equal' }) === 'possibly-stale'
+      && freshnessOf({ stamp: { at: 1 }, dirty: 0, project: 'p', digestVerdict: 'differ' }) === 'possibly-stale'
+      && freshnessOf({ stamp: null, dirty: 0, project: '', digestVerdict: undefined }) === 'unknown'
+      && freshnessOf({ stamp: null, dirty: 0, project: 'p', digestVerdict: undefined }) === 'possibly-stale',
+    typeof freshnessOf !== 'function' ? '插件未导出 freshnessOf' : 'verified/possibly-stale/unknown 全对')
+  // P0-5 F：dirty>0 时只说"改了 N 个文件/可能过期"，不再写"索引新鲜"（dirty=0 也同理）。
+  const dirtyHint = typeof hint?.text === 'function'
+    ? hint.text({ agent: fakeAgent(`sess-${process.pid}-adv`, REPO, codeAsk) })
+    : ''
+  record('F dirty>0 只说“改了 N 个文件/可能过期”，不写“索引新鲜”',
+    /本会话改了 1 个文件/.test(dirtyHint) && /过期/.test(dirtyHint) && !/索引新鲜/.test(dirtyHint), String(dirtyHint).slice(0, 140))
   record('G 注入文本不含宿主会插值的 {{var}}', !/[{]{2}[a-z][a-z0-9_]*[}]{2}/.test(hintPlanted + hintText), '')
   // G9 索引任务串行化 + 被并发中止后重试（这条臂来自一次真实失败：后台补刷与
   // code_index 撞上引擎 watcher ⇒ 退出码 1 + aborted_previous_preserved）。
@@ -1045,11 +1061,11 @@ async function verify(profile) {
   await tdBook({ name: 'edit', arguments: { file_path: join(REPO, 'src/w7.ts') }, agent: agentTd, signal: sig() }, { content: [], isError: false }, nextPost)
   const tdWarn = tdProse()
   record('TD 台账达 staleWarnFiles=8 ⇒ 无视 CODE_QUESTION 注入陈旧命令',
-    /⚠ 已改 8 个文件/.test(tdWarn) && /code_index/.test(tdWarn) && /cbm_check_index_coverage/.test(tdWarn), tdWarn.slice(0, 170))
+    /本会话改了 8 个文件/.test(tdWarn) && /⚠ 先 code_index/.test(tdWarn) && /cbm_check_index_coverage/.test(tdWarn), tdWarn.slice(0, 170))
   record('TD 旁路冷却：同会话二装配即刻为空（防编辑潮连发）', tdProse() === '', tdProse().slice(0, 70))
   const tdCode = String(tdHint?.text?.({ agent: fakeAgent(`sess-${process.pid}-td`, REPO, codeAsk) }) ?? '')
   record('TD 正门不吃冷却：结构问句 + 台账脏 ⇒ 命令句当场再给',
-    /⚠ 已改 8 个文件/.test(tdCode) && /code_find/.test(tdCode), tdCode.slice(0, 120))
+    /本会话改了 8 个文件/.test(tdCode) && /⚠ 先 code_index/.test(tdCode) && /code_find/.test(tdCode), tdCode.slice(0, 120))
   let tdStats = null
   try { tdStats = JSON.parse(String(tdRef.get())) } catch { /* 下一条断言报出来 */ }
   record('TD 旁路计数进 lever.staleWarn（旁路一次 + 正门带病一次 = 2）', (tdStats?.lever?.staleWarn ?? 0) === 2, JSON.stringify(tdStats?.lever ?? null))
@@ -1175,12 +1191,14 @@ async function verify(profile) {
       const n4Post = await (n4.events['tools/post-execute'] ?? [])[1](grepExec(agentN4, 'selfHealIndex'), { content: [{ type: 'text', text: 'O' }], isError: false }, nextPost)
       let n4Kicked = false
       for (let i = 0; i < 30 && !n4Kicked; i++) { await new Promise((r) => setTimeout(r, 40)); n4Kicked = nSpawns4.some((a) => a.includes('index_repository')) }
-      record('N4 grep 钩子不等首建：本次输出原样放行 + 后台把索引踢起来（下一发 grep 吃到图）',
-        (!n4Post?.content || n4Post.content[0]?.text === 'O') && n4Kicked, `out=${JSON.stringify(n4Post?.content?.[0]?.text ?? n4Post)} kicked=${n4Kicked} spawns=${nSpawns4.length}`)
       const nlog = readdirSync(nTdir).filter((f) => /^telemetry-\d{4}-\d{2}-\d{2}\.log$/.test(f))
         .flatMap((f) => readFileSync(join(nTdir, f), 'utf8').trim().split('\n').filter(Boolean))
         .map((l) => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
       const nEv = (e) => nlog.some((l) => l.event === e)
+      // 先读遥测再落 N4 断言：红了要能从 detail 直接看出是哪道门把这发踢吞了。
+      const nHeal = nlog.filter((l) => String(l.event).startsWith('self-heal')).map((l) => `${l.event}${l.reason ? `:${l.reason}` : ''}`).slice(-8).join(',') || '(无)'
+      record('N4 grep 钩子不等首建：本次输出原样放行 + 后台把索引踢起来（下一发 grep 吃到图）',
+        (!n4Post?.content || n4Post.content[0]?.text === 'O') && n4Kicked, `out=${JSON.stringify(n4Post?.content?.[0]?.text ?? n4Post)} kicked=${n4Kicked} spawns=${nSpawns4.length} heal=${nHeal}`)
       record('N 自愈事件全谱进遥测（start/done/failed/skip-not-git 各有其一）',
         nEv('self-heal-start') && nEv('self-heal-done') && nEv('self-heal-failed') && nEv('self-heal-skip-not-git'),
         `seen=${[...new Set(nlog.filter((l) => String(l.event).startsWith('self-heal')).map((l) => l.event))].join(',') || '(无)'}`)
