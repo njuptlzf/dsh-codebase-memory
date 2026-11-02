@@ -16,3 +16,6 @@ Thumbs.db
 
 # 验收脚本的临时文件
 *.dsh-check-bak
+
+# 其它工具在工作区留下的目录
+.workbuddy-ai/
