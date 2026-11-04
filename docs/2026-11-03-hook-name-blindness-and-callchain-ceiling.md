@@ -119,18 +119,25 @@ classify  -> {"kind":"symbol","symbol":"classifyPattern"}
 
 不改的部分：`replace` 的查询仍然是**一发** `search_graph`，不追加 `trace_path`；`classifyPattern` 判据不动（保守归字面量是对的，误拦一次配置搜索比漏拦一次符号搜索贵，index.js:1207）。
 
-### 第二步（不是"上调用链"，是"先有基线"）
+### 第二步（2026-11-04 读数之后重写：只开"可观测性"那半，条件式扩展仍不开工）
 
-第一步生效后跑一到两周，用遥测回答三个还没数据的问题：
+第一步装机后攒的 8 天遥测（`telemetry-2026-10-28 … 11-04.log`，脚本清点），三个原本没数的问题第一次有了读数：
 
-- 符号形 grep 在全部搜索里占多少（分母）；
-- `intercept-replace` / `replace-pass-*` / `near-miss-symbol` 的比例（替换率与逃逸口）；
-- 模型在替换之后是否真的接着调 `code_callers`（`wrapper-call` 计数）。
+| 读数 | 值 | 备注 |
+|---|---|---|
+| `intercept-replace` | **17** | 10-28…11-04 合计；11-03 全天 0（就是名字闸失配那天），11-04 重装后回到 4 |
+| `near-miss-symbol` | **77** | 混合 / 超 4 支交替式，判 literal 照旧放行 |
+| 近失里"全分支去掉转义后都像标识符"（图谱本可答） | **9 / 77 = 12%** | 例 `tally\|sessionReport`、`hint\|code_find\|code_callers`、`profiles\|PROFILE\|tauri\|web` |
+| 近失里真文本 / 配置检索（判据必须放行） | **68 / 77 = 88%** | 例 `MB\|MiB\|下载\|ensureAdapter`、`counts\\s*[:=]`、`跨重启\|会话结束\|genui` |
+| `wrapper-call` | 14 | **事件字段只有 `ts/pid/event`**（`telemetry(cfg, state, 'wrapper-call', {})`，index.js:1840） |
 
-**开工条件**（防止凭感觉重开，格式照搬 docs/2026-11-02-poll-vs-watch-decision.md §6.3）：只有当遥测显示**被替换的符号查询里相当比例随后又自己去 trace 调用边**，才做条件式扩展；形态二选一，都不做"每次 grep 默认附带"：
+**由此定三件事，其中两条是"不做"：**
 
-- **条件式**：最近一条用户话术命中影响面词（谁调用/影响/改/破/break/impact，即 `CODE_QUESTION` 的那一支，index.js:1782）时，对**首条**命中追加一发 `trace_path`；
-- **动词式**：加 `code_impact`（trace both + 受影响文件），即原 docs/2026-11-01-tool-hit-rate.md 的 P2-1，由模型按需调用，代价是每个请求 +200–300 token 的 schema 税。
+1. **判据不再放宽**（§6 维持保守）。近失里 88% 是模型真想要的文本检索，为救剩下 12% 去放宽 `classifyPattern`（index.js:1213）就是开始吞原文——误拦一次的成本远高于漏拦一次（index.js:1207 那句话今天有了定量依据）。
+2. **条件式 `trace_path` / `code_impact` 本体不开工**，而且这次的理由是"测不出来"而不是"想不出来"。开工闸门写的是"被替换的符号查询里相当比例随后又自己去 trace 调用边"，可 `wrapper-call` 不带 session、不带动词名、不带 symbol，**根本区分不了模型随后调的是 `code_find` 还是 `code_callers`**。只能用 pid + 30 分钟窗口粗 join，得到 7/17 ≈ **41% 的上界**——混会话、混动词、混意图，当决策依据是不合格的。
+3. **值得先开的只剩这一小块**：给 `wrapper-call` 补 `session / tool / symbol` 三个字段（一发 `telemetry()` 的入参，零行为改动、报表不动），`intercept-replace` 已带 `symbol` 不用动。攒两周真读数，再回来判那条"相当比例"到底是几成：确实高，条件式扩展（`CODE_QUESTION` 命中 + 只对首条命中追加一发 `trace_path`，index.js:1782 / 1769）才第一次有开工依据；确实低，就地关掉这个方向，不留 TODO。
+
+动词式 `code_impact`（原 docs/2026-11-01-tool-hit-rate.md 的 P2-1）同判：它要每个请求 +200–300 token 的常驻 schema 税，去服务 8 天 17 发的低频场景，在有了第 3 条的读数之前同样不批。
 
 ## 8. 取舍与风险
 
@@ -165,6 +172,6 @@ classify  -> {"kind":"symbol","symbol":"classifyPattern"}
 - **pin 换成 release 之后的两处副作用（后续小改，未动码）**：① `code_setup` 的 `同步状态:` 行退化为 `(无法判定：profile 的 package.json 里没有 file: 依赖，或不可读)`——`syncStatusLine()`（index.js:765）是从 `dependencies["dsh-codebase-memory"] = "file:…"` 反解仓库路径再逐文件比 sha 的，pin 变成 `github:…#v0.23.2` 之后这条比对没有对照物了。② 既然 pin 是真依赖，`pnpm install` 会把 `scripts/sync.mjs` 盖出来的开发版**原样还原成 tag 内容**（这次就是：11-03 起 pin 一直没动，磁盘上靠 sync 撑着 v0.23.x，报表读数字看着"新"，进程里其实是 v0.21.0 的模块）。所以开发期用 sync 试、发完版要么走 pin 升级要么立刻 sync 复盖，别混着用。
 - **新默认名单在本机暂时无法用报表字段值证明**：`profiles/tauri/cordis.patch.yml:197`（mtime 2026-11-04 14:33:45）持久覆盖了 `interceptTools: grep,glob,ops_grep,ops_glob`，旧模块读它也能凑出同样四个名字。要验"默认"本身，得先把这行覆盖删掉或改窄（volatile 字段，改完即生效，不用重启），再看 `名单核对:` 行的 `名单=` 段。
 - **那条"矛盾"已经定性（18:36 实验）**：写一次 `profiles/tauri/cordis.patch.yml`（只加一行注释再删掉，配置内容不变）之后，`code_setup` 报表**立刻**出现 `名单核对` 与 `轮扫` 两行，`遥测计数` 同时归零重计（只剩 `cbm-warm=1`）⇒ **宿主在 profile 文档被写的时候会重新挂载插件模块**。所以 14:33 那次设置页落盘（就是它写下 `interceptTools: grep,glob,ops_grep,ops_glob` 那行）也重新挂载了一次，而那时 pin 还是 `#v0.21.0`——挂载拿到的就是 v0.21.0 的模块，把我 10:02 `sync` 出来的 v0.23.2 盖掉的磁盘内容"记忆"换成了旧的。17:37 我按新 pin 装成 v0.23.2，但**文件变了不等于会重新挂载**，得等下一次文档写入。两条判据当场复核过：符号形 `ops_grep(pattern="interceptPremises", path=index.js)` 被换成图谱横幅（命中 `interceptPremises Function index.js 1897-1909`，与当前文件一致）；同一 pattern 加 `outputMode="count"` 原文保留（`count=3`）；报表 `名单核对: 实发搜索工具=ops_grep … ok`、`轮扫: on(300s) 候选=6 上轮 checked=6 … refreshed=2 behind=0`、`intercept-replace=1 intercept-replace:graph=1`、`hint-injected=2`。
-- **可复用的操作口径**：改完 `index.js` 想立刻在活宿主里验，别重启整个应用——`node scripts/sync.mjs` 之后**碰一次 profile 的 cordis.patch.yml**（加一行注释再删，或从设置页保存一次）就会重新挂载。反过来，任何 `pnpm install`/宿主依赖重解析都可能把 sync 出来的开发版还原成 pin 的内容，所以"sync 过就好"这句话只在**下一次挂载拿到的是同一份文件**时才成立。profile 文档里那行 `interceptTools: grep,glob,ops_grep,ops_glob` 现在是冗余的（v0.23.2 起就是默认值），可以删。
+- **可复用的操作口径**：改完 `index.js` 想立刻在活宿主里验，别重启整个应用——`node scripts/sync.mjs` 之后**碰一次 profile 的 cordis.patch.yml**（加一行注释再删，或从设置页保存一次）就会重新挂载。反过来，任何 `pnpm install`/宿主依赖重解析都可能把 sync 出来的开发版还原成 pin 的内容，所以"sync 过就好"这句话只在**下一次挂载拿到的是同一份文件**时才成立。profile 文档里那行 `interceptTools: grep,glob,ops_grep,ops_glob` **要留，我先前说"冗余可删"是错的**。它不是冗余，是版本偏斜时的保险，而且今天有实测：17:51 与 18:15（本地）那两次 ops_grep 被换成图谱，正是发生在活模块退回 v0.21.0 的窗口里——v0.21.0 的默认名单是 `grep,glob`，没有这行覆盖，整条 grep→图谱通道在那 3 小时里会是彻底死的状态（旧模块不认 ops_grep）。默认值只在"活模块 == 发布模块"时才等价，而这条等价关系今天被证明是可 broken 的。代价只有一个：将来若再有新的换皮名（比如 `ops_search`），显式覆盖会挡住新默认、重新造成静默失配——但那正是 `名单核对` 行负责当场点名的场景（治 R2 的那行），所以失效从"看不见"变成"看得见"，留着划算。
 - 第二步（基线读数 → 条件式 `trace_path` 或 `code_impact` 动词）**未开工**，开工条件见 §7。
 - 参考：docs/2026-11-01-tool-hit-rate.md（触发面三层与 P2-1 `code_impact`）、docs/2026-11-02-lifecycle-wiring-audit.md（§1.4 宿主真实事件面、§2 dsh-ops 五个做法）、docs/2026-11-02-poll-vs-watch-decision.md（§6.3 开工触发条件的写法）。
