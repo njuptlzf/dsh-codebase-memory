@@ -45,6 +45,16 @@ const PROXY_TOOL = 'mcp__cbm__mcp'
 /** 触发层（docs/design-v2.md）的常量。跨平台：内置工具是裸名小写（官方 tool-fs-search README 与实装一致）。 */
 const ENFORCE_MODES = ['off', 'deny-once', 'deny', 'replace']
 /**
+ * 拦截名单的默认值。**为什么必须带 ops_***（docs/2026-11-03-hook-name-blindness-and-callchain-ceiling.md）：
+ * 工具身份不是宿主独占的——dsh-ops 把内置 read/glob/grep 收走、发布 `ops_grep`/`ops_glob`
+ * （lib/policy.js: `'ops_' + raw`）。名单只认裸名时 deny 钩子、replace 钩子、近失遥测
+ * 三个消费者一起静默，而设置页与报表看着一切正常（本机实测 11-03：intercept=0，
+ * dirty-record 照记 5 条——write/edit 没被改名，这条没坏恰好证明坏的是名字闸）。
+ * 裸名保留：没装 dsh-ops 的宿主仍用内置工具。两处默认（Config 与 live 回退）共用本常量，
+ * 不留第二份字面量——R1 的成因就是"名单是启动期假设"。
+ */
+const DEFAULT_INTERCEPT_TOOLS = 'grep,glob,ops_grep,ops_glob'
+/**
  * 两条检索腿各自的钩子预算（ms）。为什么要拆：一个 interceptBudgetMs 管两腿时，
  * 图谱实测 ~5000ms、语义层热态 ~376ms，2500ms 的共同预算下**两腿都进不来**——
  * 图谱腿超时 ⇒ project 空串 ⇒ 图谱分支整段跳过。
@@ -112,7 +122,7 @@ export const Config = z.object({
   // getter，钩子每次调用重读）——注册期快照的字段标了就是让页面说谎，所以
   // wrapperTools（tools.register 只在 apply 跑一次，没有反注册）仍留在文件级。其余普通字段改了要重启。
   enforce: z.string().default('off').volatile(),
-  interceptTools: z.string().default('grep,glob').volatile(),
+  interceptTools: z.string().default(DEFAULT_INTERCEPT_TOOLS).volatile(),
   // v0.15.0：interceptBudgetMs 的默认从 2500 改成 0，含义从「整体预算」变成
   // 「未设」——0 时图谱腿按自己的默认预算走。
   // 显式设过它的老 profile 不受影响（它优先于新项），没设过的才吃到新默认。
@@ -255,7 +265,7 @@ function normalize(config = {}) {
   defineLive(cfg, 'telemetry', () => boolOf(live(config.telemetry), true, [], 'telemetry'))
   // v0.9.0：这三个也上了设置页 ⇒ 同一纪律。interceptTools 是决策点现读的名单
   // （csv 对任何字符串都成立，非法只可能是"写错工具名"，那本来就是空名单语义）。
-  defineLive(cfg, 'interceptTools', () => csv(live(config.interceptTools) || 'grep,glob'))
+  defineLive(cfg, 'interceptTools', () => csv(live(config.interceptTools) || DEFAULT_INTERCEPT_TOOLS))
   defineLive(cfg, 'contextHint', () => boolOf(live(config.contextHint), true, [], 'contextHint'))
   defineLive(cfg, 'dirtyTracking', () => boolOf(live(config.dirtyTracking), true, [], 'dirtyTracking'))
   // v0.14.0 的三个观测字段（按天轮转 / recent 环形上限 / 未替换标记）。它们在
@@ -777,6 +787,11 @@ function adapterLine(state) {
 }
 
 function report(cfg, state) {
+  // 名字闸失配的可见性（docs/2026-11-03 R2）：宿主能把内置搜索工具换皮（dsh-ops 发
+  // ops_grep/ops_glob），而拦截只比对名字 ⇒ 换了名整条通道静默、报表看着一切正常。
+  // 这条读数拿"本进程实发过的搜索类工具名"跟名单比（进程内累计，同遥测计数口径）。
+  const seenSearch = [...(state.searchNames ?? [])].sort()
+  const blindSearch = seenSearch.filter((n) => !isGrepLike(n, cfg.interceptTools))
   const lines = [
     `status: ${state.ok ? 'OK' : 'NOT READY'}`,
     `压缩层(②): ${state.adapter}  ${cfg.adapterMjs}`,
@@ -786,6 +801,7 @@ function report(cfg, state) {
     `代理工具: ${PROXY_TOOL}  bootstrap=${cfg.bootstrap}  adapterVersion=${cfg.adapterVersion}  warm=${state.warm ? (state.warmOk === true ? 'ok' : state.warmOk === false ? 'failed' : `pending(${state.warmStartedAt ? Math.round((Date.now() - state.warmStartedAt) / 1000) : 0}s)`) : 'off'}`,
     `适配层进程: ${adapterLine(state)}`,
     `触发层: wrapper=${cfg.wrapperTools ? 'on' : 'off'}  enforce=${cfg.enforce}  intercept=${cfg.interceptTools.join('+') || '(无)'}  budget=graph:${budgetGraph(cfg)}ms(intercept=${cfg.interceptBudgetMs > 0 ? `${cfg.interceptBudgetMs}ms` : '未设'})  dirty=${cfg.dirtyTracking ? 'on' : 'off'}(冷却 ${cfg.dirtyRefreshCooldownSec}s)  context=${cfg.contextHint ? 'on' : 'off'}`,
+    `名单核对: 实发搜索工具=${seenSearch.join('+') || '(本进程还没跑过搜索)'}  名单=${cfg.interceptTools.join('+') || '(无)'}  ${blindSearch.length ? `⚠ ${blindSearch.join('+')} 不在 interceptTools ⇒ 拦截/替换/近失遥测对它们全盲（volatile 字段，设置页改完即生效）` : 'ok'}`,
     `轮扫: ${live(cfg.workspaceSweepSec) > 0 ? `on(${live(cfg.workspaceSweepSec)}s) 候选=${state.workspaces.size}${state.lastSweep ? ` 上轮 checked=${state.lastSweep.checked} hot=${state.lastSweep.hot} cold=${state.lastSweep.cold} refreshed=${state.lastSweep.refreshed} behind=${state.lastSweep.behind}` : ' 还没跑过'}` : 'off'}`,
     // 六个即时热字段；清单重建不用重启宿主——
     // code_setup {action:"restart-adapter"} 重拉适配层即可（宿主监督器自动重生进程）。
@@ -1246,10 +1262,33 @@ function classifyBranch(p) {
   return bare
 }
 
-/** 内置搜索工具是裸名小写（`grep` / `glob`），MCP 工具才带 `mcp__` 前缀。 */
+/**
+ * 搜索工具名判定：精确名单比对（名单来自 cfg.interceptTools，默认见 DEFAULT_INTERCEPT_TOOLS，
+ * 已含 dsh-ops 的 ops_grep/ops_glob）。内置工具是裸名小写（`grep`/`glob`），MCP 工具才带
+ * `mcp__` 前缀。**这里刻意不做形状识别**（按 schema 猜"这算不算 grep"）：误拦一次的代价是
+ * 模型白多一个往返并失去对插件的信任，宁可名单写全 + 报表露出没配对的名字。
+ */
 export function isGrepLike(name, tools = []) {
   return tools.includes(String(name ?? '').toLowerCase())
 }
+
+/**
+ * 换皮工具连语义参数一起换过来：dsh-ops 的 `ops_grep` 带 outputMode
+ * （content/count/files_with_matches/summary），`ops_glob` 带 outputMode（paths/details）。
+ * 非可替换形态 = 模型要的是聚合数或带元数据的清单，图谱的符号坐标表答不了这个问题；
+ * replace 档又是**丢原文**的硬替换，换错比不换贵。不认识的模式名一律按聚合处理（= 放行），
+ * fail-open 的方向是"别破坏模型原本拿到的东西"。导出以便验收直接证伪。
+ */
+export function wantsAggregateOutput(args) {
+  const mode = String(args?.outputMode ?? '').trim().toLowerCase()
+  return !!mode && !['content', 'paths'].includes(mode)
+}
+
+/**
+ * "长得像搜索工具"的名字，用于报表核对名单是否漏了换皮名（R2 的治法）：要求 grep/glob
+ * 前面是分隔符或行首，`mygrep` 这种不算。只观测、不决策——决策仍只认 cfg.interceptTools。
+ */
+const SEARCH_NAME_RE = /(?:^|[^a-z0-9])(?:grep|glob)\d*$/
 
 /** 按码点截断（UTF-16 单元截断会切出孤立代理对，宿主对每个请求返回 400）。 */
 export function truncateCodepoints(text, max) {
@@ -1857,8 +1896,11 @@ function scheduleDirtyRefresh(ctx, cfg, state, sess, exec) {
  */
 function interceptPremises(exec, cfg, state) {
   if (!isGrepLike(exec?.name, cfg.interceptTools)) return null
+  // 聚合输出形态（ops_grep 的 count/files_with_matches/summary、ops_glob 的 details）不换：
+  // 图谱给的是符号坐标，答不了"几个文件命中"，而这里一旦换就把原文丢了。
+  if (wantsAggregateOutput(exec?.arguments)) return null
   const q = classifyPattern(exec?.arguments?.pattern, exec?.arguments?.path)
-  if (q.kind !== 'symbol' && q.kind !== 'symbol-multi') return null // v0.16 T-A：deny 钩子(:2241)仍只认单符号，multi 在 deny 档放行(fail-open)，替换档才做并集
+  if (q.kind !== 'symbol' && q.kind !== 'symbol-multi') return null // v0.16 T-A：deny 钩子（杠杆 ② 的 deny 档）仍只认单符号，multi 在 deny 档放行(fail-open)，替换档才做并集
   const key = sessionKey(exec?.agent)
   const cwd = exec?.agent?.session?.header?.cwd
   if (!key || !cwd || !state.ok) return null
@@ -1872,6 +1914,9 @@ function interceptPremises(exec, cfg, state) {
  * replace 档的内容替换走独立注册的后置监听（enforce=replace），不在这里。
  */
 function observeCall(ctx, cfg, state, exec, result) {
+  // 先记账工具名，再判会话：名单失配的现场证据比"这次能不能拦"更稀有（拿不到第二次）。
+  const seenName = String(exec?.name ?? '').toLowerCase()
+  if (SEARCH_NAME_RE.test(seenName)) state.searchNames?.add(seenName)
   const key = sessionKey(exec?.agent)
   const cwd = exec?.agent?.session?.header?.cwd
   if (!key || !cwd) return
@@ -1915,6 +1960,9 @@ export async function apply(ctx, config) {
     adapter: 'unknown', cbm: 'unknown', ok: false, autoIndex: '', refreshing: new Set(), notes: [], lastError: '',
     sessions: new Map(), projectsByCwd: new Map(), counts: {}, indexJobs: new Map(),
     repos: new Map(), recent: [],
+    // 本进程**实际发过**的搜索类工具名（含 dsh-ops 换皮后的 ops_grep/ops_glob）。只观测
+    // 不决策，给报表核对名单用：名单是启动期假设，宿主换皮工具名就静默瞎（R2）。
+    searchNames: new Set(),
     // P0-5 D：事件时算出的 digest 对照结论（cwd → 'equal'|'differ'）。hint 的渲染
     // 是同步的，读不到 git；只在事件里算一次，渲染层只读这个缓存，绝不现推。
     digestVerdict: new Map(),
@@ -2292,6 +2340,7 @@ export async function apply(ctx, config) {
     ctx.on('tools/pre-execute', async (exec, next) => {
       try {
         if (cfg.enforce === 'off' || cfg.enforce === 'replace' || !isGrepLike(exec.name, cfg.interceptTools)) return next()
+        if (wantsAggregateOutput(exec.arguments)) return next() // 聚合数（count/files_with_matches/summary）不是符号查询，deny 它只是挡路
         const q = classifyPattern(exec.arguments?.pattern, exec.arguments?.path)
         if (q.kind !== 'symbol') return next()
         const key = sessionKey(exec.agent)

@@ -294,7 +294,7 @@ async function verify(profile) {
   // 必须在 import 之前设：这个值在模块加载时读一次。
   process.env.DSH_CBM_WARM_DELAY_MS = '0'
   const mod = await import(pathToFileURL(installed).href)
-  const { apply, name, inject, engineVerdict, fileDrift, classifyPattern, truncateCodepoints, isGrepLike, normPath, projectFromListing, freshnessOf, dropDirtyRows, sweepPlan, Config, parseAdapterProcsWin, parseAdapterProcsPosix, DEFAULT_ADAPTER_VERSION } = mod
+  const { apply, name, inject, engineVerdict, fileDrift, classifyPattern, truncateCodepoints, isGrepLike, wantsAggregateOutput, normPath, projectFromListing, freshnessOf, dropDirtyRows, sweepPlan, Config, parseAdapterProcsWin, parseAdapterProcsPosix, DEFAULT_ADAPTER_VERSION } = mod
   if (name !== 'dsh-codebase-memory') throw new Error(`unexpected plugin name: ${name}`)
   record('装载', true, `name=${name}  inject=${inject.join(',')}`)
 
@@ -710,6 +710,11 @@ async function verify(profile) {
     classifyPattern('aFoo\\|bBar').kind === 'literal' &&
     classifyPattern('loadMcpDecls|function loadMcp|loadMcpDecls').symbols.length === 2)
   record('G 内置工具名判定（裸名小写，MCP 带前缀不算）', isGrepLike('grep', ['grep', 'glob']) && isGrepLike('GLOB', ['grep', 'glob']) && !isGrepLike('mcp__cbm__mcp', ['grep', 'glob']))
+  // 换皮工具（dsh-ops 的 ops_grep/ops_glob）连语义参数一起带过来：聚合形态的输出来不了图谱表。
+  record('G 聚合 outputMode 判定（content/paths 可换；count/files_with_matches/summary/details 与不认识的模式都不换）',
+    !wantsAggregateOutput({}) && !wantsAggregateOutput({ outputMode: 'content' }) && !wantsAggregateOutput({ outputMode: 'PATHS' }) &&
+    ['count', 'files_with_matches', 'summary', 'details', 'whatever-next-release'].every((m) => wantsAggregateOutput({ outputMode: m })),
+    `count=${wantsAggregateOutput({ outputMode: 'count' })} paths=${wantsAggregateOutput({ outputMode: 'paths' })} 空=${wantsAggregateOutput({})}`)
   // 码点截断：dsh-mneme #334 的教训——按 UTF-16 单元切会切出孤立代理对，宿主每个请求 400。
   const cut = truncateCodepoints('ab😀cd', 3)
   const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(cut)
@@ -996,6 +1001,38 @@ async function verify(profile) {
   record('R 字面量类 pattern 不替换', rLiteral?.kind === 'accept' && rLiteral?.content === undefined, JSON.stringify(rLiteral).slice(0, 90))
   const rErr = await postR(grepExec(agentR, 'usageSection'), { content: [], isError: true, error: { message: 'boom' } }, nextPost)
   record('R 失败结果不替换（被 deny 物化的错误不该再被改写）', rErr?.kind === 'accept' && rErr?.content === undefined, JSON.stringify(rErr).slice(0, 90))
+  // ── 名字盲区回归锁（docs/2026-11-03）：本机 2026-11-02 15:29 起 dsh-ops 把内置 grep/glob
+  // 换成 ops_grep/ops_glob，deny + replace + 近失遥测三个消费者一起静默，报表却一切正常。
+  // 这两条走的是 mount 的**默认配置**，证的不是"名单能配"而是"开箱就配上"。
+  // 单独 mount 而不是借 r 的通道：计数按 state 在进程内累计，混进去会把上面那条
+  // 「遥测计数里能看到 intercept-replace=1」的账搅成 2，两条断言互相踩。
+  const opsAgent = fakeAgent(`sess-${process.pid}-ops`, REPO)
+  const opsExec = (args) => ({ name: 'ops_grep', arguments: { pattern: 'usageSection', ...args }, agent: opsAgent, signal: sig() })
+  const okGrep = () => ({ content: [{ type: 'text', text: '原始 grep 输出' }], isError: false })
+  const roCalls = []
+  const ro = await mount({ enforce: 'replace' }, makeStubProxy(roCalls, { project: `stub-${process.pid}-ops` }))
+  await ro.tools.get('code_setup').execute({}, withSignal(REPO))
+  const [roObserve, roSwap] = ro.events['tools/post-execute'] ?? []
+  const opsSwap = await roSwap(opsExec(), okGrep(), nextPost)
+  record('R 默认名单吃到换皮工具名 ops_grep（符号形照换，盲区不再复发）',
+    opsSwap?.kind === 'accept' && /stubSymbol/.test(opsSwap?.content?.[0]?.text ?? '') && !/原始 grep 输出/.test(opsSwap?.content?.[0]?.text ?? '') &&
+      roCalls.some((x) => x.tool === 'cbm_search_graph' && x.args.query === 'usageSection'),
+    `查询=${roCalls.map((x) => x.tool).join(',')} out=${JSON.stringify(opsSwap).slice(0, 90)}`)
+  const opsAgg = await roSwap(opsExec({ outputMode: 'count' }), okGrep(), nextPost)
+  record('R ops_grep 要聚合数（outputMode=count）⇒ 原输出保留：图谱答不了"几个文件命中"，替换又是丢原文',
+    opsAgg?.kind === 'accept' && opsAgg?.content === undefined, JSON.stringify(opsAgg).slice(0, 90))
+  // 名单没配上的失配必须**看得见**（R2 的治法）：窄名单下 ops_grep 照旧不换，但报表点名。
+  // 两条监听都要发：[0] 是记账（searchNames 在这儿进账），[1] 才是替换——只发 [1] 等于跳过
+  // 记账，报表当然说"本进程还没跑过搜索"，那是测试写错，不是插件失明。
+  const rb = await mount({ enforce: 'replace', dirtyTracking: false, interceptTools: 'grep' }, makeStubProxy([], { project: `stub-${process.pid}-blind` }))
+  await rb.tools.get('code_setup').execute({}, withSignal(REPO))
+  const [rbObserve, rbSwap] = rb.events['tools/post-execute'] ?? []
+  await rbObserve(opsExec(), okGrep(), nextPost)
+  const rbOut = await rbSwap(opsExec(), okGrep(), nextPost)
+  const rbSetup = await rb.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('R 名单漏掉的搜索工具名被报表点名（失配不再只能靠人肉翻遥测）',
+    /名单核对:.*⚠ ops_grep 不在 interceptTools/.test(rbSetup) && rbOut?.content === undefined,
+    /名单核对:.*$/m.exec(rbSetup)?.[0]?.slice(0, 200) ?? '(报表里没有 名单核对 行)')
   const rnCalls = []
   const rn = await mount({ enforce: 'replace', dirtyTracking: false, telemetry: false }, makeStubProxy(rnCalls, { project: `stub-${process.pid}-rnohit`, emptySearch: true }))
   await rn.tools.get('code_setup').execute({}, withSignal(REPO))
