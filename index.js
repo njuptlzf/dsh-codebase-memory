@@ -1658,8 +1658,22 @@ const dayStamp = (d = new Date()) =>
  * 每次都可能写 cbm-warm/intercept-replace，写进真实目录就把现场数据淹了
  * （2026-10-24 实测：真实日志里 283 条 intercept-replace 全是桩，`project:"stub-*"`）。
  * 显式传 adapterDir 的臂（W2/U5/O1）不受影响：它们的 mount 把缝指回自己的目录。
+ *
+ * v0.24.1：缝按 **mount 钉一次**。它原本是每次现读全局 env，而验收是几十次 mount
+ * 挤在同一个进程里 —— 上一个 mount 的迟到事件（脏台账补刷、在飞的 warm）会落到
+ * **当时**的目录，用它自己的 logRetentionDays 去 sweep 别人的日志。O1b
+ * （`logRetentionDays=0` 断言"关掉轮转后超期文件仍留"）就被 O1（=7）这么删掉过：
+ * 插件里能删日志的只有 sweepTelemetry 的保留期分支和体积闸那一处，而 o1b 那个实例读到的是 0，
+ * 所以删它的必然是另一个实例。生产无此问题（一进程一实例、env 不设），行为不变。
  */
-const telemetryDir = (cfg) => process.env.DSH_CBM_TELEMETRY_DIR || cfg.adapterDir
+const telemetryDirPinned = new WeakMap()
+function telemetryDir(cfg) {
+  const env = process.env.DSH_CBM_TELEMETRY_DIR
+  if (!env) return cfg.adapterDir // 生产路径：仍跟着 adapterDir 的热改走
+  let pinned = telemetryDirPinned.get(cfg)
+  if (!pinned) telemetryDirPinned.set(cfg, (pinned = env))
+  return pinned
+}
 const telemetryPath = (cfg, d = new Date()) => join(telemetryDir(cfg), `telemetry-${dayStamp(d)}.log`)
 
 /** 删掉超 `logRetentionDays` 的旧日志。只认文件名日期，幂等且廉价。 */

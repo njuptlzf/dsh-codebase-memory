@@ -237,6 +237,21 @@ function makeCtx(tools, sections, events = {}, contexts = [], proxy = null, opts
             },
           }
         }
+        if (!opts.npmInstall && String(request.argv[1] ?? '').endsWith('npm-cli.js') && request.argv.includes('install')) {
+          // 验收层绝不打真网络。臂只要没给 npmInstall 罐头，就把这发当成安装失败：
+          // 临时 adapterDir 缺 node_modules/@njuptlzf/mcp-adapter/package.json 时，插件会
+          // 判"实装 ''≠钉的"真去装（v0.24.0 加镜像回落后变成两轮），于是 O1/U5/N/W2 这些
+          // 跟安装毫无关系的臂各自跑上十秒真 npm，还看机器与网络的脸色。
+          (opts.npmBlocked ??= []).push(request.argv.join(' '))
+          const text = 'check-plugin: 验收拦下真网络安装（该臂未提供 npmInstall 罐头）'
+          return {
+            done: Promise.resolve({ exitCode: 1, signal: null }),
+            collected: {
+              stdout: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+              stderr: { readFrom: () => ({ text, nextOffset: text.length, lossy: false }) },
+            },
+          }
+        }
         // v0.18.0 臂 N：自愈首建的那发 index_repository——真索引要秒级且动真引擎
         // 库，验收用罐头替代；opts.spawns 记下每一发 argv（"每 cwd 只试一次"靠数它证伪）。
         if (request.argv.some((a) => String(a).includes('index_repository'))) {
@@ -272,7 +287,22 @@ function makeCtx(tools, sections, events = {}, contexts = [], proxy = null, opts
         let stderr = ''
         child.stdout.on('data', (chunk) => { stdout += chunk })
         child.stderr.on('data', (chunk) => { stderr += chunk })
-        const done = new Promise((resolve) => child.on('close', (exitCode) => resolve({ exitCode, signal: null })))
+        // 真实宿主这两条都有，假层缺一条就会把验收本身搞成事故现场：
+        // ① 'error'：ENOENT（cwd 被臂的 finally 删了、二进制被换走）在 Node 里是
+        //    ChildProcess 上的 'error' 事件；只听 'close' 的话整轮套件被一发未处理
+        //    异常掀掉（2026-11-05 v0.24.1 全量就是这么死的，报的还不是被测代码的错）。
+        // ② signal：宿主 abort 会杀子进程；不接的话臂结束仍在飞的安装会活到下一条臂的
+        //    目录删除之后，拿到一个已经不该存在的 cwd。
+        const done = new Promise((resolve) => {
+          child.on('close', (exitCode) => resolve({ exitCode, signal: null }))
+          child.on('error', () => resolve({ exitCode: 127, signal: null }))
+        })
+        if (request.signal) {
+          const kill = () => { try { child.kill() } catch { } }
+          if (request.signal.aborted) kill()
+          else request.signal.addEventListener('abort', kill, { once: true })
+          done.finally?.(() => request.signal?.removeEventListener?.('abort', kill))
+        }
         return {
           done,
           collected: {
@@ -590,6 +620,15 @@ async function verify(profile) {
   // --version 当场抛错、清单永远写不出来。cmd.exe 是"存在的合法可执行文件"的最小
   // 形态：喂给它 --version/config 只会快速非零退出，没有任何副作用。
   const fakeExe = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe')
+  // 假适配层必须写在**真实布局**上：installedAdapterVersion() 读的是
+  // <adapterDir>/node_modules/@njuptlzf/mcp-adapter/package.json。写到目录根时插件判"实装 ''"，
+  // 于是每条只想测别的东西的臂都会真跑一发 npm install（v0.24.1 拦下真网络安装之后当场露形）。
+  const seedAdapter = (dir) => {
+    const d = join(dir, 'node_modules', '@njuptlzf', 'mcp-adapter')
+    mkdirSync(d, { recursive: true })
+    writeFileSync(join(d, 'mcp-server.mjs'), '', 'utf8')
+    writeFileSync(join(d, 'package.json'), `{"name":"@njuptlzf/mcp-adapter","version":"${DEFAULT_ADAPTER_VERSION}"}`, 'utf8')
+  }
   const zMount = await mount({ adapterDir: zgAdapter, cbmPath: fakeExe })
   await zMount.tools.get('code_setup').execute({}, withSignal(REPO)) // 惰 bootstrap：跑一次才写 cbm.json
   const zDoc = JSON.parse(readFileSync(join(zgAdapter, 'cbm.json'), 'utf8'))
@@ -1406,8 +1445,7 @@ async function verify(profile) {
   const rmW2 = () => { try { rmSync(w2Dir, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 }) } catch { /* 尽力，目录名带 pid 唯一 */ } }
   rmW2()
   mkdirSync(w2Dir, { recursive: true })
-  writeFileSync(join(w2Dir, 'mcp-server.mjs'), '', 'utf8')
-  writeFileSync(join(w2Dir, 'package.json'), `{"version":"${DEFAULT_ADAPTER_VERSION}"}`, 'utf8')
+  seedAdapter(w2Dir)
   try {
     const w2Calls = []
     const w2 = await mount({ telemetry: true, adapterDir: w2Dir, cbmPath: fakeExe },
@@ -1453,8 +1491,7 @@ async function verify(profile) {
     rmSync(nTdir, { recursive: true, force: true })
     mkdirSync(nTdir, { recursive: true })
     // 适配层用罐头版本占位（W2 同款）：bootstrap 走"清单已就位"分支，验收不碰真安装。
-    writeFileSync(join(nTdir, 'mcp-server.mjs'), '', 'utf8')
-    writeFileSync(join(nTdir, 'package.json'), `{"version":"${DEFAULT_ADAPTER_VERSION}"}`, 'utf8')
+    seedAdapter(nTdir)
     try {
       const healJson = (name, nodes) => JSON.stringify({ project: name, status: 'indexed', nodes, edges: nodes * 2 })
       const nSpawns = []
@@ -1652,8 +1689,7 @@ async function verify(profile) {
   const rmU5 = () => { try { rmSync(u5Dir, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 }) } catch { /* 见上 */ } }
   rmU5()
   mkdirSync(u5Dir, { recursive: true })
-  writeFileSync(join(u5Dir, 'mcp-server.mjs'), '', 'utf8')
-  writeFileSync(join(u5Dir, 'package.json'), `{"version":"${DEFAULT_ADAPTER_VERSION}"}`, 'utf8')
+  seedAdapter(u5Dir)
   try {
     const u5 = await mount({ telemetry: true, adapterDir: u5Dir, cbmPath: fakeExe }, null, { procTable: '' })
     await u5.tools.get('code_setup').execute({ action: 'restart-adapter' }, withSignal(REPO)) // 必发一条遥测
@@ -1678,8 +1714,7 @@ async function verify(profile) {
   const rmO1 = () => { try { rmSync(o1Dir, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 }) } catch { } }
   rmO1()
   mkdirSync(o1Dir, { recursive: true })
-  writeFileSync(join(o1Dir, 'mcp-server.mjs'), '', 'utf8')
-  writeFileSync(join(o1Dir, 'package.json'), `{"version":"${DEFAULT_ADAPTER_VERSION}"}`, 'utf8')
+  seedAdapter(o1Dir)
   const stamp = (offsetDays) => {
     const d = new Date(Date.now() - offsetDays * 86400000)
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
@@ -1704,14 +1739,23 @@ async function verify(profile) {
   const rmO1b = () => { try { rmSync(o1bDir, { recursive: true, force: true, maxRetries: 8, retryDelay: 150 }) } catch { } }
   rmO1b()
   mkdirSync(o1bDir, { recursive: true })
-  writeFileSync(join(o1bDir, 'mcp-server.mjs'), '', 'utf8')
-  writeFileSync(join(o1bDir, 'package.json'), `{"version":"${DEFAULT_ADAPTER_VERSION}"}`, 'utf8')
+  seedAdapter(o1bDir)
   writeFileSync(join(o1bDir, `telemetry-${oldStamp}.log`), '{"event":"old"}\n', 'utf8')
   try {
     const o1b = await mount({ telemetry: true, adapterDir: o1bDir, logRetentionDays: 0, cbmPath: fakeExe }, null, { procTable: '' })
     await o1b.tools.get('code_setup').execute({ action: 'restart-adapter' }, withSignal(REPO))
-    const stillThere = readdirSync(o1bDir).some((f) => f === `telemetry-${oldStamp}.log`)
-    record('O1 logRetentionDays=0 关掉轮转：超期文件仍留', stillThere)
+    const o1bNames = readdirSync(o1bDir)
+    const stillThere = o1bNames.some((f) => f === `telemetry-${oldStamp}.log`)
+    record('O1 logRetentionDays=0 关掉轮转：超期文件仍留', stillThere, `目录实有=[${o1bNames.join(', ')}]`)
+    // 反向证伪 + 跨 mount 污染回归（v0.24.1）：0 的语义是"整段清理跳过"，所以再写一发事件、
+    // 再放一个 3 天前的文件，两个都必须活着。曾经杀死它的是**另一个 mount 实例**的迟到事件
+    // 拿自己的 logRetentionDays=7 清了这个目录（遥测缝原本是每次现读全局 env）。
+    writeFileSync(join(o1bDir, `telemetry-${recentStamp}.log`), '{"event":"recent"}\n', 'utf8')
+    await o1b.tools.get('code_setup').execute({ action: 'restart-adapter' }, withSignal(REPO))
+    const o1bNames2 = readdirSync(o1bDir)
+    record('O1 logRetentionDays=0：再写事件后 30 天与 3 天文件都仍在',
+      o1bNames2.some((f) => f === `telemetry-${oldStamp}.log`) && o1bNames2.some((f) => f === `telemetry-${recentStamp}.log`),
+      `目录实有=[${o1bNames2.join(',')}]`)
   } finally { rmO1b() }
 
   // repos[] 带 cwd + project + per-repo 计数：一个 replace 事件后应有完整行（zg 列不得回潮）

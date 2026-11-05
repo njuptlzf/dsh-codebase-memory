@@ -274,6 +274,25 @@ inputs[5].props.onBlur({ target: badLimit })
 ok(calls.set.length === 1 && badNum.value === '2500' && badCsv.value === 'grep,glob'
   && badDays.value === '7' && badLimit.value === '100' && badSweep.value === '300',
   '非法/空值一个字节都不写，输入框拨回当前值', `${badNum.value}|${badCsv.value}|${badDays.value}|${badLimit.value}|${badSweep.value}`)
+// 快照里没有 interceptTools（= 用户从没改过）时，输入框显示的回退值必须是 bundle 的真默认。
+// v0.23.2 把默认名单从 grep,glob 扩到含 ops_grep/ops_glob，这行文案当时漏改，设置页继续
+// 教用户"默认只有 grep,glob"——照它理解就会以为装了 dsh-ops 后拦截失效。
+storeSnapshot = { status: 'ready', value: { enforce: 'off', telemetry: true }, base: {}, user: {}, writable: true, revision: 16 }
+const bareInputs = flatten(panel.component({ ...props })).filter((n) => n.type === primitives.Input)
+ok(bareInputs[3]?.props?.defaultValue === 'grep,glob,ops_grep,ops_glob',
+  '名单缺省值与 bundle 默认一致（v0.24.1：曾停在 ops_* 之前的 grep,glob）', String(bareInputs[3]?.props?.defaultValue))
+// 文案层没人管：props.t 在本套件里是 (key) => key，hint 原文从不渲染，所以 v0.23.2 换默认名单时
+// 中英文 hint 与这里的回退值一起漏改，设置页继续说"默认 grep,glob"。这条直接从源码对齐。
+const srcIndex = read('index.js')
+const srcClient = read(clientBundle)
+const realDefault = /DEFAULT_INTERCEPT_TOOLS = '([^']+)'/.exec(srcIndex)?.[1]
+const clientDefault = /inputRow\('interceptTools',\s*'([^']+)'/.exec(srcClient)?.[1]
+const hintZh = /'interceptTools\.hint': '([^']+?)',\n/.exec(srcClient)?.[1]
+const hintEn = srcClient.split("'interceptTools.hint'").slice(1).map((s) => /'([^']+?)',\n/.exec(s)?.[1]).filter(Boolean).pop()
+ok(realDefault === clientDefault && clientDefault === bareInputs[3]?.props?.defaultValue,
+  'index.js 的 DEFAULT_INTERCEPT_TOOLS == client 回退值 == 渲染出的缺省值', `index=${realDefault} client=${clientDefault}`)
+ok(/ops_grep/.test(hintZh ?? '') && /ops_grep/.test(hintEn ?? ''),
+  '中英 hint 都点名 ops_*（否则装了 dsh-ops 的用户以为默认没覆盖）', `${(hintZh ?? '').slice(0, 40)} | ${(hintEn ?? '').slice(0, 40)}`)
 let blurred = 0
 const fakeTarget = { blur: () => { blurred += 1 } }
 inputs[3].props.onKeyDown({ key: 'Enter', currentTarget: fakeTarget })

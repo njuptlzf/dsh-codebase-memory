@@ -647,6 +647,14 @@ v0.13.0 的验收现场自查翻出同一族的第三、第四种姿势：**报�
 - **并发合流（`installOnce`）**：V4 第一次跑就把这条炸出来了——记录到三轮安装 `(默认源)(默认源)(官方源)`，期望两发。不是断言太严：`bootstrap` 的 `if (state.ok && !force) return state` 只在**跑完**之后关闸，装载期那一发还没落地时 `code_setup` 又能进一发，于是两个 npm 进程往同一个 `--prefix` 里写。修法是按 `${adapterDir}|${registry}` 合流在飞的 promise（模块级 `adapterInstalls` Map），后进的那发只 await；key 带源是因为回落那一发本来就是另一件事。"装没装上"的判据不变（仍读实装版本），所以共享 promise 伪造不出 ready。
 - **引擎轴的新坑**：`codebase-memory-mcp update` 只是指路，真正升级跑 `install.ps1`，而它的 target 是**官方安装位** `%LOCALAPPDATA%\Programs\codebase-memory-mcp`。本机于是出现两份二进制：官方位 0.12.1、`~/.dsh/vendor/codebase-memory-mcp/bin` 0.11.0；探测顺序是官方 → vendor → PATH，**但 checks 硬编码 vendor 路径**（`checks/check-plugin.mjs:39`、`checks/check-tokens.mjs:14`），所以"只升官方位"时门禁测的还是旧引擎。处置：0.12.1 以同一 sha256（`39f6a789cd858d7428561ac5…`）复制进 vendor，并刷新 vendor 的 `checksums.txt`（取 `https://github.com/DeusData/codebase-memory-mcp/releases/latest/download/checksums.txt`），两条路径同一份码，报表与门禁不再各说各话。`dsh.testedEngine` 随四路 checks（patch → chain → tokens → plugin）全绿从 `0.11` 升 `0.12`。引擎二进制仍然**不自动下载**（可执行文件的安全水位高于包，这条不改）。
 
+### 6.19 设置页替旧名单说话，与验收进程里的跨 mount 污染（v0.24.1）
+
+2026-11-05 用户问"升级 mcp-adapter 之后插件还能用吗、有没有死代码"。工具面与符号引用清点下来的结论是**没有死代码**（细节见 docs/2026-11-03-hook-name-blindness-and-callchain-ceiling.md §10），但顺着查出的两件事都得记。
+
+- **默认名单扩到四项时漏了设置页**：v0.23.2 把 `interceptTools` 默认从 `grep,glob` 扩成 `grep,glob,ops_grep,ops_glob`，`index.js`、README、报表都跟上了，只有 `lib/client.js` 的中英 hint 和 `inputRow('interceptTools', …)` 的回退显示值还写着两项。checks 抓不到是**结构性**的：`check-client.mjs` 用 `props.t = (key) => key`，hint 原文从不渲染；快照断言喂的又是测试自己写的两项值 ⇒ "断言全绿 + 文案在教错东西"同时成立。补三条锁：渲染出的缺省值 == `DEFAULT_INTERCEPT_TOOLS` == client 回退值，且中英 hint 都点名 `ops_*`；反向证伪过（改回两项立刻两条 FAIL）。这条与 §6.18 的报表露实装、v0.23.2 的名单核对是同一个家族：**读数说的不是磁盘实况**，只是这次骗的是人不是遥测。
+- **验收层的三处契约缺口**（`check-plugin.mjs` 从 199/202 走到 203/203）：① 假 subprocess 层只听 `'close'`，没有 `'error'` 处理器也不接 `request.signal`，一次 `spawn … ENOENT`（Windows 上 cwd 不存在就是这个码）直接掀翻整轮，而真宿主两条都做；② 加一条"没给 `npmInstall` 罐头的臂一律拦下真网络"之后，暴露出五条臂（W2/N1–N4/U5/O1/O1b）的假适配层写在**目录根**，而 `installedAdapterVersion()` 读的是 `node_modules/@njuptlzf/mcp-adapter/package.json` ⇒ 这些臂每次真跑一发 npm install，15 秒的网络延迟一直替它们掩盖"这条臂在联网"的事实；统一换成 `seedAdapter(dir)`。③ **`telemetryDir()` 每次现读进程级 `DSH_CBM_TELEMETRY_DIR`**，而验收是同一个 node 进程里几十次 mount：上一个实例的迟到事件会落到**当时**的目录，并用它自己的 `logRetentionDays=7` 去 sweep 下一个实例刚种的文件——O1b（`=0`，断言"关掉轮转后超期文件仍留"）的 30 天文件就是这么没的。改成**按 mount 钉一次**（WeakMap）：生产不设该 env，走的还是 `cfg.adapterDir` 热改路径，**行为零变化**，测试串扰整族消失。
+- 通用一条：**桩的布局要和真读取路径同构**，否则"臂在联网"这种事能靠时序侥幸掩盖好几个版本。
+
 ---
 
 ## 7. 参考链接
