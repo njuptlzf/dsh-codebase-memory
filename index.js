@@ -34,9 +34,18 @@ export const inject = ['tools', 'subprocess', 'systemPrompt']
  *  harness 的假 bundle 固件与断言都引用它，升 pin 不再需要改第二处。
  *  5.2.0-0.0.6 = 上游 issue #34 修复版：内置清单 watcher（sha256 轮询 3s，漂移即
  *  exit(0) 交给宿主监督器重拉），stale 从"永不自愈"变"几秒自愈"；restart-adapter
- *  降级为兜底（老进程/关监听时）。同版起 mcpScript 默认不注册，需 settings.scriptMode。 */
-export const DEFAULT_ADAPTER_VERSION = '5.2.0-0.0.6'
+ *  降级为兜底（老进程/关监听时）。同版起 mcpScript 默认不注册，需 settings.scriptMode。
+ *  7.0.0-0.0.1 = 上游 7.0.0（2026-10-25）+ fork。升前逐条比过两份 mcp-server.mjs：
+ *  #34 的 `[config-watch]` 漂移→exit(0) 代码形状两侧一致、settings.scriptMode 仍在；
+ *  7.0.0 的 breaking 只动语义搜索（settings.jev→semanticSearch、System One key 删除、
+ *  mcp({tool,args}) 参数不再允许嵌套），我们的清单只有 mcpServers+scriptMode，不沾。
+ *  实测收益：代理侧工具定义 1270→1023 tokens（check:tokens 臂B 3.4×→4.2×）。
+ *  坑（这次撞上的）：npmmirror 停在 5.2.0-0.0.6，点名要 7.0.0-0.0.1 是 404，
+ *  `PUT /-/sync` 返回 201 也没同步下来 ⇒ ensureAdapter 加了官方源兜底重试。 */
+export const DEFAULT_ADAPTER_VERSION = '7.0.0-0.0.1'
 const ADAPTER_PKG = '@njuptlzf/mcp-adapter'
+/** 默认源（国内镜像）没有钉版本时的回落源：钉的是精确版本，回落脚本不改变信任面。 */
+const ADAPTER_FALLBACK_REGISTRY = 'https://registry.npmjs.org'
 const CBM_EXE = 'codebase-memory-mcp.exe'
 const BOOTSTRAP_MODES = ['blocking', 'background', 'manual']
 const INDEX_MODES = ['full', 'moderate', 'fast', 'cross-repo-intelligence']
@@ -366,19 +375,31 @@ async function ensureAdapter(ctx, cfg, state, signal) {
     return
   }
   mkdirSync(cfg.adapterDir, { recursive: true })
-  const r = await run(ctx, [
+  const npmInstall = (registry) => run(ctx, [
     process.execPath, npm, 'install',
     '--prefix', cfg.adapterDir,
     '--no-audit', '--no-fund', '--loglevel=error',
+    ...(registry ? [`--registry=${registry}`] : []),
     `${ADAPTER_PKG}@${cfg.adapterVersion}`,
   ], { cwd: cfg.adapterDir, maxBytes: 512 * 1024, signal })
+  let r = await npmInstall('')
+  // 镜像滞后兜底：钉的是精确版本，默认源没有它就是硬 404——2026-11-05 升 7.0.0-0.0.1
+  // 实撞（npmmirror 的 dist-tags 停在 5.2.0-0.0.6，`PUT /-/sync` 返回 201 也没同步下来）。
+  // 回落官方源只多一发请求，换来的是"升 pin = 真升了"，而不是全机停在旧包却照报 ready
+  // （design-v2.md:597 版本对账那条：状态没撒谎，只是不知道）。
+  let viaFallback = false
+  if (installedAdapterVersion(cfg) !== cfg.adapterVersion) {
+    r = await npmInstall(ADAPTER_FALLBACK_REGISTRY)
+    viaFallback = installedAdapterVersion(cfg) === cfg.adapterVersion
+  }
   if (!existsSync(cfg.adapterMjs)) {
     state.adapter = 'missing'
-    push(state, `npm install 退出码 ${r.exitCode}：${(r.stderr || r.stdout).trim().slice(-400)}`)
+    push(state, `npm install 退出码 ${r.exitCode}（默认源与官方源各试过一轮）：${(r.stderr || r.stdout).trim().slice(-400)}`)
     return
   }
   state.adapter = 'ready'
   const now = installedAdapterVersion(cfg)
+  if (viaFallback) push(state, `适配层 ${now} 由官方源补齐（默认源没有钉的这个版本）`)
   if (upgrading) {
     if (now === cfg.adapterVersion) {
       // 磁盘换了 ≠ 进程换了：watcher（≥0.0.5）会把活进程秒级重拉；老包不监听，
@@ -543,6 +564,45 @@ async function resolveCbm(ctx, cfg, state) {
   state.cbm = 'missing'
 }
 
+/** 探引擎版本（`--version` 第一行）。bootstrap 与引擎轴重量共用这一处。 */
+async function probeEngineVersion(ctx, state, signal) {
+  const r = await run(ctx, [state.cbmPath, '--version'], { maxBytes: 64 * 1024, signal })
+  return `${r.stdout || r.stderr}`.trim().split('\n')[0]
+}
+
+/** 引擎二进制的身份指纹：换了文件就变，用它判断缓存的版本读数还作不作数。 */
+function engineSignature(state) {
+  try {
+    const st = statSync(state.cbmPath)
+    return `${Math.round(st.mtimeMs)}:${st.size}`
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 引擎轴重量（v0.24.0）：`state.cbmVersion` 只在 bootstrap 探一次，之后换二进制不会重探——
+ * 官方位的 `codebase-memory-mcp update` 只写官方安装位，vendor 那份靠人工覆盖。2026-11-05 实撞：
+ * 磁盘两处都已是 0.12.1，报表还印 0.11.0，于是「引擎实测」行**反过来**打 ⚠ 说超出实测范围
+ * （testedEngine() 读 package.json，那个是新的）。报表不在热路径，stat 一下就能判；
+ * 探空、探败都保留旧读数，绝不反过来把报表弄坏。
+ */
+async function refreshEngineIdentity(ctx, state, signal) {
+  if (state.cbm !== 'ready' || !state.cbmPath) return
+  const sig = engineSignature(state)
+  if (!sig || sig === state.cbmSig) return
+  let line = ''
+  try {
+    line = await probeEngineVersion(ctx, state, signal)
+  } catch {
+    return
+  }
+  state.cbmSig = sig
+  if (!line || line === state.cbmVersion) return
+  push(state, `索引引擎版本已重探：${line}（二进制被换过；旧读数 ${state.cbmVersion || '(无)'}）`)
+  state.cbmVersion = line
+}
+
 /** 写 adapter 的服务器清单。二进制用绝对 .exe，绕开 .cmd shim。 */
 function writeAdapterConfig(cfg, state) {
   const doc = {
@@ -612,8 +672,8 @@ async function bootstrap(ctx, cfg, state, signal, { force = false } = {}) {
   await ensureAdapter(ctx, cfg, state, signal)
   await resolveCbm(ctx, cfg, state)
   if (state.cbm === 'ready') {
-    const r = await run(ctx, [state.cbmPath, '--version'], { maxBytes: 64 * 1024, signal })
-    state.cbmVersion = (r.stdout || r.stderr).trim().split('\n')[0]
+    state.cbmVersion = await probeEngineVersion(ctx, state, signal)
+    state.cbmSig = engineSignature(state)
     writeAdapterConfig(cfg, state)
     await ensureAutoIndex(ctx, cfg, state, signal)
   }
@@ -787,6 +847,12 @@ function adapterLine(state) {
 }
 
 function report(cfg, state) {
+  // 实装版本必须和钉的版本一起露出来：这行从前只印 cfg.adapterVersion，于是磁盘停在
+  // 旧包（或反过来）时报表看着完全正常——2026-11-05 升 7.0.0-0.0.1 时就是靠 grep 装包
+  // package.json 才发现活进程吃的还是旧码。读一次 1KB JSON，报表不在热路径上。
+  const installedAdapter = installedAdapterVersion(cfg)
+  const adapterGap = installedAdapter && installedAdapter !== cfg.adapterVersion
+    ? `  ⚠ 实装 ${installedAdapter} ≠ 钉的 ${cfg.adapterVersion}` : ''
   // 名字闸失配的可见性（docs/2026-11-03 R2）：宿主能把内置搜索工具换皮（dsh-ops 发
   // ops_grep/ops_glob），而拦截只比对名字 ⇒ 换了名整条通道静默、报表看着一切正常。
   // 这条读数拿"本进程实发过的搜索类工具名"跟名单比（进程内累计，同遥测计数口径）。
@@ -794,7 +860,7 @@ function report(cfg, state) {
   const blindSearch = seenSearch.filter((n) => !isGrepLike(n, cfg.interceptTools))
   const lines = [
     `status: ${state.ok ? 'OK' : 'NOT READY'}`,
-    `压缩层(②): ${state.adapter}  ${cfg.adapterMjs}`,
+    `压缩层(②): ${state.adapter}  ${cfg.adapterMjs}${adapterGap}`,
     `索引引擎(①): ${state.cbm}  ${state.cbmPath || '(未找到)'}${state.cbmVersion ? '  ' + state.cbmVersion : ''}`,
     `引擎实测: 实测通过 ${testedEngine() || '(未声明)'}；当前 ${state.cbmVersion || '(未探测)'}${engineVerdict(state.cbmVersion) === 'untested' ? '  ⚠ 超出实测范围——工具面可能已变，跑 npm run check' : ''}`,
     `清单: ${state.configPath ?? '(未写)'}  exclude=${JSON.stringify(EXCLUDE_TOOLS)}`,
@@ -1967,7 +2033,7 @@ function observeCall(ctx, cfg, state, exec, result) {
 export async function apply(ctx, config) {
   const cfg = normalize(config)
   const state = {
-    adapter: 'unknown', cbm: 'unknown', ok: false, autoIndex: '', refreshing: new Set(), notes: [], lastError: '',
+    adapter: 'unknown', cbm: 'unknown', cbmSig: '', ok: false, autoIndex: '', refreshing: new Set(), notes: [], lastError: '',
     sessions: new Map(), projectsByCwd: new Map(), counts: {}, indexJobs: new Map(),
     repos: new Map(), recent: [],
     // 本进程**实际发过**的搜索类工具名（含 dsh-ops 换皮后的 ops_grep/ops_glob）。只观测
@@ -2099,6 +2165,7 @@ export async function apply(ctx, config) {
         // 等完新进程再 force 量一次新鲜度：报表里的适配层进程行必须是重启后的实况。
         const r = await restartAdapter(ctx, cfg, state, ac.signal)
         const fresh = await adapterFreshness(ctx, cfg, state, ac.signal, { force: true })
+        await refreshEngineIdentity(ctx, state, ac.signal).catch(() => {})
         return [
           r.oldPids.length
             ? `已重启适配层：杀掉 pid=${r.oldPids.join(',')} → 新进程 pid=${r.newPids.join(',') || '(还没冒出来)'}`
@@ -2118,6 +2185,8 @@ export async function apply(ctx, config) {
       // 事故里 pid 行 9 分钟报着开机快照，就是因为 code_setup 没有自己的量取路径。
       // 30s TTL 天然限流；这是诊断面，失败静默，绝不反过来弄坏报表。
       if (state.ok) await adapterFreshness(ctx, cfg, state, ac.signal).catch(() => {})
+      // 引擎轴同一条纪律（v0.24.0）：报表得先重量再说话，否则 引擎实测 行拿旧缓存比新钉。
+      if (state.ok) await refreshEngineIdentity(ctx, state, ac.signal).catch(() => {})
       return report(cfg, state)
     },
   }))

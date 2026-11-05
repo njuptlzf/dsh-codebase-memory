@@ -210,12 +210,25 @@ function makeCtx(tools, sections, events = {}, contexts = [], proxy = null, opts
             },
           }
         }
+        // v0.24.0 引擎轴重量那条臂：--version 走罐头。真引擎二进制 300MB 级，而且"换没换二进制"
+        // 不是验收能控制的输入，这里把版本读数变成臂自己写的变量；文件大小仍走真实 stat。
+        if (opts.engineVersion && String(request.argv[1] ?? '') === '--version') {
+          const text = String(typeof opts.engineVersion === 'function' ? opts.engineVersion() : opts.engineVersion)
+          return {
+            done: Promise.resolve({ exitCode: 0, signal: null }),
+            collected: {
+              stdout: { readFrom: () => ({ text, nextOffset: text.length, lossy: false }) },
+              stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+            },
+          }
+        }
         // 臂 V（v0.13.0）：适配层安装的罐头版。真 npm install 依赖网络且十秒起步，
-        // 钉死对账臂要断言的是"取了哪个版本"这一确定性动作；opts.npmInstall(cwd, version)
-        // 由臂写假包并记账，返回形状与真分支完全一致。
+        // 钉死对账臂要断言的是"取了哪个版本"这一确定性动作；opts.npmInstall(cwd, version, argv)
+        // 由臂写假包并记账，返回形状与真分支完全一致。argv 是 v0.24.0 加的：镜像回落
+        // 那条臂要看的正是"第二次有没有带 --registry=官方源"。
         if (opts.npmInstall && String(request.argv[1] ?? '').endsWith('npm-cli.js') && request.argv.includes('install')) {
           const spec = String(request.argv[request.argv.length - 1])
-          opts.npmInstall(request.cwd, spec.slice(spec.lastIndexOf('@') + 1))
+          opts.npmInstall(request.cwd, spec.slice(spec.lastIndexOf('@') + 1), request.argv)
           return {
             done: Promise.resolve({ exitCode: 0, signal: null }),
             collected: {
@@ -624,7 +637,58 @@ async function verify(profile) {
   record('V manual + 旧实装 ⇒ 不碰网络：保留 ready，差距只进 note',
     vInstalls.length === 0 && /压缩层\(②\): ready/.test(vManSetup) && /bootstrap=manual 不自动升级/.test(vManSetup),
     `installs=${JSON.stringify(vInstalls)}  ${(/notes: .*/.exec(vManSetup)?.[0] ?? '(没有 note)').slice(0, 110)}`)
+  // v0.24.0：实装版本要和钉的版本一起露在报表里。这行从前只印 cfg.adapterVersion，磁盘
+  // 停在旧包时报表看着完全正常——2026-11-05 升 7.0.0-0.0.1 就是靠 grep 装包 package.json
+  // 才发现活进程吃的还是旧码。用 includes 而非正则：这条断言里没有反斜杠要躲渲染的坑。
+  record('V 报表露出实装 ≠ 钉（旧包照报 ready 的可见面）',
+    vManSetup.includes('⚠ 实装 0.0.1-fake ≠ 钉的'),
+    (vManSetup.split('\n').find((l) => l.includes('压缩层(②)')) ?? '(报表里没有压缩层行)').slice(0, 150))
   rmSync(vAdapter, { recursive: true, force: true })
+
+  // ── 臂 V4（v0.24.0）：默认源没有钉的版本 ⇒ 回落官方源 ────────────────────────
+  // 2026-11-05 实撞：npmmirror 的 dist-tags 停在 5.2.0-0.0.6，点名要 7.0.0-0.0.1 是 404，
+  // `PUT /-/sync` 返回 201 也没同步下来。若只在默认源失败就收工，升 pin 等于全机停在
+  // 旧包——所以第二轮必须带 --registry=https://registry.npmjs.org 重试，且重试落了盘才算 ready。
+  const v4Adapter = join(tmpdir(), `cbm-check-vpin4-${process.pid}`)
+  rmSync(v4Adapter, { recursive: true, force: true })
+  const v4Tries = []
+  const v4Stub = (cwd, version, argv) => {
+    v4Tries.push(argv.filter((a) => String(a).startsWith('--registry=')).join() || '(默认源)')
+    if (!argv.includes('--registry=https://registry.npmjs.org')) return // 模拟镜像 404：不落盘
+    const dir = join(cwd, 'node_modules', '@njuptlzf', 'mcp-adapter')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'mcp-server.mjs'), '', 'utf8')
+    writeFileSync(join(dir, 'package.json'), `{"name":"@njuptlzf/mcp-adapter","version":"${version}"}`, 'utf8')
+  }
+  const v4Up = await mount({ adapterDir: v4Adapter, cbmPath: fakeExe }, null, { npmInstall: v4Stub })
+  const v4Setup = await v4Up.tools.get('code_setup').execute({}, withSignal(REPO))
+  record('V 默认源缺钉版本 ⇒ 回落官方源补齐（两轮安装，note 说破来源）',
+    v4Tries.length === 2 && v4Tries[0] === '(默认源)' && v4Tries[1].includes('registry.npmjs.org')
+      && v4Setup.includes('由官方源补齐') && v4Setup.includes('压缩层(②): ready'),
+    `tries=${JSON.stringify(v4Tries)}  ${(v4Setup.split('\n').find((l) => l.includes('notes:')) ?? '(没有 note)').slice(0, 130)}`)
+  rmSync(v4Adapter, { recursive: true, force: true })
+  // ── 臂 V5（v0.24.0）：引擎二进制被换过 ⇒ 报表必须跟着改口
+  // 官方位 `codebase-memory-mcp update` 只写官方安装位、vendor 那份靠人工覆盖，而 state.cbmVersion
+  // 是 bootstrap 探一次就缓存的。2026-11-05 实撞：磁盘两处都到 0.12.1，报表还印 0.11.0，于是
+  // 「引擎实测」行反过来打 ⚠（testedEngine() 读 package.json，那个已经是新的）。这里把"换了文件"
+  // 本身当测试输入：同一个 mount 连问两次 code_setup，中间只改版本罐头与文件大小。
+  const v5Adapter = join(tmpdir(), `cbm-check-veng-${process.pid}`)
+  const engFile = join(tmpdir(), `cbm-check-veng-exe-${process.pid}.bin`)
+  rmSync(v5Adapter, { recursive: true, force: true })
+  writeFileSync(engFile, 'stub', 'utf8')
+  let engVersion = 'codebase-memory-mcp 0.11.0'
+  const v5 = await mount({ adapterDir: v5Adapter, cbmPath: engFile }, null, { npmInstall: npmStub, engineVersion: () => engVersion })
+  const v5A = await v5.tools.get('code_setup').execute({}, withSignal(REPO))
+  engVersion = 'codebase-memory-mcp 0.12.1'
+  writeFileSync(engFile, 'a deliberately different file size', 'utf8')
+  const v5B = await v5.tools.get('code_setup').execute({}, withSignal(REPO))
+  const v5Line = (t) => (t.split('\n').find((l) => l.includes('引擎实测')) ?? '(报表里没有引擎实测行)').slice(0, 96)
+  record('V 引擎轴重量：换过二进制 ⇒ 新版本进报表、误报的 ⚠ 一起消失（note 说破重探）',
+    v5A.includes('0.11.0') && v5A.includes('超出实测范围')
+      && v5B.includes('0.12.1') && !v5B.includes('超出实测范围') && v5B.includes('索引引擎版本已重探'),
+    `前=${v5Line(v5A)}  后=${v5Line(v5B)}`)
+  rmSync(v5Adapter, { recursive: true, force: true })
+  rmSync(engFile, { force: true })
 
   // ── 臂 F（可选，CBM_CHECK_REFRESH=1）：H2 的**正向**路径真的会刷新 ────────────
   // 默认不跑：它要建 git 仓库、真跑一次 index_repository（约 20–40s）。但它是这条链上

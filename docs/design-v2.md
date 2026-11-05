@@ -637,6 +637,15 @@ v0.13.0 的验收现场自查翻出同一族的第三、第四种姿势：**报�
 
 
 
+### 6.18 双轴一起升：适配层钉 7.0.0-0.0.1 + 引擎 0.12.1，顺带把"钉的 ≠ 装的"露进报表（v0.24.0）
+
+2026-11-05 用户要求"更新 mcp-adapter 到最新"，拍板两条轴一并升（压缩层② + 索引引擎①），走完整发布链。四件事：
+
+- **升 pin 到 `7.0.0-0.0.1`（上游 7.0.0 2026-10-25 + fork）**：逐条比过契约四条线——`[config-watch]` 漂移 → `restartWithFreshConfig` → `exit(0)` 的形状两侧一致、`settings.scriptMode` 仍在（清单继续写它）；**7.0.0 的 breaking 只动语义搜索轴**（`settings.jev` → `settings.semanticSearch`、System One key 删除、`pi-mcp-adapter key` 命令消失），我们的清单不沾，所以零改动兼容。实测收益在 token 面：臂B 代理冷缓存 1270 → **1023 tokens/请求**（压缩比 3.4× → **4.2×**）。顺带一条新守卫形状：代理调用参数不许嵌套（`Error: Gateway params were nested inside \`args\``），正确写法仍是 `mcp__cbm__mcp({tool, args})`。
+- **兜底 registry（`ADAPTER_FALLBACK_REGISTRY`）**：实撞——本机默认源是 npmmirror，它的 dist-tags 停在 `5.2.0-0.0.6`，点名要 `7.0.0-0.0.1` 直接 404，`PUT /-/sync` 返回 201 也没同步下来。若只在默认源失败就收工，"升 pin"等于全机停在旧包（§6.14 那课的第三种姿势），所以第二轮带 `--registry=https://registry.npmjs.org` 重试、重试落了盘才算 ready，并在 note 里说破来源。钉的是精确版本，回落不扩大信任面。门禁臂 V4 用假 npm 锁两轮顺序与回落可见性。
+- **报表露实装版本**：`压缩层(②)` 行从前只印 `cfg.adapterVersion`（钉的值）。这次磁盘已是 7.0.0-0.0.1、报表照报 `adapterVersion=5.2.0-0.0.6` 且 `ready`——发现方式是 grep 装包 `package.json`。现在该行追加 `⚠ 实装 X ≠ 钉的 Y`。报表不在热路径，多读一个 1KB JSON 无所谓。
+- **引擎轴的新坑**：`codebase-memory-mcp update` 只是指路，真正升级跑 `install.ps1`，而它的 target 是**官方安装位** `%LOCALAPPDATA%\Programs\codebase-memory-mcp`。本机于是出现两份二进制：官方位 0.12.1、`~/.dsh/vendor/codebase-memory-mcp/bin` 0.11.0；探测顺序是官方 → vendor → PATH，**但 checks 硬编码 vendor 路径**（`checks/check-plugin.mjs:39`、`checks/check-tokens.mjs:14`），所以"只升官方位"时门禁测的还是旧引擎。处置：0.12.1 以同一 sha256（`39f6a789cd858d7428561ac5…`）复制进 vendor，并刷新 vendor 的 `checksums.txt`（取 `https://github.com/DeusData/codebase-memory-mcp/releases/latest/download/checksums.txt`），两条路径同一份码，报表与门禁不再各说各话。`dsh.testedEngine` 随四路 checks（patch → chain → tokens → plugin）全绿从 `0.11` 升 `0.12`。引擎二进制仍然**不自动下载**（可执行文件的安全水位高于包，这条不改）。
+
 ---
 
 ## 7. 参考链接

@@ -58,14 +58,14 @@ irm https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.
 Unblock-File .\install.ps1; .\install.ps1 --skip-config
 ```
 
-装完后插件会按 官方安装位 → `$DSH_HOME/vendor/codebase-memory-mcp/bin` → PATH 的顺序探测；也可以用 `cbmPath` 配置指死。
+装完后插件会按 官方安装位 → `$DSH_HOME/vendor/codebase-memory-mcp/bin` → PATH 的顺序探测；也可以用 `cbmPath` 配置指死。**两个位置可能不同版本**：`codebase-memory-mcp update`（以及它指向的上游 `install.ps1`）只写**官方安装位**，而验收门禁的引擎路径硬编码在 vendor（`checks/check-plugin.mjs:39`、`checks/check-tokens.mjs:14`）。升引擎要么两边同升（复制校验过的二进制 + 刷新 `checksums.txt`），要么把 `cbmPath` 指死——否则门禁测的是宿主没在跑的那份。
 
 ### ② 把 bundle 挂进 profile（②③④全自动）
 
 本插件没有 npm 包，也没有 `dsh install` 命令——装插件就是 `dsh plugin <args>`，本质是在 profile 目录里跑 pnpm。所以直接从 GitHub 装：
 
 ```powershell
-dsh plugin --profile <你的profile> add github:njuptlzf/dsh-codebase-memory#v0.23.3
+dsh plugin --profile <你的profile> add github:njuptlzf/dsh-codebase-memory#v0.24.0
 ```
 
 `#<tag>` 要留着：tag 钉死一个 commit，之后 `pnpm install` 不会悄悄漂移。要更新时改 tag（或去掉 tag 跟随 `main`）；卸载 `dsh plugin --profile <p> remove dsh-codebase-memory`。
@@ -327,7 +327,7 @@ v0.23.0 起套件里有一条读 `index.js` 原文的锁：**任何** `ctx.on(..
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `bootstrap` | `background` | `blocking` / `background` / `manual`（manual = 只探测不下载） |
-| `adapterVersion` | `5.2.0-0.0.6` | 钉死；**唯一升级入口**。bootstrap 会比对实装版本：不一致自动重装到钉版本（`manual` 只记 note 不碰网络；安装失败保留旧包继续跑）。0.0.6 起清单自带 watcher（漂移秒级自愈）、mcpScript 需 `settings.scriptMode` 显式准入（清单由插件写好） |
+| `adapterVersion` | `7.0.0-0.0.1` | 钉死；**唯一升级入口**。bootstrap 比对**实装**版本：不一致自动重装到钉版本（`manual` 只记 note 不碰网络；安装失败保留旧包继续跑）。本机配置的源没有钉的这个版本时会重试一次官方源并在 note 里说破（实撞：npmmirror 停在 `5.2.0-0.0.6`，点名 `7.0.0-0.0.1` 是 404，`PUT /-/sync` 返回 201 也没同步下来；钉的是精确版本，重试只是换镜像、不扩大信任面）。0.0.6 起清单自带 watcher（漂移秒级自愈）、mcpScript 需 `settings.scriptMode` 显式准入（清单由插件写好）。`code_setup` 的压缩层②行在两者不一致时追加 `⚠ 实装 X ≠ 钉的 Y`（v0.24.0：这行从前只印钉的值，旧包照报健康） |
 | `adapterDir` | `$DSH_HOME/vendor/mcp-adapter` | 压缩层与 `cbm.json` 的落点 |
 | `cbmPath` | 自动探测 | 留空则按 官方安装位 → vendor → PATH 探测 |
 | `autoIndex` | `true` | 自举时把引擎的 `auto_index` 对齐到该值（先读后写，值相同不重复写）。**作用域警告**：它落在机器级共享的 `~/.cache/codebase-memory-mcp/_config.db`，同机所有 MCP client 共用——不想让本插件替你决定就设成 `false`。实测语义：只给**尚无索引**的项目在会话启动时补一次全量，**不刷新陈旧坐标**，所以它不是防漂移手段（防漂移仍是 `code_index` + `check_index_coverage`） |

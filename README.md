@@ -61,14 +61,14 @@ irm https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.
 Unblock-File .\install.ps1; .\install.ps1 --skip-config
 ```
 
-Afterwards the plugin probes, in order: the official install location → `$DSH_HOME/vendor/codebase-memory-mcp/bin` → `PATH`. Or pin it explicitly via the `cbmPath` config.
+Afterwards the plugin probes, in order: the official install location → `$DSH_HOME/vendor/codebase-memory-mcp/bin` → `PATH`. Or pin it explicitly via the `cbmPath` config. **Both locations can hold different versions**: `codebase-memory-mcp update` — and the upstream `install.ps1` it points at — only ever writes the *official* location, while the acceptance suite hardcodes the vendor one (`checks/check-plugin.mjs:39`, `checks/check-tokens.mjs:14`). Upgrade both (copy the checksum-verified binary over, refresh `checksums.txt`) or pin `cbmPath`; otherwise the checks grade a binary the host is not running.
 
 ### 2. Mount the bundle into a profile (②③④ are fully automatic)
 
 There is no npm package and no `dsh install` command — plugin installation *is* `dsh plugin <args>`, which runs pnpm in the profile directory. So install from the GitHub release directly:
 
 ```powershell
-dsh plugin --profile <your-profile> add github:njuptlzf/dsh-codebase-memory#v0.23.3
+dsh plugin --profile <your-profile> add github:njuptlzf/dsh-codebase-memory#v0.24.0
 ```
 
 Keep the `#<tag>` pin: a tag resolves to one commit, so a later `pnpm install` does not silently move under you. Bump the tag (or drop it to follow `main`) when you want a newer release; uninstall with `dsh plugin --profile <p> remove dsh-codebase-memory`.
@@ -334,7 +334,7 @@ Two ways to change it. **Settings → Plugins → dsh-codebase-memory → the `c
 | Field | Default | Meaning |
 |---|---|---|
 | `bootstrap` | `background` | `blocking` / `background` / `manual` (manual = probe only, never download) |
-| `adapterVersion` | `5.2.0-0.0.6` | pinned; **the single upgrade entry point**. bootstrap compares the installed version against the pin and reinstalls on drift (`manual` only records the gap, never touches the network; a failed install keeps the old bundle running). From 0.0.6 the manifest ships with a watcher (drift self-heals in seconds) and mcpScript requires the explicit `settings.scriptMode` opt-in — the plugin writes it into the manifest |
+| `adapterVersion` | `7.0.0-0.0.1` | pinned; **the single upgrade entry point**. bootstrap compares the **installed** version against the pin and reinstalls on drift (`manual` only records the gap, never touches the network; a failed install keeps the old bundle running). If the machine's configured registry does not carry the pinned version — hit in production: npmmirror still serves `5.2.0-0.0.6` and 404s on `7.0.0-0.0.1`, and `PUT /-/sync` returned 201 without publishing anything — bootstrap retries once against `https://registry.npmjs.org` and says so in the note (the pin is an exact version, so the retry widens nothing but the mirror). Since 5.2.0-0.0.6 the manifest ships with a watcher (drift self-heals in seconds) and mcpScript requires the explicit `settings.scriptMode` opt-in — the plugin writes it into the manifest. `code_setup`'s layer-② line appends `⚠ installed X ≠ pinned Y` when the two differ (v0.24.0: the line used to print only the pin, so a stale bundle reported perfectly healthy) |
 | `adapterDir` | `$DSH_HOME/vendor/mcp-adapter` | where layer ② and `cbm.json` live |
 | `cbmPath` | auto-probe | leave empty to probe official → vendor → PATH |
 | `autoIndex` | `true` | Aligns the engine's `auto_index` at bootstrap (read-first, write only if it differs). **Scope warning:** this lands in the machine-wide `~/.cache/codebase-memory-mcp/_config.db`, shared with every other MCP client on this box — set it to `false` if you don't want this plugin deciding that. Measured semantics: it indexes projects that have **no** index yet when a session starts; it does **not** refresh stale coordinates, so it is not drift protection (`code_index` + `check_index_coverage` still are) |
