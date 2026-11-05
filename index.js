@@ -46,6 +46,8 @@ export const DEFAULT_ADAPTER_VERSION = '7.0.0-0.0.1'
 const ADAPTER_PKG = '@njuptlzf/mcp-adapter'
 /** 默认源（国内镜像）没有钉版本时的回落源：钉的是精确版本，回落脚本不改变信任面。 */
 const ADAPTER_FALLBACK_REGISTRY = 'https://registry.npmjs.org'
+/** 在飞的适配层安装，按 `目录|源` 合流：bootstrap 会被重复进入，别让两个 npm 写同一个 prefix。 */
+const adapterInstalls = new Map()
 const CBM_EXE = 'codebase-memory-mcp.exe'
 const BOOTSTRAP_MODES = ['blocking', 'background', 'manual']
 const INDEX_MODES = ['full', 'moderate', 'fast', 'cross-repo-intelligence']
@@ -382,14 +384,27 @@ async function ensureAdapter(ctx, cfg, state, signal) {
     ...(registry ? [`--registry=${registry}`] : []),
     `${ADAPTER_PKG}@${cfg.adapterVersion}`,
   ], { cwd: cfg.adapterDir, maxBytes: 512 * 1024, signal })
-  let r = await npmInstall('')
+  // 同一目录、同一源，进程内只允许一发 npm 在飞。bootstrap 每回合都可能被重新进入
+  // （装载期一发、code_setup 又一发），两发的 await 窗口互相穿插过：2026-11-05 臂 V4
+  // 实测到三轮安装——(默认源)(默认源)(官方源)，也就是两个 npm 进程往同一个 prefix
+  // 里写。合流之后进后到的那一发只是等前一发的结果，"装没装上"的判据不变。
+  const installOnce = (registry) => {
+    const key = `${cfg.adapterDir}|${registry}`
+    let inflight = adapterInstalls.get(key)
+    if (!inflight) {
+      inflight = npmInstall(registry).finally(() => adapterInstalls.delete(key))
+      adapterInstalls.set(key, inflight)
+    }
+    return inflight
+  }
+  let r = await installOnce('')
   // 镜像滞后兜底：钉的是精确版本，默认源没有它就是硬 404——2026-11-05 升 7.0.0-0.0.1
   // 实撞（npmmirror 的 dist-tags 停在 5.2.0-0.0.6，`PUT /-/sync` 返回 201 也没同步下来）。
   // 回落官方源只多一发请求，换来的是"升 pin = 真升了"，而不是全机停在旧包却照报 ready
   // （design-v2.md:597 版本对账那条：状态没撒谎，只是不知道）。
   let viaFallback = false
   if (installedAdapterVersion(cfg) !== cfg.adapterVersion) {
-    r = await npmInstall(ADAPTER_FALLBACK_REGISTRY)
+    r = await installOnce(ADAPTER_FALLBACK_REGISTRY)
     viaFallback = installedAdapterVersion(cfg) === cfg.adapterVersion
   }
   if (!existsSync(cfg.adapterMjs)) {
