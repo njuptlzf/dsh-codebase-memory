@@ -100,7 +100,7 @@
 ### R7 没有反馈闭环
 
 - 非符号 grep 不被替换，也没有一行"若在找定义/调用，code_find 更快"的提示。
-- telemetry 有 `wrapper-call`、`intercept-replace`，但没有"本会话 grep N 次 / code_find M 次"的对照读数，改进无法验收。
+- telemetry 有 `wrapper-call`、`intercept-replace`，但没有"本会话 grep N 次 / code_find M 次"的对照读数，改进无法验收。**（v0.23.3 起这条已解决：**`wrapper-call` 现带 `session` / `tool` / `query`，与 `intercept-replace` 的 `session` + `symbol` 同源可精确 join；对照读法与阈值见 docs/2026-11-03-hook-name-blindness-and-callchain-ceiling.md §7。）**
 
 ## 4. 其他插件对照
 

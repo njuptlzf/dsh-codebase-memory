@@ -1837,7 +1837,17 @@ const formatRows = (rows) => rows
 async function runCbmFlow(ctx, cfg, state, exec, work) {
   // 杠杆 ① 的采纳率读数：模型真的在用封装动词吗？两个封装工具共用这条动线，
   // 所以计一次点在这里，而不是各自的 execute 里。
-  telemetry(cfg, state, 'wrapper-call', {})
+  // v0.23.3：事件必须带 session/tool/query。此前它只有 ts/pid/event，于是第二步那条
+  // 开工闸门——"被图谱替换掉的符号查询，模型之后会不会自己再去查调用边"——根本算不出
+  // 来（8 天 14 发 wrapper-call 全匿名，连 find/callers 都分不开，pid+30min 粗 join
+  // 只能给个上界）。补上之后它和 intercept-replace 用同一个 sessionKey，可按会话精确
+  // join。exec 就是宿主 execute(args, exec) 的第二个实参（dsh-tools lib/index.js:3406
+  // `tool.execute(exec.arguments, exec)`），所以 name / arguments 都在这里。
+  telemetry(cfg, state, 'wrapper-call', {
+    session: sessionKey(exec?.agent),
+    tool: String(exec?.name ?? ''),
+    query: String(exec?.arguments?.query ?? exec?.arguments?.name ?? '').slice(0, 80),
+  })
   const sessionCwd = exec?.agent?.session?.header?.cwd
   if (!sessionCwd) throw new Error('封装工具需要会话工作区：exec.agent.session.header.cwd 为空')
   // 仓库根归一后再查项目/测新鲜度：封装工具在子目录会话里也必须命中父仓的图。

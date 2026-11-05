@@ -135,7 +135,17 @@ classify  -> {"kind":"symbol","symbol":"classifyPattern"}
 
 1. **判据不再放宽**（§6 维持保守）。近失里 88% 是模型真想要的文本检索，为救剩下 12% 去放宽 `classifyPattern`（index.js:1213）就是开始吞原文——误拦一次的成本远高于漏拦一次（index.js:1207 那句话今天有了定量依据）。
 2. **条件式 `trace_path` / `code_impact` 本体不开工**，而且这次的理由是"测不出来"而不是"想不出来"。开工闸门写的是"被替换的符号查询里相当比例随后又自己去 trace 调用边"，可 `wrapper-call` 不带 session、不带动词名、不带 symbol，**根本区分不了模型随后调的是 `code_find` 还是 `code_callers`**。只能用 pid + 30 分钟窗口粗 join，得到 7/17 ≈ **41% 的上界**——混会话、混动词、混意图，当决策依据是不合格的。
-3. **值得先开的只剩这一小块**：给 `wrapper-call` 补 `session / tool / symbol` 三个字段（一发 `telemetry()` 的入参，零行为改动、报表不动），`intercept-replace` 已带 `symbol` 不用动。攒两周真读数，再回来判那条"相当比例"到底是几成：确实高，条件式扩展（`CODE_QUESTION` 命中 + 只对首条命中追加一发 `trace_path`，index.js:1782 / 1769）才第一次有开工依据；确实低，就地关掉这个方向，不留 TODO。
+3. **值得先开的只剩这一小块——已实施（v0.23.3，2026-11-05）**：`wrapper-call` 现在带 `session / tool / query`（index.js:1840 那发 `telemetry()` 的入参；`session` 与 `intercept-replace` 用同一个 `sessionKey`（index.js:1325）⇒ 可按会话精确 join；`exec` 就是宿主 `tool.execute(exec.arguments, exec)` 的第二实参，dsh-tools `lib/index.js:3406`，所以 `name` / `arguments` 当场可得）。`intercept-replace` 已带 `symbol`，不动。零行为改动、报表不动；checks G 臂新增一条断言直接读事件行验三字段（`mount` 第 5 参钉独立遥测目录 `telemetry-wrap`，execute 时补一发完整形状的 exec）。
+
+**两周后怎么读（照抄即可，三个读数互相排他）：**
+
+| 读数 | 算法 | 落在哪边 ⇒ 拍什么板 |
+|---|---|---|
+| R1 模型会不会自己查调用边 | `wrapper-call` 按 `tool` 分桶：`code_find` vs `code_callers` | callers 接近 0 ⇒ 模型不主动要调用链，第二步永久关；有一成以上 ⇒ 需求存在，再看 R2 |
+| R2 被替换后是否有下文（**真正的开工闸门**） | 同 `session` 上 join：某次 `intercept-replace(symbol=X)` 之后，又出现 `query` 末段 ≈ X 的 `wrapper-call`，占比 B/A。注意 `code_callers` 的 `query` 是 qualified_name（`proj.sym`），比对取最后一段 | B/A ≥ ~0.3 ⇒ 模型确实想往深走，钩子里附一跳调用者 = 帮它省掉已愿意付的那一跳，开工有对象；B/A < ~0.1 ⇒ 没人跟横幅里那行"下一步"（index.js:1777），该改的是文案/横幅结构，不是加动词 |
+| R3 需求是不是 grep 引出来的 | 把 R1 的 callers 按"该符号近期被 replace 过 / 没被 replace 过"分两拨 | callers 主要发生在**没**被 replace 过的符号上 ⇒ 调用链需求真实但与 grep 无关，模型自己调 `code_callers` 就够（现状已支持），仍不必钩子化 |
+
+样本量的上限要说清：本机 8 天只有 17 发 `intercept-replace`（其中至少 4 发是验收探针），两周后的真实样本大概几十发 ⇒ 这套读数只能分辨"接近 0"和"明显高"，中间带会统计不显著。它是把"根本算不出"变成"算得出"，不是能直接出结论的仪表。附带好处：探针会话从此可按 `session` 剔掉，`code_find` 首建/未索引那类失败也能看到当时的 `query` 形状。
 
 动词式 `code_impact`（原 docs/2026-11-01-tool-hit-rate.md 的 P2-1）同判：它要每个请求 +200–300 token 的常驻 schema 税，去服务 8 天 17 发的低频场景，在有了第 3 条的读数之前同样不批。
 
@@ -173,5 +183,7 @@ classify  -> {"kind":"symbol","symbol":"classifyPattern"}
 - **新默认名单在本机暂时无法用报表字段值证明**：`profiles/tauri/cordis.patch.yml:197`（mtime 2026-11-04 14:33:45）持久覆盖了 `interceptTools: grep,glob,ops_grep,ops_glob`，旧模块读它也能凑出同样四个名字。要验"默认"本身，得先把这行覆盖删掉或改窄（volatile 字段，改完即生效，不用重启），再看 `名单核对:` 行的 `名单=` 段。
 - **那条"矛盾"已经定性（18:36 实验）**：写一次 `profiles/tauri/cordis.patch.yml`（只加一行注释再删掉，配置内容不变）之后，`code_setup` 报表**立刻**出现 `名单核对` 与 `轮扫` 两行，`遥测计数` 同时归零重计（只剩 `cbm-warm=1`）⇒ **宿主在 profile 文档被写的时候会重新挂载插件模块**。所以 14:33 那次设置页落盘（就是它写下 `interceptTools: grep,glob,ops_grep,ops_glob` 那行）也重新挂载了一次，而那时 pin 还是 `#v0.21.0`——挂载拿到的就是 v0.21.0 的模块，把我 10:02 `sync` 出来的 v0.23.2 盖掉的磁盘内容"记忆"换成了旧的。17:37 我按新 pin 装成 v0.23.2，但**文件变了不等于会重新挂载**，得等下一次文档写入。两条判据当场复核过：符号形 `ops_grep(pattern="interceptPremises", path=index.js)` 被换成图谱横幅（命中 `interceptPremises Function index.js 1897-1909`，与当前文件一致）；同一 pattern 加 `outputMode="count"` 原文保留（`count=3`）；报表 `名单核对: 实发搜索工具=ops_grep … ok`、`轮扫: on(300s) 候选=6 上轮 checked=6 … refreshed=2 behind=0`、`intercept-replace=1 intercept-replace:graph=1`、`hint-injected=2`。
 - **可复用的操作口径**：改完 `index.js` 想立刻在活宿主里验，别重启整个应用——`node scripts/sync.mjs` 之后**碰一次 profile 的 cordis.patch.yml**（加一行注释再删，或从设置页保存一次）就会重新挂载。反过来，任何 `pnpm install`/宿主依赖重解析都可能把 sync 出来的开发版还原成 pin 的内容，所以"sync 过就好"这句话只在**下一次挂载拿到的是同一份文件**时才成立。profile 文档里那行 `interceptTools: grep,glob,ops_grep,ops_glob` **要留，我先前说"冗余可删"是错的**。它不是冗余，是版本偏斜时的保险，而且今天有实测：17:51 与 18:15（本地）那两次 ops_grep 被换成图谱，正是发生在活模块退回 v0.21.0 的窗口里——v0.21.0 的默认名单是 `grep,glob`，没有这行覆盖，整条 grep→图谱通道在那 3 小时里会是彻底死的状态（旧模块不认 ops_grep）。默认值只在"活模块 == 发布模块"时才等价，而这条等价关系今天被证明是可 broken 的。代价只有一个：将来若再有新的换皮名（比如 `ops_search`），显式覆盖会挡住新默认、重新造成静默失配——但那正是 `名单核对` 行负责当场点名的场景（治 R2 的那行），所以失效从"看不见"变成"看得见"，留着划算。
-- 第二步（基线读数 → 条件式 `trace_path` 或 `code_impact` 动词）**未开工**，开工条件见 §7。
+- **第二步只开了可观测性那一小块（v0.23.3，2026-11-05）**：`wrapper-call` 现在带 `session / tool / query`（index.js:1846），条件式 `trace_path` / `code_impact` 本体仍未开工，判据与两周后的读法见 §7。改动量 `index.js` +11/−1、`checks/check-plugin.mjs` +26/−0。
+- **v0.23.3 验收**：`node checks/check-plugin.mjs tauri` = **198/199**（日志 %TEMP%/cbm-v233.log），新断言 G「wrapper-call 记账带 session/tool/query」PASS，读数 `{"tool":"code_find","query":"wrapProbeFind","session":"ess-74628-find"}` / `{"tool":"code_callers","query":"stub-project.wrapProbeCallers",…}`。唯一一条 FAIL 是既有的时序 flake `M1 预热在飞时报表报出 pending(Ns)`（11-03 tauri 挂、11-04 两 profile 过、11-05 又挂；本机负载相关，v0.23.3 没碰预热路径）。
+- **热验证（真宿主，不用重启整个应用）**：`node scripts/sync.mjs` 之后往 `profiles/tauri/cordis.patch.yml` 追加一行注释再原样删掉，宿主即重新挂载；随后本会话发一发 `code_find("runCbmFlow")`，当日 `~/.dsh/vendor/mcp-adapter/telemetry-2026-11-05.log` 落出 `{"ts":"2026-11-05T02:07:54.640Z","pid":74272,"event":"wrapper-call","session":"session-98f09730-…","tool":"code_find","query":"runCbmFlow"}`——三字段齐、`session` 与 `intercept-replace` 同源可直接 join。R2 的分母（本机 `intercept-replace` 今日 2 发）从今起可精确计算。
 - 参考：docs/2026-11-01-tool-hit-rate.md（触发面三层与 P2-1 `code_impact`）、docs/2026-11-02-lifecycle-wiring-audit.md（§1.4 宿主真实事件面、§2 dsh-ops 五个做法）、docs/2026-11-02-poll-vs-watch-decision.md（§6.3 开工触发条件的写法）。

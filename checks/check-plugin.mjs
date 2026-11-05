@@ -754,6 +754,32 @@ async function verify(profile) {
   const traced = await g.tools.get('code_callers').execute({ name: 'stub-project.stubSymbol' }, { agent: agentG, signal: sig() })
   record('G code_callers 默认 inbound 并返回调用者', /callerOfStub/.test(traced.text) && /direction: inbound/.test(traced.text), traced.text.split('\n')[1] ?? '')
 
+  // v0.23.3：wrapper-call 的三字段是"第二步（条件式调用链）到底有没有对象"这条闸门
+  // 的分母来源——缺任何一个，被替换的符号查询与模型自己的后续图谱动词就无法按会话
+  // join（8 天遥测里 14 发全是匿名）。上面那些 execute 传的是精简 exec；真实宿主把
+  // name / arguments 一起给（dsh-tools lib/index.js:3406 `tool.execute(exec.arguments,
+  // exec)`），所以这条臂自己补一发完整形状的调用，并直接读事件行验字段。
+  const wrapTdir = join(countsDir, 'telemetry-wrap')
+  const wrapEvents = () => (existsSync(wrapTdir)
+    ? readdirSync(wrapTdir)
+      .filter((f) => /^telemetry-\d{4}-\d{2}-\d{2}\.log$/.test(f))
+      .flatMap((f) => readFileSync(join(wrapTdir, f), 'utf8').split('\n'))
+      .filter((l) => /"wrapper-call"/.test(l))
+      .map((l) => { try { return JSON.parse(l) } catch { return {} } })
+    : [])
+  const wrap = await mount({}, gProxy, null, null, wrapTdir)
+  await wrap.tools.get('code_setup').execute({}, withSignal(REPO)) // 自举一次，否则 runCbmFlow 的前提直接 throw
+  const wrapExec = (name, args) => ({ agent: agentG, signal: sig(), name, arguments: args })
+  await wrap.tools.get('code_find').execute({ query: 'wrapProbeFind' }, wrapExec('code_find', { query: 'wrapProbeFind' }))
+  await wrap.tools.get('code_callers').execute({ name: 'stub-project.wrapProbeCallers' },
+    wrapExec('code_callers', { name: 'stub-project.wrapProbeCallers' }))
+  const wrapGot = wrapEvents()
+  record('G wrapper-call 记账带 session/tool/query（第二步判据的分母可算）',
+    wrapGot.some((e) => e.tool === 'code_find' && e.query === 'wrapProbeFind'
+      && String(e.session).startsWith(`sess-${process.pid}`))
+      && wrapGot.some((e) => e.tool === 'code_callers' && /wrapProbeCallers/.test(String(e.query))),
+    JSON.stringify(wrapGot.map((e) => ({ tool: e.tool, query: e.query, session: String(e.session).slice(-14) }))))
+
   // G2b 第四态 behind：stamp 建图之后工作区又变过 ⇒ 索引落后。hint 必须不管问法
   // 都提示（正门/旁路之外的第三闸门），code_find 的坐标也要挂同一句警告。
   // 用真实 state（g 已 code_setup），但 stamp 指到"建图时"：at=now 走冷却，
