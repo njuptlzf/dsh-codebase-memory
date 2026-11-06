@@ -554,11 +554,24 @@ async function verify(profile) {
     `{"name":"@njuptlzf/mcp-adapter","version":"${DEFAULT_ADAPTER_VERSION}"}`, 'utf8')
   writeFileSync(join(s3T, 'refresh-stamps.json'),
     JSON.stringify({ [REPO]: { at: Date.now(), digest: 'built|0|0' } }), 'utf8')
+  // 轮扫是 fire-and-forget（index.js:1183 `void runWorkspaceSweep`），落账前报表停在
+  // 「还没跑过」。旧写法固定睡 2500ms，可这一轮里每个候选至少要付 3 发 git 子进程
+  // （repoRootOf + `git rev-parse HEAD` + `git status --porcelain`，index.js:1011/1013），
+  // 冷却/未变闸门在 digest **之后**（index.js:1077），本机一忙（并发第二套 checks、真
+  // npm install、Defender 扫 git.exe）就翻过 2.5s——24 次完整跑里两条 S 臂一起假红 4 次
+  // （17%）。改成有界轮询：命中即返回（空闲机比原来还快），上限 20s，判据一字未改。
+  const waitSwept = async (tool) => {
+    const deadline = Date.now() + 20000
+    for (;;) {
+      const report = await tool.execute({}, withSignal(REPO))
+      if (/上轮 checked=\d+/.test(report) || Date.now() >= deadline) return report
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+  }
   const sw = await mount({ workspaceSweepSec: 60, adapterDir: s3T })
   await sw.tools.get('code_setup').execute({}, withSignal(REPO))
   sw.events['agent/created'][0]({ agent: fakeAgent(`sess-${process.pid}-sweep`, REPO), source: 'fresh', signal: sig() })
-  await new Promise((resolve) => setTimeout(resolve, 2500))
-  const swReport = await sw.tools.get('code_setup').execute({}, withSignal(REPO))
+  const swReport = await waitSwept(sw.tools.get('code_setup'))
   record('S 轮扫被踢发并留下一轮的账（checked=1，冷却短路未重建）',
     /轮扫: on\(60s\) 候选=\d+ 上轮 checked=1 hot=\d+ cold=\d+ refreshed=0/.test(swReport),
     /轮扫:.*$/m.exec(swReport)?.[0] ?? '(报表里没有轮扫行)')
@@ -581,8 +594,7 @@ async function verify(profile) {
   const sw4 = await mount({ workspaceSweepSec: 60, adapterDir: s4T })
   await sw4.tools.get('code_setup').execute({}, withSignal(REPO))
   sw4.events['agent/created'][0]({ agent: fakeAgent(`sess-${process.pid}-sweep4`, REPO), source: 'fresh', signal: sig() })
-  await new Promise((resolve) => setTimeout(resolve, 2500))
-  const sw4Report = await sw4.tools.get('code_setup').execute({}, withSignal(REPO))
+  const sw4Report = await waitSwept(sw4.tools.get('code_setup'))
   const sw4Ok = /上轮 checked=1 hot=\d+ cold=\d+ refreshed=0/.test(sw4Report)
   let sw4FailLine = ''
   try {
